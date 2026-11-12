@@ -1,12 +1,17 @@
-//! wtfs-core —— WorktreeFS 的共享核心类型与存储契约。
+//! wtfs-core —— WorktreeFS 的共享核心类型、存储契约与 M0 核心实现。
 //!
-//! 本 crate 是 M1（B010100）交付的 API 骨架；M2 实现、M3+ 消费：
+//! M1（B010100）交付 API 骨架，M2（B020100）在本 crate 内完成实现；M3+ 消费：
 //!
 //! * 值类型：[`TemplateId`]、[`WorktreeId`]、[`TemplateSpec`]、[`Template`]、
 //!   [`TemplateFile`]、[`Stat`]、[`DedupeDecision`]、[`WorktreeState`]、[`OverlayConfig`]。
 //! * 存储契约：[`TemplateStore`] 与 [`OverlayStore`]，由 wtfs-vfs（读路径、dedupe）
 //!   与 wtfs-daemon（模板管理、注册表、gc）共同使用。
 //! * 路径校验：[`validate_relative_path`]（Windows 保留名/保留尾字符，spec §11.2）。
+//! * M2 实现：[`Db`]（schema/迁移）、[`SqliteTemplateStore`]（checkout + index
+//!   快照 + blake3 清单）、[`SqliteOverlayStore`]（worktrees/whiteouts/renames/
+//!   file_ids/stat_cache）、[`Overlay`]（upper>whiteout>lower 解析、目录合并、
+//!   rename map、写路径 dedupe、固定 stat/逻辑 mtime）、[`dedupe`]（三态决策）、
+//!   [`tower_state`]（state.json → 模板 base，缺失则全量 copy 兜底）。
 //!
 //! 稳定性承诺：类型与 trait 只做 additive 变更；方法语义不变。
 //! 两个 trait 均为对象安全（`Send + Sync`），可放入 `Arc<dyn TemplateStore>`。
@@ -19,6 +24,23 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+pub mod db;
+pub mod dedupe;
+mod gitx;
+pub mod overlay;
+pub mod overlay_store;
+pub mod template_store;
+pub mod tower_state;
+
+pub use db::Db;
+pub use dedupe::{DedupeState, decide_for_path, hash_bytes, hash_file, hash_reader};
+pub use overlay::{EntryKind, Overlay, OverlayDirEntry, Resolution, attributes_for};
+pub use overlay_store::{SqliteOverlayStore, StatCacheEntry, WorktreeRegistration};
+pub use template_store::SqliteTemplateStore;
+pub use tower_state::{
+    TowerMissionEntry, TowerStateFile, read_state_file, template_spec_for_worktree,
+};
 
 /// lower（模板）文件统一报告的固定 stat 纪元：2000-01-01T00:00:00Z（Unix 纳秒）。
 /// 固定 mtime/ctime 使 Git 写入的 index 与 ready 后 FS 报告的 stat 一致（spec §7），

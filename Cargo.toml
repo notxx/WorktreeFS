@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wtfs-core",
+    "crates/wtfs-vfs",
+    "crates/wtfs-daemon",
+    "crates/wtfs-cli",
+    "crates/wtfs-git-shim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+bitflags = "2.13.2"
+blake3 = "1.8.7"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+dashmap = "6.2.1"
+# sha1: gix-hash 0.28 默认不带哈希算法 feature（default = []），直连 gix-index 时
+# 必须显式选定算法，否则 gix-hash 编译失败（Kind 枚举为空）。
+gix-index = { version = "0.58.0", features = ["sha1"] }
+lru = "0.19.0"
+memmap2 = "0.9.12"
+parking_lot = "0.13.0"
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+winfsp = "0.13.2"
+winfsp-sys = "0.12.1"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

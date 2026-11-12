@@ -1,0 +1,15 @@
+[package]
+name = "wtfs-vfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+dashmap.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+winfsp.workspace = true
+winfsp-sys.workspace = true
+windows.workspace = true
+wtfs-core = { path = "../wtfs-core" }

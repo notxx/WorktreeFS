@@ -207,28 +207,19 @@ fn real_mount_git_worktree_add_through_daemon() {
     let status = status_of(&worktree);
     assert!(status.contains("M README.md"), "expected ` M README.md`, got {status:?}");
 
-    // 还原 + remove → 注销；卸载后挂载点恢复为空目录。
-    // 注：先删再写是绕开 wtfs-vfs 的 in-place 截断缺陷（M3 遗留：对已有
-    // upper 文件的 OVERWRITE 不重置 EOF，缩短的内容会残留旧尾部）——
-    // 已单独向 tower 提 finding；这里 remove+create 走全新 upper/staged 路径。
-    std::fs::remove_file(worktree.join("README.md")).unwrap();
+    // 还原：直接覆写已有 upper 文件（M6/B060100 已修复覆写截断——不再
+    // 需要“先删再写”绕行），读回必须字节级一致（EOF 截断到位）。
     std::fs::write(worktree.join("README.md"), "# hello\n").unwrap();
+    assert_eq!(
+        std::fs::read(worktree.join("README.md")).unwrap(),
+        b"# hello\n",
+        "in-place overwrite must truncate to new content"
+    );
     assert_eq!(status_of(&worktree), "");
 
-    // remove：当前 wtfs-vfs 对 overlay 根目录拒绝 set_delete（M3 遗留，
-    // 已提 finding），git 删 worktree 根会 Permission denied——文件内容
-    // 已删净，只差根目录 rmdir。此处容忍该失败并模拟 git 的收尾动作
-    // （删元数据目录），daemon watcher 随后注销 overlay、gc 回收 upper。
-    let (removed_ok, remove_out) =
-        git(&repo, &["worktree", "remove", "--force", &worktree.to_string_lossy()]);
-    if !removed_ok {
-        eprintln!(
-            "[wtfs-e2e] git worktree remove blocked by VFS root-delete gap: {remove_out}"
-        );
-        // git 的删除顺序里元数据目录可能已先行删除（此处实测如此）；
-        // 只要有任一步没删净就补删，watcher 按“元数据消失”注销。
-        std::fs::remove_dir_all(repo.join(".git").join("worktrees").join("wt-1")).ok();
-    }
+    // remove 必须直接成功（M6/B060100 已放开 worktree 根 set_delete）；
+    // watcher 按元数据消失注销 overlay，upper 变孤儿由 gc 回收。
+    assert_git_ok(&repo, &["worktree", "remove", "--force", &worktree.to_string_lossy()]);
     wait_for(
         Duration::from_secs(10),
         || daemon.registry().get("wt-1").is_none(),

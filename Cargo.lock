@@ -1725,7 +1725,9 @@ dependencies = [
  "anyhow",
  "clap",
  "serde_json",
+ "tempfile",
  "tracing-subscriber",
+ "windows 0.62.2",
  "wtfs-core",
  "wtfs-daemon",
 ]

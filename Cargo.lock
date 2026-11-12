@@ -1726,6 +1726,7 @@ dependencies = [
  "clap",
  "serde_json",
  "tracing-subscriber",
+ "wtfs-core",
  "wtfs-daemon",
 ]
 
@@ -1755,13 +1756,16 @@ name = "wtfs-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "crossbeam-channel",
+ "parking_lot 0.13.0",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "windows 0.62.2",
  "wtfs-core",
  "wtfs-vfs",
 ]

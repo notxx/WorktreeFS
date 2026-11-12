@@ -137,16 +137,38 @@ impl SqliteTemplateStore {
     ) -> Result<TemplateId> {
         self.db.with_tx(|tx| {
             let repo_id = upsert_repo(tx, repo, true)?;
-            let old: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM templates
-                     WHERE repo_id = ?1 AND base_commit = ?2 AND state != 'ready'",
-                    params![repo_id, commit],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(db_err)?;
-            if let Some(old) = old {
+            // 旧行清理：非 ready（上次失败/中断），或 ready 但 tree/index 已被
+            // 外部删除——否则 UNIQUE(repo_id, base_commit) 会让重建永远失败（P2-1）。
+            let stale: Vec<i64> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id, tree_path, index_path, state FROM templates
+                         WHERE repo_id = ?1 AND base_commit = ?2",
+                    )
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(params![repo_id, commit], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    })
+                    .map_err(db_err)?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    let (id, row_tree, row_index, state) = row.map_err(db_err)?;
+                    let intact = state == "ready"
+                        && Path::new(&row_tree).is_dir()
+                        && Path::new(&row_index).is_file();
+                    if !intact {
+                        ids.push(id);
+                    }
+                }
+                ids
+            };
+            for old in stale {
                 tx.execute(
                     "UPDATE worktrees SET template_id = NULL WHERE template_id = ?1",
                     params![old],
@@ -685,6 +707,30 @@ mod tests {
         assert_eq!(lib.hash, crate::FileHash::of_bytes(&lib_bytes));
         // 旧模板仍可用（gc 由 daemon 决定）。
         assert_eq!(store.get(t1.id).unwrap().unwrap().state, TemplateState::Ready);
+    }
+
+    #[test]
+    fn template_rebuild_after_external_tree_deletion() {
+        // P2-1 回归：Ready 行的 tree/index 被外部删除后必须能重建，
+        // 不再撞 UNIQUE(repo_id, base_commit)。重建成功本身即证明旧行
+        // 已被 reserve_row 清理（否则 INSERT 会触发 UNIQUE 约束）。
+        let dir = TempDir::new().unwrap();
+        let repo = init_repo(dir.path());
+        let store = SqliteTemplateStore::open(dir.path().join("store")).unwrap();
+        let spec = crate::TemplateSpec::new(&repo, "master");
+        store.create_or_update(&spec).unwrap();
+
+        std::fs::remove_dir_all(dir.path().join("store").join("templates")).unwrap();
+        assert!(
+            store.resolve(&spec).unwrap().is_none(),
+            "tree 缺失不得再解析出模板"
+        );
+
+        let t2 = store.create_or_update(&spec).unwrap();
+        assert_eq!(t2.state, TemplateState::Ready);
+        assert_eq!(store.files(t2.id).unwrap().len(), 4);
+        assert!(t2.tree_path.join("README.md").is_file());
+        assert_eq!(store.resolve(&spec).unwrap().unwrap().id, t2.id);
     }
 
     #[test]

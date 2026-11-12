@@ -99,6 +99,13 @@ pub(crate) fn whiteout_blocks(mapped: &str, whites: &HashSet<String>) -> bool {
     if whites.contains(mapped) {
         return true;
     }
+    ancestor_whiteout_blocks(mapped, whites)
+}
+
+/// 仅祖先目录命中（不含路径自身）。路径自身的 whiteout 可以被
+/// `remove_whiteout` 精确撤销，回落 lower 后仍然可见；祖先目录的 whiteout
+/// 则会继续隐藏子树，回落会导致"写入成功但文件不可见"。
+pub(crate) fn ancestor_whiteout_blocks(mapped: &str, whites: &HashSet<String>) -> bool {
     let mut cur = mapped;
     while let Some(idx) = cur.rfind('/') {
         cur = &cur[..idx];
@@ -483,15 +490,22 @@ impl Overlay {
         if self.config.dedupe_enabled {
             if let Some(t) = &template_entry {
                 if t.hash == hash {
-                    // 与模板一致：丢弃副本回落 lower（copy-up 后改回模板内容同样回收）。
-                    let _ = std::fs::remove_file(&tmp);
-                    if final_path.symlink_metadata().is_ok() {
-                        std::fs::remove_file(&final_path)?;
+                    let whites = self.store.whiteouts(id)?;
+                    if !ancestor_whiteout_blocks(&mapped, &whites) {
+                        // 与模板一致且 lower 视图可见（路径自身的 whiteout 会被
+                        // remove_whiteout 撤销）：丢弃副本回落 lower。
+                        // copy-up 后改回模板内容同样回收。
+                        let _ = std::fs::remove_file(&tmp);
+                        if final_path.symlink_metadata().is_ok() {
+                            std::fs::remove_file(&final_path)?;
+                        }
+                        self.store.remove_stat_entry(id, rel)?;
+                        self.store.record_dedupe_state(id, rel, DedupeState::Lower)?;
+                        self.store.remove_whiteout(id, &mapped)?;
+                        return Ok((DedupeState::Lower, size));
                     }
-                    self.store.remove_stat_entry(id, rel)?;
-                    self.store.record_dedupe_state(id, rel, DedupeState::Lower)?;
-                    self.store.remove_whiteout(id, &mapped)?;
-                    return Ok((DedupeState::Lower, size));
+                    // 祖先目录被 whiteout：回落会让刚写入的文件不可见——
+                    // 保留内容继续走 Upper 路径（仅错过一次 dedupe 机会）。
                 }
             }
         }
@@ -966,6 +980,38 @@ mod tests {
         ));
         assert_eq!(names(&of, "a"), vec!["9.txt"]);
         assert!(names(&of, "").contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn write_template_identical_under_dir_whiteout_stays_visible() {
+        // P1-1 回归：目录级 whiteout 下写模板一致内容，不得回落 lower
+        // （祖先 whiteout 会继续隐藏子树 → "写入成功但文件不可见"）。
+        let fx = fixture(true);
+        let of = make(&fx, true);
+        of.mark_ready().unwrap();
+
+        assert!(of.remove("a").unwrap());
+        assert_eq!(of.resolve("a").unwrap(), Resolution::Whiteout);
+        // 目录 whiteout 下 copy_up 不可见即不可复制（返回 None，不产生副本）
+        assert_eq!(of.copy_up("a/1.txt").unwrap(), None);
+
+        // 与模板完全一致的重写：保留为 upper，文件可解析、可见、内容正确
+        let (state, _) = of.write("a/1.txt", ONE).unwrap();
+        assert_eq!(state, DedupeState::Upper);
+        assert!(matches!(of.resolve("a/1.txt").unwrap(), Resolution::Upper { .. }));
+        assert_eq!(of.read("a/1.txt").unwrap().as_deref(), Some(ONE));
+        assert!(names(&of, "a").contains(&"1.txt".to_string()));
+        assert!(matches!(
+            of.resolve("a").unwrap(),
+            Resolution::Directory { has_lower: false, has_upper: true }
+        ));
+
+        // 对照组：文件级 whiteout 的旧行为不变——精确路径一致重写回落 lower 且可见
+        assert!(of.remove("b.txt").unwrap());
+        let (state, _) = of.write("b.txt", BEE).unwrap();
+        assert_eq!(state, DedupeState::Lower);
+        assert_eq!(of.read("b.txt").unwrap().as_deref(), Some(BEE));
+        assert!(names(&of, "").contains(&"b.txt".to_string()));
     }
 
     #[test]

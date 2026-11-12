@@ -12,8 +12,8 @@ use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{DirInfo, FileSecurity, FileInfo, FileSystemContext, VolumeInfo};
 use winfsp::U16CString;
 use wtfs_core::{
-    Db, DedupeState, Overlay, OverlayConfig, Resolution, SqliteOverlayStore, TemplateFile,
-    WorktreeId,
+    Db, DedupeState, Overlay, OverlayConfig, OverlayStore, Resolution, SqliteOverlayStore,
+    TemplateFile, WorktreeId,
 };
 
 use crate::context::{
@@ -21,8 +21,9 @@ use crate::context::{
 };
 use crate::registry::{VfsConfig, VfsRegistry};
 use crate::win::{
-    FILE_ACTION_MODIFIED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
-    FILE_DIRECTORY_FILE, filetime_from_unix_ns,
+    FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+    FILE_OVERWRITE_IF, filetime_from_unix_ns,
 };
 use crate::security::fixed_security_descriptor_len;
 
@@ -100,7 +101,18 @@ fn sec(fx: &Fixture, name: &str) -> winfsp::Result<FileSecurity> {
 }
 
 fn open(fx: &Fixture, name: &str) -> winfsp::Result<FileContext> {
-    fx.ctx.open(&p(name), 0, 0, &mut blank_open_file_info_for_test())
+    open_as(fx, name, FILE_OPEN)
+}
+
+/// 以指定 disposition 打开（CreateOptions 高 8 位 = disposition，B060100）。
+fn open_as(fx: &Fixture, name: &str, disposition: u32) -> winfsp::Result<FileContext> {
+    fx.ctx
+        .open(&p(name), disposition << 24, 0, &mut blank_open_file_info_for_test())
+}
+
+/// CREATE_ALWAYS 语义打开（FILE_OVERWRITE_IF）：真机 git/`std::fs::write` 路径。
+fn open_overwrite(fx: &Fixture, name: &str) -> winfsp::Result<FileContext> {
+    open_as(fx, name, FILE_OVERWRITE_IF)
 }
 
 fn create_file(fx: &Fixture, name: &str) -> FileContext {
@@ -355,6 +367,151 @@ fn ready_view_merge_read_and_in_place_dedupe() {
 }
 
 #[test]
+fn ready_overwrite_open_truncates_eof_on_shorter_write() {
+    // B060100 回归：CREATE_ALWAYS（FILE_OVERWRITE_IF）覆写已有 upper 文件，
+    // 更短的内容必须把 EOF 收缩到写入长度，不得残留旧尾部
+    // （M4 真机缺陷："# hello\nd\n"）。
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    // initializing（checkout 流）先制造已有 upper 文件（长内容，非模板内容）
+    let fctx = create_file(&fx, "\\wt-1\\b.txt");
+    write(&fx, &fctx, b"longer changed content");
+    cleanup(&fx, fctx, 0);
+
+    fx.registry.mark_ready("wt-1").unwrap();
+    assert!(matches!(
+        overlay.resolve("b.txt").unwrap(),
+        Resolution::Upper { .. }
+    ));
+
+    // 覆写打开 + 写更短内容 + 关闭：终裁后内容精确等于新写入
+    // （非模板内容，确保留在 upper 供物理断言）
+    let fctx = open_overwrite(&fx, "\\wt-1\\b.txt").unwrap();
+    assert_eq!(write(&fx, &fctx, b"short"), 5);
+    cleanup(&fx, fctx, 0);
+    assert_eq!(
+        overlay.read("b.txt").unwrap().as_deref(),
+        Some(b"short".as_slice())
+    );
+    let md = std::fs::metadata(fx.upper_dir.join("b.txt")).unwrap();
+    assert_eq!(md.len(), 5, "upper EOF must shrink to write");
+}
+
+#[test]
+fn ready_overwrite_open_without_writes_lands_empty_file() {
+    // CREATE_ALWAYS 语义打开后零写入即关闭 → 视图为空文件（Windows 在打开
+    // 时即清空；git checkout 对空文件 blob 正是 create + 零写入）。
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    let fctx = create_file(&fx, "\\wt-1\\b.txt");
+    write(&fx, &fctx, b"nonempty");
+    cleanup(&fx, fctx, 0);
+
+    fx.registry.mark_ready("wt-1").unwrap();
+    let fctx = open_overwrite(&fx, "\\wt-1\\b.txt").unwrap();
+    cleanup(&fx, fctx, 0);
+    assert_eq!(overlay.read("b.txt").unwrap().as_deref(), Some(&b""[..]));
+
+    // 空内容写回模板一致内容 → 仍回收回落 lower（dedupe 终裁语义不变）
+    let fctx = open_overwrite(&fx, "\\wt-1\\b.txt").unwrap();
+    write(&fx, &fctx, BEE);
+    cleanup(&fx, fctx, 0);
+    assert!(!fx.upper_dir.join("b.txt").exists());
+    assert_eq!(overlay.read("b.txt").unwrap().as_deref(), Some(BEE));
+}
+
+#[test]
+fn ready_overwrite_open_over_lower_skips_copy_up_and_truncates() {
+    // CREATE_ALWAYS 覆写 lower（从未改过）文件且内容更短：不复制模板全文，
+    // EOF 收缩到写入长度；写回模板内容仍回收回落 lower。
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+    fx.registry.mark_ready("wt-1").unwrap();
+
+    let fctx = open_overwrite(&fx, "\\wt-1\\exec.sh").unwrap();
+    write(&fx, &fctx, b"x");
+    cleanup(&fx, fctx, 0);
+    assert_eq!(overlay.read("exec.sh").unwrap().as_deref(), Some(b"x".as_slice()));
+    let st = overlay.stat("exec.sh").unwrap().unwrap();
+    assert!(st.mtime_ns > wtfs_core::FIXED_STAT_EPOCH_UNIX_NS, "upper 逻辑 mtime");
+
+    // 写回模板一致内容 → 回收 upper 回落 lower（dedupe 终裁语义保持）
+    let fctx = open_overwrite(&fx, "\\wt-1\\exec.sh").unwrap();
+    write(&fx, &fctx, RUN);
+    cleanup(&fx, fctx, 0);
+    assert!(!fx.upper_dir.join("exec.sh").exists());
+    assert_eq!(
+        overlay.read("exec.sh").unwrap().as_deref(),
+        Some(RUN)
+    );
+}
+
+#[test]
+fn set_allocation_size_shrink_truncates_eof_for_std_create_always() {
+    // B060100 回归（真机缺陷主路径）：Rust std 对 CREATE_ALWAYS 的模拟
+    // （rust-lang/rust#115745：OPEN_ALWAYS + FileAllocationInfo(0) 手动清空）
+    // 依赖"分配大小收缩即截断 EOF"的 NT 语义；分配收缩被忽略时 std::fs::write
+    // 会残留旧尾部（M4 真机复现："# hello\nd\n"）。
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    // initializing 制造已有 upper 文件（10 字节）
+    let fctx = create_file(&fx, "\\wt-1\\b.txt");
+    write(&fx, &fctx, b"0123456789");
+    cleanup(&fx, fctx, 0);
+
+    fx.registry.mark_ready("wt-1").unwrap();
+    // std::fs::write 的完整流：OPEN_IF 打开（无截断标记）→ 分配大小收缩
+    // 到 0 → 写新内容 → 关闭终裁
+    let fctx = open_as(&fx, "\\wt-1\\b.txt", FILE_OPEN_IF).unwrap();
+    let mut info = FileInfo::default();
+    fx.ctx.set_file_size(&fctx, 0, true, &mut info).unwrap();
+    write(&fx, &fctx, b"short");
+    cleanup(&fx, fctx, 0);
+    assert_eq!(
+        overlay.read("b.txt").unwrap().as_deref(),
+        Some(b"short".as_slice())
+    );
+    let md = std::fs::metadata(fx.upper_dir.join("b.txt")).unwrap();
+    assert_eq!(md.len(), 5, "EOF must shrink with allocation size");
+
+    // 增长/持平的分配大小仍是纯预占提示：不改变 EOF
+    let fctx = open_as(&fx, "\\wt-1\\b.txt", FILE_OPEN_IF).unwrap();
+    let mut info = FileInfo::default();
+    fx.ctx.set_file_size(&fctx, 4096, true, &mut info).unwrap();
+    assert_eq!(file_info(&fx, &fctx).file_size, 5);
+    cleanup(&fx, fctx, 0);
+    assert_eq!(
+        overlay.read("b.txt").unwrap().as_deref(),
+        Some(b"short".as_slice())
+    );
+}
+
+#[test]
+fn plain_open_partial_write_keeps_tail_beyond_written_range() {
+    // 普通打开（FILE_OPEN）+ 从 0 写更短内容 = 部分覆写（patch 语义）：
+    // EOF 不得收缩（否则编辑器/构建工具的小范围写会静默丢数据）。
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    let fctx = create_file(&fx, "\\wt-1\\b.txt");
+    write(&fx, &fctx, b"0123456789");
+    cleanup(&fx, fctx, 0);
+
+    fx.registry.mark_ready("wt-1").unwrap();
+    let fctx = open(&fx, "\\wt-1\\b.txt").unwrap();
+    write(&fx, &fctx, b"abc");
+    cleanup(&fx, fctx, 0);
+    assert_eq!(
+        overlay.read("b.txt").unwrap().as_deref(),
+        Some(b"abc3456789".as_slice()),
+        "patch write must keep the tail beyond the written range"
+    );
+}
+
+#[test]
 fn whiteout_delete_and_recreate() {
     let fx = fixture();
     let overlay = fx.registry.get("wt-1").unwrap();
@@ -379,6 +536,69 @@ fn whiteout_delete_and_recreate() {
     cleanup(&fx, fctx, 0);
     let s = sec(&fx, "\\wt-1\\b.txt").unwrap();
     assert!(s.attributes & wtfs_core::FileAttributes::ARCHIVE.bits() != 0);
+}
+
+#[test]
+fn set_delete_allows_empty_worktree_root_and_unregisters_on_cleanup() {
+    // B060100 回归：`git worktree remove` 的收尾 rmdir 必须能删 worktree 根。
+    // 正常文件/目录删除语义（非空拒绝、delete-on-close）不变。
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    // initializing（checkout 进行中）→ 拒绝根删除
+    let dctx = open(&fx, "\\wt-1").unwrap();
+    assert!(fx.ctx.set_delete(&dctx, &p("\\wt-1"), true).is_err());
+    drop(dctx);
+
+    fx.registry.mark_ready("wt-1").unwrap();
+
+    // 挂载根不可删
+    let root_ctx = open(&fx, "\\").unwrap();
+    assert!(fx.ctx.set_delete(&root_ctx, &p("\\"), true).is_err());
+    drop(root_ctx);
+
+    // 视图非空 → 目录非空拒绝（与普通目录语义一致）
+    let dctx = open(&fx, "\\wt-1").unwrap();
+    assert!(fx.ctx.set_delete(&dctx, &p("\\wt-1"), true).is_err());
+
+    // 自底向上删空视图（git 的删除顺序：文件 → 子目录 → 根）
+    for name in ["\\wt-1\\a\\1.txt", "\\wt-1\\a\\2.txt"] {
+        let fctx = open(&fx, name).unwrap();
+        fx.ctx.set_delete(&fctx, &p(name), true).unwrap();
+        cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    }
+    let dctx = open(&fx, "\\wt-1\\a").unwrap();
+    fx.ctx.set_delete(&dctx, &p("\\wt-1\\a"), true).unwrap();
+    cleanup(&fx, dctx, FspCleanupFlags::FspCleanupDelete as u32);
+    for name in ["\\wt-1\\b.txt", "\\wt-1\\exec.sh"] {
+        let fctx = open(&fx, name).unwrap();
+        fx.ctx.set_delete(&fctx, &p(name), true).unwrap();
+        cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    }
+    assert!(fx.registry.get("wt-1").is_some(), "视图清空前仍注册");
+
+    // 取消删除（set_delete(false)）→ cleanup 不注销
+    let dctx = open(&fx, "\\wt-1").unwrap();
+    fx.ctx.set_delete(&dctx, &p("\\wt-1"), true).unwrap();
+    fx.ctx.set_delete(&dctx, &p("\\wt-1"), false).unwrap();
+    cleanup(&fx, dctx, 0);
+    assert!(fx.registry.get("wt-1").is_some(), "取消删除后仍注册");
+
+    // delete-on-close 根删除 → cleanup 注销路由
+    let dctx = open(&fx, "\\wt-1").unwrap();
+    fx.ctx.set_delete(&dctx, &p("\\wt-1"), true).unwrap();
+    cleanup(&fx, dctx, 0);
+    assert!(fx.registry.get("wt-1").is_none(), "根删除后必须注销路由");
+    let events = drain_events(&fx);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.name == "\\wt-1" && e.action == FILE_ACTION_REMOVED)
+    );
+    // overlay DB 行已删（级联清子表），upper 物理目录保留为孤儿——由
+    // `wtfs gc` 回收（spec §6.6，与 daemon watcher 注销路径一致）
+    assert_eq!(overlay.store().state(WorktreeId(1)).unwrap(), None);
+    assert!(fx.upper_dir.exists(), "upper 目录留给 gc");
 }
 
 #[test]

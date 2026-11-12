@@ -158,6 +158,18 @@ fn real_mount_git_worktree_add_dedupes_and_reports_clean_status() {
     assert!(ok, "git status after edit failed: {out}");
     assert!(out.contains("M README.md"), "expected modification, got: {out:?}");
 
+    // 9b. B060100 回归：CREATE_ALWAYS（std::fs::write）用更短内容覆写已有
+    // upper 文件，读回内容必须精确等于写入内容（不得残留旧尾部）。
+    std::fs::write(worktree.join("README.md"), "# hi\n").unwrap();
+    let readme = std::fs::read(worktree.join("README.md")).expect("read back through mount");
+    assert_eq!(
+        readme, b"# hi\n",
+        "shorter in-place overwrite must truncate EOF, got {readme:?}"
+    );
+    let (ok, out) = git(&worktree, &["status", "--porcelain"]);
+    assert!(ok, "git status after shorter overwrite failed: {out}");
+    assert!(out.contains("M README.md"), "still modified, got: {out:?}");
+
     // 10. 卸载。
     volume.unmount();
 }

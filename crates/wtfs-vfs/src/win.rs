@@ -23,6 +23,29 @@ pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 /// `FILE_FLAG_DELETE_ON_CLOSE` 对应的 CreateOptions 位。
 pub const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
+/// NT 创建 disposition（fsctl.h `Req.Create.CreateOptions`：高 8 位 =
+/// disposition，低 24 位 = 选项；WinFSP 对 Open/CreateEx 原样传递该字段）。
+pub const FILE_SUPERSEDE: u32 = 0;
+pub const FILE_OPEN: u32 = 1;
+pub const FILE_CREATE: u32 = 2;
+pub const FILE_OPEN_IF: u32 = 3;
+pub const FILE_OVERWRITE: u32 = 4;
+pub const FILE_OVERWRITE_IF: u32 = 5;
+
+/// `CreateOptions` 高 8 位 → disposition。
+pub fn disposition_of(create_options: u32) -> u32 {
+    (create_options >> 24) & 0xff
+}
+
+/// 覆写类 disposition（`CREATE_ALWAYS`/`TRUNCATE_EXISTING`）：打开即清空
+/// 既有内容（B060100 的截断语义来源）。
+pub fn is_overwrite_disposition(create_options: u32) -> bool {
+    matches!(
+        disposition_of(create_options),
+        FILE_SUPERSEDE | FILE_OVERWRITE | FILE_OVERWRITE_IF
+    )
+}
+
 /// 写访问位（`FILE_ACCESS_RIGHTS`/`GENERIC_*`）：open 回调判断"写意图"用。
 pub const WRITE_ACCESS_MASK: u32 = 0x4000_0000 // GENERIC_WRITE
     | 0x1000_0000 // GENERIC_ALL

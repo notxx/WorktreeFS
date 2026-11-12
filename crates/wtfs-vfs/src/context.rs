@@ -21,6 +21,18 @@
 //!   upper）。判定逻辑全部复用 M2 合并实现（含祖先 whiteout 守护）。
 //! * `Ready`（worker 编辑流）：首次写 copy-up 后直接对 upper 物理 pwrite
 //!   （POSIX 可见性）；cleanup 时同样 post-hoc 经 `write_from` 比对回收。
+//! * 覆写打开语义（B060100）：`CREATE_ALWAYS`/`TRUNCATE_EXISTING` 有两条
+//!   真实路径，都保证最终 EOF 恒等于新内容：
+//!   ① 真覆写 disposition（`FILE_OVERWRITE_IF`/`FILE_OVERWRITE`/
+//!   `FILE_SUPERSEDE`，git 等）：WinFSP 用户态命中已有文件时只调
+//!   [`FileSystemContext::open`]（`CreateOptions` 高 8 位携带 disposition），
+//!   [`FileSystemContext::overwrite`] 由内核 best-effort 补发、可能不达，
+//!   因此 `open` 打 `truncate_open` 标记：首次写状态建立时 `set_len(0)`
+//!   （Lower 目标跳过 copy-up），零写入句柄在 cleanup 兜底清空。
+//!   ② Rust std ≥1.7x 对 `CREATE_ALWAYS` 的模拟（rust-lang/rust#115745：
+//!   `OPEN_ALWAYS`（=`FILE_OPEN_IF`）+ `FileAllocationInfo(0)` 手动清空）：
+//!   [`FileSystemContext::set_file_size`] 对分配大小收缩按 NT 语义截断
+//!   EOF（增长/持平仍是预占提示，不改变 EOF）。
 //! * 任何一步失败保留 upper 已写内容（正确性优先，spec §6.3.6）。
 //!
 //! 并发：回调以 `&self` 并发进入（FineGuard 多线程）；文件级状态在
@@ -36,7 +48,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use wtfs_core::{FileAttributes, Overlay, Resolution, Stat, TemplateFile, validate_relative_path};
+use wtfs_core::{
+    FileAttributes, Overlay, OverlayStore, Resolution, Stat, TemplateFile, validate_relative_path,
+};
 use winfsp::FspError;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileSecurity, FileInfo, FileSystemContext, OpenFileInfo,
@@ -52,8 +66,8 @@ use crate::win::{
     FILE_ACTION_RENAMED_OLD_NAME, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
     allocation_size, err_access_denied, err_collision, err_dir_not_empty,
     err_invalid_name, err_invalid_parameter, err_is_directory, err_no_more_files,
-    err_not_a_directory, err_not_found, filetime_from_unix_ns, fsp_err, mount_path,
-    split_first_component,
+    err_not_a_directory, err_not_found, filetime_from_unix_ns, fsp_err, is_overwrite_disposition,
+    mount_path, split_first_component,
 };
 
 /// 暂存溢写阈值：超过后暂存内容落到 upper 目录内的 `.wtfs-tmp-w-*`
@@ -165,6 +179,9 @@ pub struct FileContext {
     dir_buffer: DirBuffer,
     write: Mutex<Option<WriteState>>,
     delete_pending: AtomicBool,
+    /// 覆写类 disposition 打开（CREATE_ALWAYS/TRUNCATE_EXISTING，B060100）：
+    /// EOF 必须收缩到新内容——首次写状态建立时清空；零写入句柄 cleanup 兜底。
+    truncate_open: AtomicBool,
 }
 
 impl Drop for FileContext {
@@ -195,6 +212,7 @@ impl FileContext {
             dir_buffer: DirBuffer::new(),
             write: Mutex::new(None),
             delete_pending: AtomicBool::new(false),
+            truncate_open: AtomicBool::new(false),
         }
     }
 
@@ -207,7 +225,44 @@ impl FileContext {
             dir_buffer: DirBuffer::new(),
             write: Mutex::new(None),
             delete_pending: AtomicBool::new(false),
+            truncate_open: AtomicBool::new(false),
         }
+    }
+
+    /// 在 `upper_abs(rel)` 建立全新空 upper 文件的写状态（新建/whiteout 重建/
+    /// 覆写跳过 copy-up 共用；P1-1 祖先 whiteout 时同样按新文件落 upper）。
+    fn open_fresh_upper(
+        overlay: &Overlay,
+        rel: &str,
+    ) -> Result<WriteState, FspError> {
+        let path = overlay.upper_abs(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(FspError::from)?;
+        }
+        let file = open_rw_create(&path)?;
+        Ok(WriteState::InPlace { file, size: 0 })
+    }
+
+    /// 句柄视角的当前 EOF：写状态优先；覆写类打开（尚未写入）按 0 报告
+    /// （CREATE_ALWAYS 打开即清空，物理收缩随首次写/cleanup 落地）。
+    fn current_eof(&self) -> Result<u64, FspError> {
+        {
+            let slot = self.write.lock().map_err(|_| err_invalid_parameter())?;
+            match slot.as_ref() {
+                Some(WriteState::Staged(staged)) => return Ok(staged.size),
+                Some(WriteState::InPlace { size, .. }) => return Ok(*size),
+                None => {}
+            }
+        }
+        if self.truncate_open.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        let overlay = self.overlay.as_ref().ok_or_else(err_access_denied)?;
+        Ok(overlay
+            .stat(&self.rel)
+            .map_err(fsp_err)?
+            .map(|st| st.size)
+            .unwrap_or(0))
     }
 
     /// 首次写操作时建立写状态（spec §6.5 copy-up / §16.2 暂存策略）。
@@ -218,6 +273,7 @@ impl FileContext {
             let rel = self.rel.as_str();
             let initializing = overlay.is_initializing().map_err(fsp_err)?;
             *slot = Some(if initializing {
+                // 暂存写从空内容开始：覆写打开语义天然成立（终裁整段替换）。
                 WriteState::Staged(StagedWrite {
                     mem: Vec::new(),
                     spill: None,
@@ -226,11 +282,23 @@ impl FileContext {
                     hasher_valid: true,
                 })
             } else {
+                // 覆写类 disposition（CREATE_ALWAYS 等，B060100）：EOF 收缩到
+                // 新内容——upper 直接清空；lower 跳过 copy-up（内容将被整体
+                // 替换），终裁 write_from 的 dedupe 比对语义不变。
+                let truncate = self.truncate_open.load(Ordering::SeqCst);
                 match overlay.resolve(rel).map_err(fsp_err)? {
                     Resolution::Upper { path } => {
-                        let size = std::fs::metadata(&path).map_err(FspError::from)?.len();
-                        let file = open_rw(&path)?;
+                        let mut size = std::fs::metadata(&path).map_err(FspError::from)?.len();
+                        let mut file = open_rw(&path)?;
+                        if truncate {
+                            file.set_len(0).map_err(FspError::from)?;
+                            file.seek(SeekFrom::Start(0)).map_err(FspError::from)?;
+                            size = 0;
+                        }
                         WriteState::InPlace { file, size }
+                    }
+                    Resolution::Lower { .. } if truncate => {
+                        Self::open_fresh_upper(overlay, rel)?
                     }
                     Resolution::Lower { .. } => {
                         // copy-up；被祖先 whiteout 挡住（P1-1）时按新文件落 upper。
@@ -243,12 +311,7 @@ impl FileContext {
                         WriteState::InPlace { file, size }
                     }
                     Resolution::Whiteout | Resolution::NotFound => {
-                        let path = overlay.upper_abs(rel);
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).map_err(FspError::from)?;
-                        }
-                        let file = open_rw_create(&path)?;
-                        WriteState::InPlace { file, size: 0 }
+                        Self::open_fresh_upper(overlay, rel)?
                     }
                     Resolution::Directory { .. } => return Err(err_is_directory()),
                 }
@@ -559,7 +622,14 @@ impl FileSystemContext for WtfsContext {
                 if is_dir {
                     Ok(FileContext::dir(Some(name), Some(overlay), rel))
                 } else {
-                    Ok(FileContext::file(Some(name), overlay, rel))
+                    let fctx = FileContext::file(Some(name), overlay, rel);
+                    // 覆写类 disposition（B060100）：WinFSP 用户态对覆写打开
+                    // 只调 Open（Overwrite op 由内核 best-effort 补发、可能
+                    // 不达），EOF 收缩语义由标记在首次写/cleanup 落地。
+                    if is_overwrite_disposition(create_options) {
+                        fctx.truncate_open.store(true, Ordering::SeqCst);
+                    }
+                    Ok(fctx)
                 }
             }
         }
@@ -705,11 +775,26 @@ impl FileSystemContext for WtfsContext {
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
         let delete = winfsp::constants::FspCleanupFlags::FspCleanupDelete.is_flagged(flags)
             || context.delete_pending.load(Ordering::SeqCst);
-        if context.overlay.is_none() || context.rel.is_empty() {
-            return; // 挂载根/worktree 根：删除由 daemon/gc 负责
-        }
-        let overlay = context.overlay.clone().expect("checked above");
+        // 挂载根：删除由 daemon/gc 负责。
+        let overlay = match context.overlay.clone() {
+            Some(overlay) => overlay,
+            None => return,
+        };
         let name = context.route_name.clone().unwrap_or_default();
+        if context.rel.is_empty() {
+            // worktree 根 delete-on-close（`git worktree remove` 的最后一步
+            // rmdir，B060100）：与 daemon watcher 的元数据消失路径完全一致——
+            // 删 DB 行（级联清子表）+ 摘路由；upper 目录随后变孤儿，由
+            // `wtfs gc` 回收（spec §6.6）。
+            if delete {
+                if let Err(e) = overlay.store().unregister(overlay.worktree_id()) {
+                    tracing::warn!(worktree = %name, error = %e, "failed to unregister row");
+                }
+                self.registry.unregister(&name);
+                self.notify.push(&mount_path(&name, ""), FILE_ACTION_REMOVED);
+            }
+            return;
+        }
         let rel = context.rel.clone();
 
         let mut slot = match context.write.lock() {
@@ -776,6 +861,23 @@ impl FileSystemContext for WtfsContext {
                     match overlay.remove(&rel) {
                         Ok(_) => self.notify_change(&name, &rel, FILE_ACTION_REMOVED),
                         Err(e) => tracing::warn!(rel = %rel, error = %e, "delete failed"),
+                    }
+                } else if context.truncate_open.load(Ordering::SeqCst) {
+                    // 覆写类打开后零写入（B060100 兜底）：Windows CREATE_ALWAYS
+                    // 语义 = 打开即清空。走 write_from 终裁：与模板一致的空
+                    // 内容回落 lower，否则落空 upper（git 空文件 blob 路径）。
+                    let mut reader = Cursor::new(&[][..]);
+                    let result = overlay
+                        .write_from(&rel, &mut reader)
+                        .map(|_| ())
+                        .map_err(fsp_err);
+                    match result {
+                        Ok(()) => self.notify_change(&name, &rel, FILE_ACTION_MODIFIED),
+                        Err(e) => tracing::warn!(
+                            rel = %rel,
+                            error = %e,
+                            "zero-write overwrite finalize failed; content preserved"
+                        ),
                     }
                 }
             }
@@ -853,7 +955,7 @@ impl FileSystemContext for WtfsContext {
         let name = context.route_name.clone().unwrap_or_default();
         if constrained_io {
             // 受限写：不得越过当前 EOF（cache manager 语义）。
-            let size_now = context.handle_stat()?.size;
+            let size_now = context.current_eof()?;
             if offset >= size_now {
                 return Ok(0);
             }
@@ -861,7 +963,7 @@ impl FileSystemContext for WtfsContext {
             return self.write_chunk(context, &name, &buffer[..clip], offset, file_info);
         }
         let offset = if write_to_eof {
-            context.handle_stat()?.size
+            context.current_eof()?
         } else {
             offset
         };
@@ -1021,9 +1123,23 @@ impl FileSystemContext for WtfsContext {
     ) -> Result<(), FspError> {
         let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
         if context.rel.is_empty() {
-            return Err(err_access_denied());
+            // worktree 根目录删除（B060100，`git worktree remove` 的收尾
+            // rmdir）：initializing（checkout 进行中）拒绝；视图仍有可见条目
+            // 拒绝（与普通目录一致）。挂载根已在上面（overlay=None）拒绝。
+            if delete_file {
+                if overlay.is_initializing().map_err(fsp_err)? {
+                    return Err(err_access_denied());
+                }
+                let non_empty = !overlay.list("").map_err(fsp_err)?.is_empty();
+                if non_empty {
+                    return Err(err_dir_not_empty());
+                }
+            }
+            context.delete_pending.store(delete_file, Ordering::SeqCst);
+            return Ok(());
         }
-        // 句柄级操作，不做 initializing 门控（暂存句柄可 delete-on-close）。
+        // 非根路径：句柄级操作，不做 initializing 门控（暂存句柄可
+        // delete-on-close）。
         if delete_file && context.is_dir {
             let non_empty = !overlay.list(&context.rel).map_err(fsp_err)?.is_empty();
             if non_empty {
@@ -1044,8 +1160,12 @@ impl FileSystemContext for WtfsContext {
         if context.is_dir {
             return Err(err_is_directory());
         }
-        if set_allocation_size {
-            // 分配大小只是预占提示：接受但不改变 EOF。
+        // B060100：分配大小收缩即截断 EOF（NT 语义：EOF 不得超过分配大小）。
+        // Rust std 对 CREATE_ALWAYS 的模拟（rust-lang/rust#115745：OPEN_ALWAYS
+        // + FileAllocationInfo(0)）依赖此收缩截断；增长/持平仍只是预占提示，
+        // 不改变 EOF。
+        let shrink = set_allocation_size && new_size < context.current_eof()?;
+        if set_allocation_size && !shrink {
             let st = context.handle_stat()?;
             fill_file_info(file_info, &st);
             return Ok(());

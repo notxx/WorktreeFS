@@ -173,3 +173,44 @@ fn real_mount_git_worktree_add_dedupes_and_reports_clean_status() {
     // 10. 卸载。
     volume.unmount();
 }
+
+fn is_junction(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[test]
+#[ignore = "requires real WinFSP runtime"]
+fn real_mount_unmount_restores_empty_mount_dir_for_tower() {
+    // B070100 回归：卸载后 Tower 契约目录 `<repo>/.tower/worktrees` 必须
+    // 恢复为真实空目录——WinFSP 的 junction 删除（FILE_DELETE_ON_CLOSE）
+    // 异步生效，补建必须先等删除竞态窗口过去（restore 内部等待 + 重试），
+    // 失败升格为 error 日志，不得静默落空。
+    let base = tempfile::tempdir().expect("tempdir");
+    let repo = base.path().join("repo");
+    let mount_point = repo.join(".tower").join("worktrees");
+    std::fs::create_dir_all(&mount_point).unwrap();
+
+    let cfg = VfsConfig::new(&repo, base.path().join("store"));
+    let registry = Arc::new(VfsRegistry::open(cfg).unwrap());
+    let volume = mount_directory(&mount_point, registry)
+        .expect("WinFSP directory mount must succeed (is the WinFSP runtime installed?)");
+    assert!(is_junction(&mount_point), "mounted point must be a junction");
+
+    volume.unmount();
+
+    // unmount 返回即恢复完成：junction 消失 + 真实空目录回到 Tower 契约位。
+    assert!(
+        !is_junction(&mount_point),
+        "junction must be gone after unmount"
+    );
+    assert!(
+        mount_point.is_dir(),
+        "empty mount dir must be restored for Tower"
+    );
+    assert!(
+        std::fs::read_dir(&mount_point).unwrap().next().is_none(),
+        "restored mount dir must be empty"
+    );
+}

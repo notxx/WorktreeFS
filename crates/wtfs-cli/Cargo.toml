@@ -7,6 +7,23 @@ edition.workspace = true
 name = "wtfs"
 path = "src/main.rs"
 
+[dev-dependencies]
+tempfile.workspace = true
+
+# B070100：spawn detached wtfsd 时清自身 stdio 句柄的 inherit 标志
+# （阻断 CreateProcess bInheritHandles=TRUE 的管道写端泄漏）。
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+# B070100 回归（spawn stdio）：harness = false，同一测试二进制按
+# WTFS_TEST_ROLE 分饰 caller/child/grandchild 三进程。
+[[test]]
+name = "spawn_stdio_regression"
+harness = false
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

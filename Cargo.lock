@@ -1742,6 +1742,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha1",
  "tempfile",
  "thiserror",

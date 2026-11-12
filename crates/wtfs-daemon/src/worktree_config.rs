@@ -11,7 +11,11 @@
 //! 与其他 section 原样保留。
 
 use std::io::Write as _;
+use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
+
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
 
 /// config.worktree 必须包含的三项（key → 值）。
 pub const REQUIRED_KEYS: [(&str, &str); 3] = [
@@ -111,7 +115,9 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
-/// 写临时文件后替换；Windows 的 rename 不覆盖已存在文件，先删旧再改名。
+/// 写临时文件后用 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` 原子替换——
+/// rename 语义直接覆盖目标，不存在“先删后改名”的中间丢文件窗口
+/// （评审 P3；崩溃时最多残留 .wtfs-tmp 临时文件）。
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("wtfs-tmp");
     {
@@ -119,10 +125,15 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
         file.write_all(content.as_bytes())?;
         file.flush()?;
     }
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replaced =
+        unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_REPLACE_EXISTING) };
+    if replaced.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(std::io::Error::last_os_error());
     }
-    std::fs::rename(&tmp, path)
+    Ok(())
 }
 
 #[cfg(test)]

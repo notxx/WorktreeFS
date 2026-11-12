@@ -144,8 +144,22 @@ fn require_repo(repo: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
 // ---- mount / unmount / status ----
 
 fn cmd_mount(cfg: &DaemonConfig, base: Option<&str>, wait_secs: u64, json: bool) -> anyhow::Result<()> {
-    // 已有 daemon 在跑：直接报告。
+    // 已有 daemon 在跑：先确认它服务的正是请求的 repo——全局管道名下，
+    // 另一个 repo 的 daemon 在位时绝不能报“已挂载”假成功（评审 P2-1）。
     if let Ok(value) = pipe::call(&cfg.pipe_name, &PipeRequest::Status, Duration::from_millis(800)) {
+        let status_repo = value["status"]["repo_root"].as_str().unwrap_or_default();
+        let same_repo = !status_repo.is_empty()
+            && config::normalize_root(Path::new(status_repo)) == config::normalize_root(&cfg.repo_root);
+        if !same_repo {
+            print_pipe_value(&value, json);
+            bail!(
+                "pipe {} is already served by a daemon for repo {:?}, not {:?}; \
+                 stop that daemon first (wtfs unmount) or pass --pipe to choose another pipe",
+                cfg.pipe_name,
+                status_repo,
+                cfg.repo_root.display()
+            );
+        }
         print_pipe_value(&value, json);
         println!("wtfsd already running (see status above); nothing to mount");
         return Ok(());
@@ -182,12 +196,13 @@ fn cmd_mount(cfg: &DaemonConfig, base: Option<&str>, wait_secs: u64, json: bool)
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", exe.display()))?;
     println!("wtfsd spawned (pid {})", child.id());
 
-    // 等挂载就绪（轮询 status.mounted）。
+    // 等挂载就绪（轮询 status.mounted）。bail 路径顺带清理失败的 detached
+    // 进程，避免留下无人管的 wtfsd（评审 P3）。
     let deadline = std::time::Instant::now() + Duration::from_secs(wait_secs);
     loop {
         match pipe::call(&cfg.pipe_name, &PipeRequest::Status, Duration::from_millis(500)) {
@@ -198,12 +213,16 @@ fn cmd_mount(cfg: &DaemonConfig, base: Option<&str>, wait_secs: u64, json: bool)
                     println!("mounted at {}", cfg.mount_point.display());
                     return Ok(());
                 }
+                let _ = child.kill();
+                let _ = child.wait();
                 bail!("wtfsd is running but not mounted; check {}", cfg.log_dir.join("wtfsd.log").display());
             }
             Err(_) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
                 bail!(
                     "wtfsd did not become reachable within {wait_secs}s: {e}; check {}",
                     cfg.log_dir.join("wtfsd.log").display()

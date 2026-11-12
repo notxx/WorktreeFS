@@ -10,7 +10,7 @@
 //!   `{"ok":false,"error":"..."}`（[`ok_value`]/[`err_value`]）。
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -83,18 +83,26 @@ impl PipeControl {
         self.stop.load(Ordering::Relaxed)
     }
 
-    /// 请求停止：置标志并取消在途 accept（监听线程随即退出）。
+    /// 请求停止：置标志并取消在途 accept。
+    ///
+    /// 句柄的移除由监听线程在 `ConnectNamedPipe` 返回后负责（见
+    /// [`PipeServer::spawn`] 内的 listen_loop），这里只取消、不清空 pending，
+    /// 并短暂重试数次——覆盖“cancel 先于 IO 发起”的竞态窗口（stop 时句柄
+    /// 已在 pending、但监听线程尚未调 ConnectNamedPipe：首轮 CancelIoEx 是
+    /// no-op，重试轮会在 IO 真正挂起后命中）。
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.cancel_pending();
-    }
-
-    fn cancel_pending(&self) {
-        let handles = self.pending.lock().drain(..).collect::<Vec<_>>();
-        for raw in handles {
-            unsafe {
-                let _ = CancelIoEx(HANDLE(raw as *mut _), None);
+        for _ in 0..5 {
+            let handles = self.pending.lock().clone();
+            if handles.is_empty() {
+                break;
             }
+            for raw in &handles {
+                unsafe {
+                    let _ = CancelIoEx(HANDLE(*raw as *mut _), None);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -164,6 +172,8 @@ fn listen_loop(
             break;
         }
 
+        // 阻塞 accept。句柄在 pending 中保留到 ConnectNamedPipe 返回之后才移除，
+        // 保证此窗口内的 stop() 仍能 CancelIoEx 命中（评审 P2-2）。
         let connected = unsafe { ConnectNamedPipe(handle, None) };
         pending.lock().retain(|h| *h != raw);
 
@@ -212,8 +222,14 @@ fn serve_connection(file: File, handler: &Handler) {
             return;
         }
     });
+    // 读循环内限长（io::Take 对 BufRead 透传 read_until），无换行的异常
+    // 客户端最多消耗 MAX_LINE_BYTES+1 字节，超出即断开（评审 P3）。
     let mut bytes = Vec::new();
-    match reader.read_until(b'\n', &mut bytes) {
+    let read = {
+        let mut limited = reader.by_ref().take(MAX_LINE_BYTES as u64 + 1);
+        limited.read_until(b'\n', &mut bytes)
+    };
+    match read {
         Ok(0) => return, // 客户端未发请求即断开。
         Ok(_) => {}
         Err(e) => {
@@ -221,8 +237,8 @@ fn serve_connection(file: File, handler: &Handler) {
             return;
         }
     }
-    if bytes.len() > MAX_LINE_BYTES {
-        tracing::warn!(len = bytes.len(), "pipe request too large");
+    if !bytes.ends_with(b"\n") || bytes.len() > MAX_LINE_BYTES {
+        tracing::warn!(len = bytes.len(), "pipe request too large; dropping connection");
         return;
     }
     let line = String::from_utf8_lossy(&bytes);
@@ -365,8 +381,83 @@ mod tests {
         let response = call(&name, &PipeRequest::Status, Duration::from_secs(5)).unwrap();
         assert_eq!(response["ok"], serde_json::Value::Bool(true));
         control.stop();
-        join.join().expect("listener exits on stop");
+        join_with_watchdog(join, "listener exits on stop");
         // 停机后客户端不再可达（不再有监听实例）。
         assert!(call(&name, &PipeRequest::Status, Duration::from_millis(300)).is_err());
+    }
+
+    /// P2-2 回归：在监听线程 push 句柄与发起 ConnectNamedPipe 之间的竞态
+    /// 窗口内 stop，监听线程必须仍能退出（CancelIoEx 必须命中）。窗口是
+    /// 微秒级、无法确定性复现，用多轮“spawn 即 stop + 有请求穿插”的压力
+    /// 循环逼近；任一轮 join 超时即失败。
+    #[test]
+    fn stop_race_stress_never_hangs() {
+        for round in 0..30 {
+            let name = test_pipe_name("race");
+            let handler: Handler = Arc::new(|req| match req {
+                PipeRequest::Status => ok_value(serde_json::json!({"ok echo": true})),
+                _ => ok_value(serde_json::json!({})),
+            });
+            let (control, join) = PipeServer::spawn(name.clone(), handler).unwrap();
+            // 穿插请求：把监听循环推进过 accept/移交各阶段。超时取短值——
+            // stop 抢先取消 accept 时调用方按预期失败，不能拖慢整个测试。
+            let caller = {
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    let _ = call(&name, &PipeRequest::Status, Duration::from_millis(300));
+                })
+            };
+            control.stop();
+            caller.join().expect("caller thread");
+            join_with_watchdog(join, &format!("round {round}: listener must exit on stop"));
+        }
+    }
+
+    /// join 的看门狗：超时 panic（否则挂死会拖死整个测试进程）。
+    fn join_with_watchdog(join: std::thread::JoinHandle<()>, what: &str) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = join.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("timeout waiting for {what}"));
+    }
+
+    #[test]
+    fn oversized_request_is_capped_and_dropped() {
+        let name = test_pipe_name("cap");
+        let handler: Handler = Arc::new(|_| ok_value(serde_json::json!({"served": true})));
+        let (control, _join) = PipeServer::spawn(name.clone(), handler).unwrap();
+
+        // 无换行且超过 MAX_LINE_BYTES：服务端在读取循环内截断并断开，
+        // 不响应、不无界缓冲。
+        let mut file = open_pipe_with_retry(&name, Duration::from_secs(5));
+        let junk = vec![b'a'; MAX_LINE_BYTES + 4096];
+        file.write_all(&junk).unwrap();
+        file.flush().unwrap();
+        let mut line = String::new();
+        // 服务端不回响应且直接断开：读到 EOF（0 字节）。
+        let n = BufReader::new(file).read_line(&mut line).unwrap();
+        assert_eq!(n, 0, "server must drop oversized connection, got {line:?}");
+
+        // 管道实例随后被服务端释放；正常请求仍可用（新实例）。
+        let response = call(&name, &PipeRequest::Status, Duration::from_secs(5)).unwrap();
+        assert_eq!(response["served"], serde_json::Value::Bool(true));
+        control.stop();
+    }
+
+    /// 与服务端 `call` 同语义的带重试打开（监听线程建实例有间隙）。
+    fn open_pipe_with_retry(name: &str, timeout: Duration) -> std::fs::File {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match OpenOptions::new().read(true).write(true).open(name) {
+                Ok(file) => return file,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("pipe {name} never became available: {e}"),
+            }
+        }
     }
 }

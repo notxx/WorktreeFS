@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
 /// GC 上下文。`registry`/`mounted` 语义见模块文档。
@@ -170,6 +170,13 @@ pub fn apply(ctx: &GcContext<'_>, gc_plan: &GcPlan) -> anyhow::Result<GcReport> 
     let mut report = GcReport::default();
     let conn = open_meta_db(ctx.store_root)?;
 
+    // plan→apply 之间的 TOCTOU 防护：wt-N 名字被移除又重建会复用同一 id，
+    // 每个删除动作执行前按当前状态重新校验“仍是 dead”。
+    let current_registered = match &conn {
+        Some(conn) => registered_ids(conn)?,
+        None => HashSet::new(),
+    };
+
     for dead in &gc_plan.dead_dirs {
         let mounted_view = ctx.mounted;
         if mounted_view && ctx.registry.is_none() {
@@ -177,6 +184,15 @@ pub fn apply(ctx: &GcContext<'_>, gc_plan: &GcPlan) -> anyhow::Result<GcReport> 
                 "dead dir {}: mounted but no registry; cannot remove",
                 dead.name
             ));
+            continue;
+        }
+        let has_git_now = ctx.mount_root.join(&dead.name).join(".git").exists();
+        let registered_now = current_registered.contains(&dead.worktree_id);
+        if has_git_now && registered_now {
+            // 名字被移除又重建（或仅补回了 .git）：不再是 dead，跳过。
+            report
+                .errors
+                .push(format!("dead dir {} is live again; skipped", dead.name));
             continue;
         }
         // 1. 注销路由（在线模式：FS 视图目录随之消失）。
@@ -218,10 +234,8 @@ pub fn apply(ctx: &GcContext<'_>, gc_plan: &GcPlan) -> anyhow::Result<GcReport> 
                 continue;
             }
         }
-        // 空的 `wt-<id>` 父目录一并清掉。
-        if let Some(parent) = dir.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+        // `dir` 是 `<store>/worktrees/wt-<id>` 本身，已整体删除；其父目录
+        // 是所有 worktree 共享的 worktrees 根，保留不动。
         report.removed_uppers += 1;
     }
 
@@ -377,20 +391,6 @@ fn old_templates(
         });
     }
     Ok(out)
-}
-
-/// 是否存在指定 worktree 行（daemon 状态展示用）。
-#[allow(dead_code)]
-fn worktree_exists(conn: &Connection, id: i64) -> anyhow::Result<bool> {
-    let hit: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM worktrees WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| anyhow::anyhow!("query worktree {id}: {e}"))?;
-    Ok(hit.is_some())
 }
 
 #[cfg(test)]

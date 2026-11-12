@@ -17,6 +17,12 @@
 //!   按注册表加载后延迟绑定。
 //! * 测试：不触碰 WinFSP 的单测/集成测试二进制直接可加载运行；
 //!   `#[ignore]` 真实挂载测试在首次调用时经 ensure_winfsp_runtime 解析。
+//!
+//! 注意（评审 P3 备注）：link args 只对本 crate 的 bin/test 生效。当前
+//! wtfs.exe 不引用任何 WinFSP 符号（链接器死代码剥离后无 winfsp 导入），
+//! 无需处理；若将来 CLI 直接调用 wtfs-vfs，需在 wtfs-cli 侧加同样的
+//! /DELAYLOAD link-arg（或 build.rs），否则其二进制将带静态导入、
+//! 无 PATH 即启动失败。
 
 fn main() {
     println!("cargo:rustc-link-arg-bins=/DELAYLOAD:winfsp-x64.dll");

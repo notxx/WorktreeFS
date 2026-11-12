@@ -1,0 +1,22 @@
+[package]
+name = "wtfs-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+blake3.workspace = true
+dashmap.workspace = true
+gix-index.workspace = true
+lru.workspace = true
+memmap2.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

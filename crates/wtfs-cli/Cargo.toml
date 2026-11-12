@@ -1,0 +1,15 @@
+[package]
+name = "wtfs-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wtfs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+wtfs-daemon = { path = "../wtfs-daemon" }

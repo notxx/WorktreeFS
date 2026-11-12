@@ -1,0 +1,11 @@
+[package]
+name = "wtfs-git-shim"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "wtfs-git-shim"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true

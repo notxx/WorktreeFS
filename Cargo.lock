@@ -1777,10 +1777,12 @@ dependencies = [
 name = "wtfs-vfs"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crossbeam-channel",
  "dashmap",
  "lru",
  "parking_lot 0.13.0",
+ "tempfile",
  "tracing",
  "windows 0.62.2",
  "winfsp",

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+blake3.workspace = true
 crossbeam-channel.workspace = true
 dashmap.workspace = true
 lru.workspace = true
@@ -11,5 +12,16 @@ parking_lot.workspace = true
 tracing.workspace = true
 winfsp.workspace = true
 winfsp-sys.workspace = true
-windows.workspace = true
+# Win32_Security(_Authorization)：固定安全描述符经 SDDL 一次性转换；
+# Win32_Storage_FileSystem：GetDiskFreeSpaceExW（卷容量）。
+windows = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
 wtfs-core = { path = "../wtfs-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 crossbeam-channel.workspace = true
+parking_lot.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -14,3 +16,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 wtfs-core = { path = "../wtfs-core" }
 wtfs-vfs = { path = "../wtfs-vfs" }
+# 控制管道（\\.\pipe\wtfs）服务端所需：workspace 的 windows 条目 feature 不够，
+# 这里不用 workspace 继承，声明超集（同版本在构建图内自动统一）。
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }

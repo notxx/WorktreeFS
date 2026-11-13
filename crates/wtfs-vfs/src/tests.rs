@@ -1061,3 +1061,46 @@ fn staged_spill_write_finalizes_via_rename_with_single_fsync() {
     assert!(&data[5..].iter().all(|&b| b == b'x'));
     assert_eq!(count_files(&fx.upper_dir), 1);
 }
+
+/// P2-2 回归：溢写态 `set_file_size` 必须作用于溢写文件（而非已清空的
+/// mem 缓冲），spill 长度与 staged.size 一致；终裁后 upper EOF、stat size
+/// 与读回内容同步（收缩截尾、扩张零填充），哈希从溢写文件整段重算。
+#[test]
+fn staged_spill_set_file_size_updates_spill_eof_and_finalizes_consistently() {
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    // 32MiB+1024 触发溢写
+    let head: Vec<u8> = vec![b'a'; crate::context::STAGE_SPILL_BYTES + 1024];
+    let fctx = create_file(&fx, "\\wt-1\\big.bin");
+    assert_eq!(write(&fx, &fctx, &head), head.len() as u32);
+
+    // 收缩：溢写文件截尾，EOF 投影同步
+    let mut info = FileInfo::default();
+    let shrink = (crate::context::STAGE_SPILL_BYTES + 4) as u64;
+    fx.ctx.set_file_size(&fctx, shrink, false, &mut info).unwrap();
+    assert_eq!(file_info(&fx, &fctx).file_size, shrink);
+    // 增长：零填充扩张，EOF 投影同步
+    let grow = (crate::context::STAGE_SPILL_BYTES + 4096) as u64;
+    fx.ctx.set_file_size(&fctx, grow, false, &mut info).unwrap();
+    assert_eq!(file_info(&fx, &fctx).file_size, grow);
+    cleanup(&fx, fctx, 0);
+
+    // 终裁后：upper EOF = stat size = staged size；内容 = 头部 'a' + 尾部零
+    let md = std::fs::metadata(fx.upper_dir.join("big.bin")).unwrap();
+    assert_eq!(md.len(), grow, "upper EOF 必须与终裁 size 一致（旧实现发散）");
+    assert_eq!(overlay.stat("big.bin").unwrap().unwrap().size, grow);
+    let data = overlay.read("big.bin").unwrap().unwrap();
+    assert_eq!(data.len() as u64, grow);
+    assert!(
+        data[..crate::context::STAGE_SPILL_BYTES + 4].iter().all(|&b| b == b'a'),
+        "收缩保留头部内容"
+    );
+    assert!(
+        data[crate::context::STAGE_SPILL_BYTES + 4..].iter().all(|&b| b == 0),
+        "扩张区零填充"
+    );
+    // M9 目标不受影响：物化恰好 1 upper + 1 fsync
+    assert_eq!(overlay.io_stats().fsyncs(), 1);
+    assert_eq!(overlay.io_stats().upper_writes(), 1);
+}

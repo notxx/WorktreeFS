@@ -21,9 +21,10 @@
 //!   落库持久化；逐 upper 写的 `SELECT MAX(mtime_ns)` 已移除。
 //! * M9/B090100 暂存写零拷贝终裁：[`Overlay::finish_staged`] 接收暂存期已
 //!   流式算好的哈希/长度/内容（内存或溢写路径），一致 → 丢弃回落 lower
-//!   （零 upper 文件、零 fsync、零临时副本）；否则溢写同卷改名 / 内存直写
-//!   upper，恰好一次 fsync。[`Overlay::write_from`] 保留给 ready 就地与
-//!   通用写；[`OverlayIoStats`] 插桩 upper 物化与 fsync 次数（测试/诊断）。
+//!   （零 upper 文件、零 fsync、零临时副本）；否则溢写同卷改名 / 内存经
+//!   TEMP_PREFIX 临时文件原子改名，恰好一次 fsync。[`Overlay::write_from`]
+//!   保留给 ready 就地与通用写；[`OverlayIoStats`] 插桩 upper 物化与 fsync
+//!   次数（测试/诊断）。
 //!
 //! 约定：upper 根下以 `.wtfs-tmp` 开头的名字是写入临时文件，对视图不可见；
 //! 写入请求若使用该前缀名会被拒绝。
@@ -868,10 +869,12 @@ impl Overlay {
     ///   零临时副本**（干净 checkout 的目标路径；copy-up 后改回模板内容的
     ///   回收语义与 `write_from` 一致，既有 upper 一并删除）。
     /// * 否则物化 upper：[`StagedContent::Spill`] 在 upper 目录内同卷改名到
-    ///   最终 upper 路径，[`StagedContent::Memory`] 直写 upper，随后**恰好
-    ///   一次 fsync**（溢写先 fsync 再 rename：数据先于可见性落盘，崩溃不留
-    ///   半截可见文件）。记 `Upper`/`New`、撤销 whiteout、发放逻辑 mtime
-    ///   （initializing 期进 InitBatch 内存缓冲，ready 后逐操作落库）。
+    ///   最终 upper 路径，[`StagedContent::Memory`] 写 upper 内 TEMP_PREFIX
+    ///   隐藏临时文件后原子改名（P2-1：两条路径的最终 upper 路径都零半截
+    ///   文件），随后**恰好一次 fsync**（溢写先 fsync 再 rename：数据先于
+    ///   可见性落盘，崩溃不留半截可见文件）。记 `Upper`/`New`、撤销
+    ///   whiteout、发放逻辑 mtime（initializing 期进 InitBatch 内存缓冲，
+    ///   ready 后逐操作落库）。
     ///
     /// `Spill` 的句柄必须已由调用方关闭。返回 (决策, 字节数)；失败时溢写
     /// 文件保留（调用方 best-effort 清理），upper 既有内容不受影响。
@@ -912,9 +915,10 @@ impl Overlay {
             // 祖先目录被 whiteout：回落会让刚写入的文件不可见——保留内容
             // 继续走 Upper 路径（仅错过一次 dedupe 机会）。
         }
-        if let Some(parent) = final_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = final_path
+            .parent()
+            .ok_or_else(|| Error::Overlay(format!("bad upper path for {rel:?}")))?;
+        std::fs::create_dir_all(parent)?;
         match content {
             StagedContent::Spill(spill) => {
                 // 先 fsync 溢写内容再同卷 rename：恰好一次 fsync，且数据先于
@@ -932,10 +936,30 @@ impl Overlay {
             }
             StagedContent::Memory(data) => {
                 debug_assert_eq!(data.len() as u64, size, "memory staged size mismatch");
-                let mut file = std::fs::File::create(&final_path)?;
-                file.write_all(data)?;
-                file.sync_all()?;
+                // P2-1：内存物化同样经 TEMP_PREFIX 隐藏临时文件 → fsync →
+                // 原子 rename——最终 upper 路径零半截文件（与 write_from 同
+                // 语义，代价同为恰好一次 fsync，只多一次 rename）；任何中途
+                // 失败只残留对视图隐藏的临时文件（gc 回收）。
+                let tmp = parent.join(format!(
+                    "{TEMP_PREFIX}-{}-{}",
+                    std::process::id(),
+                    TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                let staged_io = (|| -> std::io::Result<()> {
+                    let mut file = std::fs::File::create(&tmp)?;
+                    file.write_all(data)?;
+                    file.sync_all()?;
+                    Ok(())
+                })();
+                if let Err(e) = staged_io {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
                 self.io.record_fsync();
+                if let Err(e) = std::fs::rename(&tmp, &final_path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
             }
         }
         self.io.record_upper_write();
@@ -1863,6 +1887,46 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, crate::Error::Overlay(_)));
         assert_eq!(of.io_stats().fsyncs(), 0);
+    }
+
+    /// P2-1 回归：内存物化经 TEMP_PREFIX 临时文件原子改名——成功后零临时
+    /// 残留、最终内容/长度精确；rename 失败（目标被目录占用）时最终路径
+    /// 不被部分覆写、临时文件被清理。最终路径只经原子 rename 替换。
+    #[test]
+    fn finish_staged_memory_materializes_via_temp_rename_without_residue() {
+        let fx = fixture(true);
+        let of = make(&fx, true);
+        let (state, size) = of
+            .finish_staged("new.txt", crate::dedupe::hash_bytes(b"payload!"), 8, StagedContent::Memory(b"payload!"))
+            .unwrap();
+        assert_eq!(state, DedupeState::New);
+        assert_eq!(size, 8);
+        let temp_residue = || -> Vec<String> {
+            std::fs::read_dir(&fx.upper_dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(TEMP_PREFIX))
+                .collect()
+        };
+        assert!(temp_residue().is_empty(), "临时文件必须经 rename 消费");
+        let md = std::fs::metadata(fx.upper_dir.join("new.txt")).unwrap();
+        assert_eq!(md.len(), 8);
+        assert_eq!(of.read("new.txt").unwrap().as_deref(), Some(b"payload!".as_slice()));
+        assert_eq!(of.io_stats().fsyncs(), 1);
+        assert_eq!(of.io_stats().upper_writes(), 1);
+
+        // rename 失败（目标为目录）：终裁报错，目录不被替换，无临时残留；
+        // 失败发生在 fsync 之后（物化恰好一次 fsync 已计数）。
+        std::fs::create_dir(fx.upper_dir.join("dir.txt")).unwrap();
+        let err = of
+            .finish_staged("dir.txt", crate::dedupe::hash_bytes(b"x"), 1, StagedContent::Memory(b"x"))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Io(_)));
+        assert!(fx.upper_dir.join("dir.txt").is_dir(), "目录不被部分覆写");
+        assert!(temp_residue().is_empty(), "失败路径清理临时文件");
+        assert_eq!(of.io_stats().fsyncs(), 2);
+        assert_eq!(of.io_stats().upper_writes(), 1, "失败的 rename 不计物化");
     }
 
     // ---- M8/B080100：批量元数据与 O(1) 事务 ----

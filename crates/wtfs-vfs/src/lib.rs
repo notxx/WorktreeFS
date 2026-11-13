@@ -11,8 +11,8 @@
 //! * 写入路径 dedupe：暂存/就地两段式。暂存流（checkout）cleanup/flush 时经
 //!   [`wtfs_core::Overlay::finish_staged`] 直接终裁（M9/B090100 零拷贝：
 //!   一致则丢弃暂存回落 lower——零 upper 文件、零 fsync、零临时副本；不同才
-//!   溢写改名 / 内存直写 upper，恰好一次 fsync）；就地流（worker 编辑）仍经
-//!   [`wtfs_core::Overlay::write_from`] post-hoc 比对回收。失败保留
+//!   溢写改名 / 内存经临时文件原子改名 upper，恰好一次 fsync）；就地流（worker
+//!   编辑）仍经 [`wtfs_core::Overlay::write_from`] post-hoc 比对回收。失败保留
 //!   upper 全量内容（正确性优先）。I/O 计数器见
 //!   [`wtfs_core::Overlay::io_stats`]。
 //! * stat：lower 报 [`wtfs_core::Stat::fixed_lower`] 固定值（与 index 对

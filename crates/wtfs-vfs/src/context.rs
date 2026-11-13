@@ -19,8 +19,8 @@
 //!   （与 ready 后 lower 一致，index 对齐），否则报逻辑 mtime。cleanup/flush
 //!   时经 [`wtfs_core::Overlay::finish_staged`] 直接终裁（M9/B090100 零拷贝：
 //!   一致 → 丢弃暂存回落 lower，零 upper 文件、零 fsync、零临时副本；不同 →
-//!   溢写同卷改名 / 内存直写 upper，恰好一次 fsync）。判定逻辑全部复用
-//!   M2 合并实现（含祖先 whiteout 守护）。
+//!   溢写同卷改名 / 内存经临时文件原子改名 upper，恰好一次 fsync）。判定
+//!   逻辑全部复用 M2 合并实现（含祖先 whiteout 守护）。
 //! * `Ready`（worker 编辑流）：首次写 copy-up 后直接对 upper 物理 pwrite
 //!   （POSIX 可见性）；cleanup 时同样 post-hoc 经 `write_from` 比对回收。
 //! * 覆写打开语义（B060100）：`CREATE_ALWAYS`/`TRUNCATE_EXISTING` 有两条
@@ -1187,7 +1187,19 @@ impl FileSystemContext for WtfsContext {
             let mut slot = context.ensure_write_state()?;
             match slot.as_mut().expect("ensure_write_state initializes") {
                 WriteState::Staged(staged) => {
-                    staged.mem.resize(new_size as usize, 0);
+                    match staged.spill.as_mut() {
+                        // 溢写态（P2-2）：EOF 收缩/扩张直接作用于溢写文件，
+                        // 保持 spill 长度与 staged.size 一致；mem 缓冲已清空，
+                        // 不得按新长度重分配零缓冲（旧实现的发散源）。
+                        // set_len 之后显式定位到新 EOF；收缩截断尾部、扩张
+                        // 零填充，后续读写均按绝对偏移显式 seek，位置语义不变。
+                        // 增量哈希失效：终裁经 staged_hash 从溢写文件整段重算。
+                        Some(spill) => {
+                            spill.file.set_len(new_size).map_err(FspError::from)?;
+                            spill.file.seek(SeekFrom::Start(new_size)).map_err(FspError::from)?;
+                        }
+                        None => staged.mem.resize(new_size as usize, 0),
+                    }
                     staged.size = new_size;
                     staged.hasher_valid = false;
                 }

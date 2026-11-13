@@ -269,6 +269,9 @@ fn staged_write_dedupe_discards_template_identical_content() {
     // 与模板一致 → upper 空、视图回落 lower
     assert!(!fx.upper_dir.join("b.txt").exists());
     assert_eq!(overlay.read("b.txt").unwrap().as_deref(), Some(BEE));
+    // M8/B080100：initializing 期 dedupe 决策进内存批量缓冲，mark_ready
+    // 单事务落库——先切 ready 再断言 store 行。
+    overlay.mark_ready().unwrap();
     assert_eq!(
         overlay
             .store()
@@ -300,6 +303,8 @@ fn staged_write_modified_content_lands_upper_with_logical_mtime() {
         overlay.read("b.txt").unwrap().as_deref(),
         Some(b"changed".as_slice())
     );
+    // M8/B080100：initializing 期 dedupe/stat 行在批量缓冲，mark_ready 落库。
+    overlay.mark_ready().unwrap();
     assert_eq!(
         overlay
             .store()

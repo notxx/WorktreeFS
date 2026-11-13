@@ -7,11 +7,14 @@
 //! * 存储契约：[`TemplateStore`] 与 [`OverlayStore`]，由 wtfs-vfs（读路径、dedupe）
 //!   与 wtfs-daemon（模板管理、注册表、gc）共同使用。
 //! * 路径校验：[`validate_relative_path`]（Windows 保留名/保留尾字符，spec §11.2）。
-//! * M2 实现：[`Db`]（schema/迁移）、[`SqliteTemplateStore`]（checkout + index
-//!   快照 + blake3 清单）、[`SqliteOverlayStore`]（worktrees/whiteouts/renames/
-//!   file_ids/stat_cache）、[`Overlay`]（upper>whiteout>lower 解析、目录合并、
-//!   rename map、写路径 dedupe、固定 stat/逻辑 mtime）、[`dedupe`]（三态决策）、
-//!   [`tower_state`]（state.json → 模板 base，缺失则全量 copy 兜底）。
+//! * M2 实现：[`Db`](db::Db)（schema/迁移）、[`SqliteTemplateStore`](template_store::SqliteTemplateStore)
+//!   （checkout + index 快照 + blake3 清单）、[`SqliteOverlayStore`](overlay_store::SqliteOverlayStore)
+//!   （worktrees/whiteouts/renames/file_ids/stat_cache）、[`Overlay`](overlay::Overlay)
+//!   （upper>whiteout>lower 解析、目录合并、rename map、写路径 dedupe、固定 stat/
+//!   逻辑 mtime）、[`dedupe`]（三态决策）、[`tower_state`]（state.json → 模板 base，
+//!   缺失则全量 copy 兜底）。
+//! * M8/B080100：initializing 期内存元数据批量（`overlay_batch`），mark_ready
+//!   单事务整批落库 + 状态切换原子生效；全量 checkout 事务数 O(1)。
 //!
 //! 稳定性承诺：类型与 trait 只做 additive 变更；方法语义不变。
 //! 两个 trait 均为对象安全（`Send + Sync`），可放入 `Arc<dyn TemplateStore>`。
@@ -28,6 +31,7 @@ use serde::{Deserialize, Serialize};
 pub mod db;
 pub mod dedupe;
 mod gitx;
+mod overlay_batch;
 pub mod overlay;
 pub mod overlay_store;
 pub mod template_store;

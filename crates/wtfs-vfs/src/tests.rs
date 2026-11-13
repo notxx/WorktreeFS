@@ -940,3 +940,124 @@ fn open_file_info_helper_is_zeroed() {
     let info = blank_open_file_info_for_test();
     assert_eq!(info.normalized_name_size(), 0);
 }
+
+// ---- M9/B090100：暂存写零拷贝终裁（I/O 插桩断言） ----
+
+/// 递归统计目录下的文件数（upper 零残留断言用）。
+fn count_files(dir: &std::path::Path) -> usize {
+    let mut files = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for entry in rd.flatten() {
+                if entry.path().is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    files += 1;
+                }
+            }
+        }
+    }
+    files
+}
+
+/// 干净 N 文件 checkout 走 VFS 回调：零 upper 文件、零 fsync；决策进批量
+/// 缓冲，mark_ready 落库后视图回落 lower。
+#[test]
+fn clean_checkout_via_vfs_creates_zero_upper_files_and_zero_fsyncs() {
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    for (name, rel, content) in [
+        ("\\wt-1\\a\\1.txt", "a/1.txt", ONE),
+        ("\\wt-1\\a\\2.txt", "a/2.txt", TWO),
+        ("\\wt-1\\b.txt", "b.txt", BEE),
+        ("\\wt-1\\exec.sh", "exec.sh", RUN),
+    ] {
+        let fctx = create_file(&fx, name);
+        assert_eq!(write(&fx, &fctx, content), content.len() as u32);
+        // fstat 投影：一致内容报固定 stat（index 对齐语义不变）
+        let info = file_info(&fx, &fctx);
+        assert_eq!(info.file_size, content.len() as u64);
+        assert_eq!(
+            info.last_write_time,
+            filetime_from_unix_ns(wtfs_core::FIXED_STAT_EPOCH_UNIX_NS)
+        );
+        cleanup(&fx, fctx, 0);
+        assert!(matches!(overlay.resolve(rel).unwrap(), Resolution::Lower { .. }));
+    }
+
+    assert_eq!(overlay.io_stats().fsyncs(), 0, "干净 checkout 必须零 fsync");
+    assert_eq!(
+        overlay.io_stats().upper_writes(),
+        0,
+        "干净 checkout 必须零 upper 物化"
+    );
+    assert_eq!(count_files(&fx.upper_dir), 0, "upper 整棵零文件（含零临时副本）");
+    overlay.mark_ready().unwrap();
+    let states = overlay.store().dedupe_states(WorktreeId(1)).unwrap();
+    for rel in ["a/1.txt", "a/2.txt", "b.txt", "exec.sh"] {
+        assert_eq!(states.get(rel), Some(&DedupeState::Lower));
+    }
+    assert_eq!(overlay.read("b.txt").unwrap().as_deref(), Some(BEE));
+}
+
+/// 改动文件恰好 1 upper 物化 + 1 fsync；混合 checkout 中一致文件不增加计数。
+#[test]
+fn changed_file_via_vfs_lands_upper_with_exactly_one_fsync() {
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    let fctx = create_file(&fx, "\\wt-1\\b.txt");
+    write(&fx, &fctx, b"changed");
+    cleanup(&fx, fctx, 0);
+    assert!(fx.upper_dir.join("b.txt").is_file());
+    assert_eq!(overlay.io_stats().fsyncs(), 1);
+    assert_eq!(overlay.io_stats().upper_writes(), 1);
+
+    // 混合 checkout：其余文件与模板一致 → 计数不再增长
+    for (name, content) in [("\\wt-1\\a\\1.txt", ONE), ("\\wt-1\\exec.sh", RUN)] {
+        let fctx = create_file(&fx, name);
+        write(&fx, &fctx, content);
+        cleanup(&fx, fctx, 0);
+    }
+    assert_eq!(overlay.io_stats().fsyncs(), 1, "一致内容零 fsync");
+    assert_eq!(overlay.io_stats().upper_writes(), 1, "一致内容零物化");
+    overlay.mark_ready().unwrap();
+    assert_eq!(overlay.read("b.txt").unwrap().as_deref(), Some(b"changed".as_slice()));
+    assert_eq!(overlay.read("a/1.txt").unwrap().as_deref(), Some(ONE));
+}
+
+/// 溢写暂存（>32MiB）终裁：溢写文件同卷 rename 消费，恰好一次 fsync；
+/// 乱序小写使增量哈希失效后终裁从溢写文件整段重算，语义不变。
+#[test]
+fn staged_spill_write_finalizes_via_rename_with_single_fsync() {
+    let fx = fixture();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    let big: Vec<u8> = vec![b'x'; crate::context::STAGE_SPILL_BYTES + 1];
+    let fctx = create_file(&fx, "\\wt-1\\big.bin");
+    assert_eq!(write(&fx, &fctx, &big), big.len() as u32);
+    let spill_count = |fx: &Fixture| {
+        std::fs::read_dir(&fx.upper_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".wtfs-tmp-w-"))
+            .count()
+    };
+    assert_eq!(spill_count(&fx), 1, "超阈值内容必须溢写");
+
+    // 乱序写：增量哈希失效 → 终裁走 hash_file 整段重算（内容仍一致判定）
+    write_at_offset(&fx, &fctx, 0, b"HEAD!");
+    cleanup(&fx, fctx, 0);
+
+    assert_eq!(overlay.io_stats().fsyncs(), 1, "溢写物化恰好一次 fsync");
+    assert_eq!(overlay.io_stats().upper_writes(), 1);
+    assert_eq!(spill_count(&fx), 0, "溢写文件经 rename 消费");
+    assert_eq!(overlay.stat("big.bin").unwrap().unwrap().size, big.len() as u64);
+    let data = overlay.read("big.bin").unwrap().unwrap();
+    assert_eq!(data.len(), big.len());
+    assert_eq!(&data[..5], b"HEAD!", "乱序写生效");
+    assert!(&data[5..].iter().all(|&b| b == b'x'));
+    assert_eq!(count_files(&fx.upper_dir), 1);
+}

@@ -14,11 +14,13 @@
 //! 写路径（spec §6.3/§16.2 折衷）：
 //!
 //! * `Initializing`（checkout 流）：内容先暂存（内存，>32MiB 溢写
-//!   `.wtfs-tmp-w-*` 隐藏文件）。Git 在 close 前 `fstat`，[`FileContext`]
-//!   投影最终 stat——内容与模板一致时报固定 stat（与 ready 后 lower 一致，
-//!   index 对齐），否则报逻辑 mtime。cleanup/flush 时经
-//!   [`Overlay::write_from`] 终裁（一致 → 丢弃副本回落 lower；不同 → 落
-//!   upper）。判定逻辑全部复用 M2 合并实现（含祖先 whiteout 守护）。
+//!   `.wtfs-tmp-w-*` 隐藏文件），暂存期流式算好 blake3。Git 在 close 前
+//!   `fstat`，[`FileContext`] 投影最终 stat——内容与模板一致时报固定 stat
+//!   （与 ready 后 lower 一致，index 对齐），否则报逻辑 mtime。cleanup/flush
+//!   时经 [`wtfs_core::Overlay::finish_staged`] 直接终裁（M9/B090100 零拷贝：
+//!   一致 → 丢弃暂存回落 lower，零 upper 文件、零 fsync、零临时副本；不同 →
+//!   溢写同卷改名 / 内存直写 upper，恰好一次 fsync）。判定逻辑全部复用
+//!   M2 合并实现（含祖先 whiteout 守护）。
 //! * `Ready`（worker 编辑流）：首次写 copy-up 后直接对 upper 物理 pwrite
 //!   （POSIX 可见性）；cleanup 时同样 post-hoc 经 `write_from` 比对回收。
 //! * 覆写打开语义（B060100）：`CREATE_ALWAYS`/`TRUNCATE_EXISTING` 有两条
@@ -42,14 +44,15 @@
 
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wtfs_core::{
-    FileAttributes, Overlay, OverlayStore, Resolution, Stat, TemplateFile, validate_relative_path,
+    FileAttributes, Overlay, OverlayStore, Resolution, StagedContent, Stat, TemplateFile,
+    validate_relative_path,
 };
 use winfsp::FspError;
 use winfsp::filesystem::{
@@ -72,7 +75,7 @@ use crate::win::{
 
 /// 暂存溢写阈值：超过后暂存内容落到 upper 目录内的 `.wtfs-tmp-w-*`
 /// 隐藏文件（core 对该前缀隐藏/拒绝写，视为临时文件）。
-const STAGE_SPILL_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const STAGE_SPILL_BYTES: usize = 32 * 1024 * 1024;
 
 /// 挂载根的稳定 ino。
 const MOUNT_ROOT_INO: u64 = 1;
@@ -240,6 +243,7 @@ impl FileContext {
             std::fs::create_dir_all(parent).map_err(FspError::from)?;
         }
         let file = open_rw_create(&path)?;
+        overlay.io_stats().record_upper_write();
         Ok(WriteState::InPlace { file, size: 0 })
     }
 
@@ -320,16 +324,24 @@ impl FileContext {
         Ok(slot)
     }
 
-    /// 暂存内容哈希（增量有效用增量；否则整段重算）。
-    fn staged_hash(staged: &StagedWrite) -> Option<wtfs_core::FileHash> {
+    /// 暂存内容哈希（增量有效用增量；否则整段重算）。溢写读取失败返回 IO 错误
+    /// （终裁路径据此报错，投影 stat 路径按 `.ok()` 降级为不匹配）。
+    fn staged_hash(staged: &StagedWrite) -> std::io::Result<wtfs_core::FileHash> {
         if staged.hasher_valid {
-            return Some(wtfs_core::FileHash(
+            return Ok(wtfs_core::FileHash(
                 *staged.hasher.clone().finalize().as_bytes(),
             ));
         }
         match &staged.spill {
-            Some(spill) => wtfs_core::hash_file(&spill.path).ok().map(|(h, _)| h),
-            None => Some(wtfs_core::hash_bytes(&staged.mem)),
+            Some(spill) => match wtfs_core::hash_file(&spill.path) {
+                Ok((h, _)) => Ok(h),
+                Err(wtfs_core::Error::Io(e)) => Err(e),
+                Err(other) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    other.to_string(),
+                )),
+            },
+            None => Ok(wtfs_core::hash_bytes(&staged.mem)),
         }
     }
 
@@ -345,7 +357,7 @@ impl FileContext {
             && staged.size == template.as_ref().map_or(0, |t| t.size)
             && template
                 .as_ref()
-                .zip(Self::staged_hash(staged))
+                .zip(Self::staged_hash(staged).ok())
                 .is_some_and(|(t, h)| h == t.hash);
         if matches_template {
             let t = template.as_ref().expect("checked above");
@@ -371,8 +383,10 @@ impl FileContext {
         })
     }
 
-    /// cleanup/flush 终裁：暂存/就地内容经 [`Overlay::write_from`] 判定
-    /// dedupe（一致 → 回落 lower；不同/新 → 落 upper + bookkeeping）。
+    /// cleanup/flush 终裁：暂存内容经 [`Overlay::finish_staged`] 判定
+    /// dedupe（M9/B090100 零拷贝：一致 → 丢弃暂存回落 lower，零 upper/零
+    /// fsync；不同/新 → 溢写改名 / 内存直写 upper + 恰好一次 fsync）；
+    /// 就地写（ready 编辑流）保持 [`Overlay::write_from`] post-hoc 比对。
     /// 失败时保留 upper 已写内容（全量 copy 兜底）。
     fn finalize_write(&self) -> Result<(), FspError> {
         let overlay = self.overlay.clone().ok_or_else(err_access_denied)?;
@@ -381,23 +395,8 @@ impl FileContext {
         let Some(state) = slot.take() else {
             return Ok(());
         };
-        let result = match state {
-            WriteState::Staged(staged) => {
-                let spill_path = staged.spill.as_ref().map(|s| s.path.clone());
-                let result = match &spill_path {
-                    Some(path) => File::open(path).map_err(FspError::from).and_then(|mut f| {
-                        overlay.write_from(&rel, &mut f).map(|_| ()).map_err(fsp_err)
-                    }),
-                    None => {
-                        let mut reader = Cursor::new(&staged.mem);
-                        overlay.write_from(&rel, &mut reader).map(|_| ()).map_err(fsp_err)
-                    }
-                };
-                if let Some(path) = spill_path {
-                    let _ = std::fs::remove_file(&path);
-                }
-                result
-            }
+        match state {
+            WriteState::Staged(staged) => Self::finalize_staged(&overlay, &rel, staged),
             WriteState::InPlace { file, size: _ } => {
                 // 关句柄再重开：Windows 上 rename 覆盖打开中的文件会失败。
                 drop(file);
@@ -408,7 +407,30 @@ impl FileContext {
                     Ok(mut f) => overlay.write_from(&rel, &mut f).map(|_| ()).map_err(fsp_err),
                 }
             }
+        }
+    }
+
+    /// 暂存终裁（M9/B090100）：暂存期算好的哈希/长度直接交
+    /// [`Overlay::finish_staged`]，不再把内容重写进临时副本。溢写句柄先关
+    /// （Windows rename 前置条件）；失败时 best-effort 清理溢写文件，
+    /// upper 既有内容不受影响。
+    fn finalize_staged(overlay: &Overlay, rel: &str, staged: StagedWrite) -> Result<(), FspError> {
+        let hash = Self::staged_hash(&staged).map_err(FspError::from)?;
+        let size = staged.size;
+        let StagedWrite { mem, spill, .. } = staged;
+        let spill_path = spill.as_ref().map(|s| s.path.clone());
+        drop(spill);
+        let content = match spill_path.as_deref() {
+            Some(path) => StagedContent::Spill(path),
+            None => StagedContent::Memory(mem.as_slice()),
         };
+        let result = overlay
+            .finish_staged(rel, hash, size, content)
+            .map(|_| ())
+            .map_err(fsp_err);
+        if let Some(path) = &spill_path {
+            let _ = std::fs::remove_file(path);
+        }
         result
     }
 
@@ -810,20 +832,7 @@ impl FileSystemContext for WtfsContext {
                     discard_staged(staged);
                     return;
                 }
-                let spill_path = staged.spill.as_ref().map(|s| s.path.clone());
-                let result = match &spill_path {
-                    Some(path) => File::open(path).map_err(FspError::from).and_then(|mut f| {
-                        overlay.write_from(&rel, &mut f).map(|_| ()).map_err(fsp_err)
-                    }),
-                    None => {
-                        let mut reader = Cursor::new(&staged.mem);
-                        overlay.write_from(&rel, &mut reader).map(|_| ()).map_err(fsp_err)
-                    }
-                };
-                if let Some(path) = spill_path {
-                    let _ = std::fs::remove_file(&path);
-                }
-                match result {
+                match FileContext::finalize_staged(&overlay, &rel, staged) {
                     Ok(()) => self.notify_change(&name, &rel, FILE_ACTION_MODIFIED),
                     Err(e) => tracing::warn!(
                         rel = %rel,
@@ -864,11 +873,15 @@ impl FileSystemContext for WtfsContext {
                     }
                 } else if context.truncate_open.load(Ordering::SeqCst) {
                     // 覆写类打开后零写入（B060100 兜底）：Windows CREATE_ALWAYS
-                    // 语义 = 打开即清空。走 write_from 终裁：与模板一致的空
+                    // 语义 = 打开即清空。走 finish_staged 终裁：与模板一致的空
                     // 内容回落 lower，否则落空 upper（git 空文件 blob 路径）。
-                    let mut reader = Cursor::new(&[][..]);
                     let result = overlay
-                        .write_from(&rel, &mut reader)
+                        .finish_staged(
+                            &rel,
+                            wtfs_core::hash_bytes(&[]),
+                            0,
+                            StagedContent::Memory(&[]),
+                        )
                         .map(|_| ())
                         .map_err(fsp_err);
                     match result {

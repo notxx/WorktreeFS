@@ -6,21 +6,33 @@
 //!   lower（[`crate::DedupeState::Lower`]），不同则落 upper；模板缺失时全部
 //!   upper（全量 copy 兜底），绝不丢数据。
 //! * stat：lower 文件固定 dev/ino/mtime/ctime（size/mode 来自模板），upper 文件
-//!   用单调递增的逻辑 mtime（`stat_cache` 持久化，跨重启不倒退），目录按
-//!   `0o040755` 报告。VFS（M3）经 [`Overlay::stat`]/[`Overlay::attributes_for`]
-//!   拿到 WinFSP 需要的稳定值。
+//!   用单调递增的逻辑 mtime，目录按 `0o040755` 报告。VFS（M3）经
+//!   [`Overlay::stat`]/[`Overlay::attributes_for`] 拿到 WinFSP 需要的稳定值。
+//! * M8/B080100 批量元数据：`initializing` 阶段（对 readdir 隐藏的安全批量窗口）
+//!   把 `file_ids` / `dedupe` / `stat_cache` / `whiteouts` / `renames` 全部累积在
+//!   内存（[`InitBatch`]），**每文件零事务、零 DB 读**；[`Overlay::mark_ready`]
+//!   在单个 SQLite 事务内整批落库并切 ready（崩溃安全：提交前崩溃保持
+//!   initializing、upper 文件完整，缓冲丢失可接受，spec §6.3.6）。ready 后的
+//!   编辑回到逐操作持久化（spec 允许）。initializing 标志缓存在内存，per-file
+//!   操作不再查询 `worktrees.status`；fresh checkout 的 renames/whiteouts 读
+//!   全程不触 DB。
+//! * 逻辑 mtime 用进程内原子时钟（[`Overlay::mtime_clock`]）：打开时从
+//!   `MAX(mtime_ns)` 初始化一次，原子推进（同进程严格单调），随 stat_cache
+//!   落库持久化；逐 upper 写的 `SELECT MAX(mtime_ns)` 已移除。
 //!
-//! 元数据全部经 [`SqliteOverlayStore`] 落 SQLite；本引擎自身无内存可变状态，
-//! `&self` 并发安全。约定：upper 根下以 `.wtfs-tmp` 开头的名字是写入临时文件，
-//! 对视图不可见；写入请求若使用该前缀名会被拒绝。
+//! 约定：upper 根下以 `.wtfs-tmp` 开头的名字是写入临时文件，对视图不可见；
+//! 写入请求若使用该前缀名会被拒绝。
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::{Mutex, MutexGuard};
+
+use crate::overlay_batch::InitBatch;
 use crate::overlay_store::{SqliteOverlayStore, StatCacheEntry};
 use crate::{
     DedupeState, Error, FileAttributes, FileHash, FileHashMap, OverlayConfig, OverlayStore,
@@ -140,11 +152,202 @@ fn now_unix_ns() -> i64 {
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// overlay 视图：config + lower 模板清单 + 元数据存储。
+/// overlay 视图：config + lower 模板清单 + 元数据存储 + initializing 内存批量缓冲。
 pub struct Overlay {
     config: OverlayConfig,
     lower: Option<Arc<FileHashMap>>,
     store: Arc<SqliteOverlayStore>,
+    /// initializing 标志与元数据缓冲（同锁）：标志缓存自 worktrees.status，
+    /// per-file 操作不再查库；batch 为 `Some` 当且仅当 initializing。
+    init_meta: Mutex<InitMeta>,
+    /// 逻辑 mtime 时钟（Unix 纳秒）：打开时从 `MAX(mtime_ns)` 初始化一次，
+    /// 此后 `max(now, prev+1)` 原子推进；随 stat_cache 落库持久化。
+    mtime_clock: AtomicI64,
+}
+
+/// [`Overlay::init_meta` 的守卫状态]：initializing 标志 + 可缺省的批量缓冲。
+#[derive(Debug, Default)]
+struct InitMeta {
+    initializing: bool,
+    /// initializing 期的权威元数据视图；ready/failed 后为 `None`
+    ///（该阶段回逐操作持久化，直接读写 store）。
+    batch: Option<InitBatch>,
+}
+
+/// 元数据操作的二选一上下文：initializing = 持锁内存缓冲（零 DB）；
+/// ready = 直连 store（逐操作持久化）。由 [`Overlay::meta_ctx`] 在锁内判定，
+/// 不存在"初始化中但缓冲缺席"的中间态。
+enum MetaCtx<'a> {
+    Init {
+        guard: MutexGuard<'a, InitMeta>,
+    },
+    Ready {
+        id: WorktreeId,
+        store: &'a SqliteOverlayStore,
+    },
+}
+
+impl<'a> MetaCtx<'a> {
+    fn batch(&self) -> &InitBatch {
+        match self {
+            MetaCtx::Init { guard, .. } => guard
+                .batch
+                .as_ref()
+                .expect("Init meta context without batch"),
+            MetaCtx::Ready { .. } => unreachable!("batch access in Ready context"),
+        }
+    }
+
+    fn batch_mut(&mut self) -> &mut InitBatch {
+        match self {
+            MetaCtx::Init { guard, .. } => guard
+                .batch
+                .as_mut()
+                .expect("Init meta context without batch"),
+            MetaCtx::Ready { .. } => unreachable!("batch access in Ready context"),
+        }
+    }
+
+    /// 全部目录重命名映射 (from → to)。
+    fn renames(&self) -> Result<Vec<(String, String)>> {
+        match self {
+            MetaCtx::Init { .. } => Ok(self.batch().renames()),
+            MetaCtx::Ready { store, id } => store.renames(*id),
+        }
+    }
+
+    /// 全部 whiteout（lower 命名空间路径）。fresh checkout 下为空集合、零 DB 读。
+    fn whiteouts(&self) -> Result<HashSet<String>> {
+        match self {
+            MetaCtx::Init { .. } => Ok(self.batch().whiteouts()),
+            MetaCtx::Ready { store, id } => store.whiteouts(*id),
+        }
+    }
+
+    /// 稳定 file id：initializing 期纯内存派生 + 探测；ready 后持久映射落库。
+    fn file_id(&mut self, path: &str) -> Result<u64> {
+        validate_relative_path(path)?;
+        match self {
+            MetaCtx::Init { .. } => Ok(self.batch_mut().file_id(path)),
+            MetaCtx::Ready { store, id } => store.file_id(*id, path),
+        }
+    }
+
+    fn stat_entry(&self, path: &str) -> Result<Option<StatCacheEntry>> {
+        match self {
+            MetaCtx::Init { .. } => Ok(self.batch().stat_entry(path)),
+            MetaCtx::Ready { store, id } => store.stat_entry(*id, path),
+        }
+    }
+
+    fn set_stat_entry(&mut self, path: &str, entry: StatCacheEntry) -> Result<()> {
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().set_stat_entry(path, entry);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.set_stat_entry(*id, path, entry),
+        }
+    }
+
+    /// 删除一条 stat 缓存；缓冲无条目时为 no-op（M8：per-file 无用功短路）。
+    fn remove_stat_entry(&mut self, path: &str) -> Result<()> {
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().remove_stat_entry(path);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.remove_stat_entry(*id, path),
+        }
+    }
+
+    fn record_dedupe_state(&mut self, path: &str, state: DedupeState) -> Result<()> {
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().record_dedupe(path, state);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.record_dedupe_state(*id, path, state),
+        }
+    }
+
+    fn remove_dedupe(&mut self, path: &str) -> Result<()> {
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().remove_dedupe(path);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.remove_dedupe(*id, path),
+        }
+    }
+
+    fn add_whiteout(&mut self, path: &str) -> Result<()> {
+        validate_relative_path(path)?;
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().add_whiteout(path);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.add_whiteout(*id, path),
+        }
+    }
+
+    /// 撤销 whiteout；缓冲无条目时为 no-op（M8：per-file 无用功短路）。
+    fn remove_whiteout(&mut self, path: &str) -> Result<()> {
+        validate_relative_path(path)?;
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().remove_whiteout(path);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.remove_whiteout(*id, path),
+        }
+    }
+
+    fn record_rename(&mut self, from: &str, to: &str) -> Result<()> {
+        validate_relative_path(from)?;
+        validate_relative_path(to)?;
+        match self {
+            MetaCtx::Init { .. } => {
+                if from == to {
+                    return Err(Error::Overlay(format!(
+                        "rename source and target are identical: {from}"
+                    )));
+                }
+                self.batch_mut().record_rename(from, to);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.record_rename(*id, from, to),
+        }
+    }
+
+    /// 删除 `dir` 及其子树的 dedupe / stat_cache 行。
+    fn remove_meta_subtree(&mut self, dir: &str) -> Result<()> {
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().remove_meta_subtree(dir);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.remove_meta_subtree(*id, dir),
+        }
+    }
+
+    /// 把 from（含子树）的 dedupe / stat_cache 键改写为 to。
+    fn rewrite_meta_prefix(&mut self, from: &str, to: &str) -> Result<()> {
+        match self {
+            MetaCtx::Init { .. } => {
+                self.batch_mut().rewrite_meta_prefix(from, to);
+                Ok(())
+            }
+            MetaCtx::Ready { store, id } => store.rewrite_meta_prefix(*id, from, to),
+        }
+    }
+}
+
+/// 打开时初始化一次逻辑 mtime 时钟：max(系统 now, DB 已发放最大值)。
+fn init_mtime_clock(store: &SqliteOverlayStore, id: WorktreeId) -> Result<i64> {
+    let db_max = store.max_stat_mtime(id)?.unwrap_or(0);
+    Ok(now_unix_ns().max(db_max))
 }
 
 impl Overlay {
@@ -156,29 +359,43 @@ impl Overlay {
         store: Arc<SqliteOverlayStore>,
     ) -> Result<Self> {
         store.register(&config)?;
+        let mtime_clock = init_mtime_clock(&store, config.worktree_id)?;
         Ok(Self {
             config,
             lower: lower_files.map(Arc::new),
             store,
+            init_meta: Mutex::new(InitMeta {
+                initializing: true,
+                batch: Some(InitBatch::empty()),
+            }),
+            mtime_clock: AtomicI64::new(mtime_clock),
         })
     }
 
     /// 重新挂到已注册的 worktree（崩溃恢复/重开视图）；未注册报 [`Error::NotFound`]。
+    /// initializing 行（崩溃于 ready 前）：一次性从 DB 装载既有元数据行为缓冲，
+    /// 之后继续零事务累积，mark_ready 时整批落库。
     pub fn reopen(
         config: OverlayConfig,
         lower_files: Option<FileHashMap>,
         store: Arc<SqliteOverlayStore>,
     ) -> Result<Self> {
-        if store.state(config.worktree_id)?.is_none() {
-            return Err(Error::NotFound(format!(
-                "worktree {} not registered",
-                config.worktree_id
-            )));
-        }
+        let state = store
+            .state(config.worktree_id)?
+            .ok_or_else(|| Error::NotFound(format!("worktree {} not registered", config.worktree_id)))?;
+        let initializing = state.hides_entries();
+        let batch = if initializing {
+            Some(InitBatch::load(&store, config.worktree_id)?)
+        } else {
+            None
+        };
+        let mtime_clock = init_mtime_clock(&store, config.worktree_id)?;
         Ok(Self {
             config,
             lower: lower_files.map(Arc::new),
             store,
+            init_meta: Mutex::new(InitMeta { initializing, batch }),
+            mtime_clock: AtomicI64::new(mtime_clock),
         })
     }
 
@@ -201,22 +418,67 @@ impl Overlay {
 
     // ---- 状态机 ----
 
+    /// initializing 标志（内存缓存；per-file 调用不再查询 `worktrees.status`）。
     pub fn is_initializing(&self) -> Result<bool> {
-        Ok(self
-            .store
-            .state(self.config.worktree_id)?
-            .map(|s| s.hides_entries())
-            .unwrap_or(true))
+        Ok(self.init_meta.lock().initializing)
     }
 
+    /// `initializing → ready`：缓冲元数据整批 + 状态切换在**同一事务**落库
+    /// （崩溃安全：提交前崩溃 = 保持 initializing、upper 文件完整，缓冲丢失
+    /// 可接受）。持锁执行落库——落库期间并发操作短暂阻塞，切 ready 后一次性
+    /// 看到完整视图。无缓冲（已 ready 的重开/幂等调用）时仅切状态，
+    /// 不重写任何既有行。
     pub fn mark_ready(&self) -> Result<()> {
-        self.store
-            .set_state(self.config.worktree_id, crate::WorktreeState::Ready)
+        let mut guard = self.init_meta.lock();
+        match guard.batch.take() {
+            Some(batch) => match self.store.flush_init_batch(
+                self.config.worktree_id,
+                &batch,
+                crate::WorktreeState::Ready,
+            ) {
+                Ok(()) => {
+                    guard.initializing = false;
+                    Ok(())
+                }
+                Err(e) => {
+                    // 落库失败：恢复缓冲，保持 initializing，可重试。
+                    guard.batch = Some(batch);
+                    Err(e)
+                }
+            },
+            None => {
+                self.store
+                    .set_state(self.config.worktree_id, crate::WorktreeState::Ready)?;
+                guard.initializing = false;
+                Ok(())
+            }
+        }
     }
 
+    /// 初始化失败标记：丢弃未落库缓冲（upper 文件是数据真相，保留），
+    /// 状态落库为 failed——不允许 worker 在半初始化的 worktree 上启动
+    /// （spec §6.3.6）。
     pub fn mark_failed(&self) -> Result<()> {
+        let mut guard = self.init_meta.lock();
         self.store
-            .set_state(self.config.worktree_id, crate::WorktreeState::Failed)
+            .set_state(self.config.worktree_id, crate::WorktreeState::Failed)?;
+        guard.batch = None;
+        guard.initializing = false;
+        Ok(())
+    }
+
+    /// 元数据操作上下文：initializing → 持锁缓冲；ready → 直连 store。
+    fn meta_ctx(&self) -> MetaCtx<'_> {
+        let guard = self.init_meta.lock();
+        if guard.initializing {
+            MetaCtx::Init { guard }
+        } else {
+            drop(guard);
+            MetaCtx::Ready {
+                id: self.config.worktree_id,
+                store: &self.store,
+            }
+        }
     }
 
     // ---- 路径与映射 ----
@@ -239,13 +501,10 @@ impl Overlay {
         validate_relative_path(rel)
     }
 
-    pub(crate) fn renames(&self) -> Result<Vec<(String, String)>> {
-        self.store.renames(self.config.worktree_id)
-    }
-
     /// lower 命名空间改写；`MovedAway` 时写入场景退回原路径（upper 物理位置）。
-    fn mapped_or_same(&self, rel: &str) -> Result<String> {
-        match map_to_lower_with(&self.renames()?, rel) {
+    /// `ctx` 由调用方持有（勿经 [`Overlay::meta_ctx`] 重复加锁）。
+    fn mapped_or_same(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<String> {
+        match map_to_lower_with(&ctx.renames()?, rel) {
             LowerLookup::Same(s) | LowerLookup::Mapped(s) => Ok(s),
             LowerLookup::MovedAway => Ok(rel.to_string()),
         }
@@ -285,8 +544,9 @@ impl Overlay {
 
     // ---- 解析与枚举 ----
 
-    /// 解析顺序：upper > whiteout > lower（spec §6.5）。
-    pub fn resolve(&self, rel: &str) -> Result<Resolution> {
+    /// 解析顺序：upper > whiteout > lower（spec §6.5）。`ctx` 由调用方持有，
+    /// 同一逻辑操作的元数据视图一致（initializing 期 = 内存缓冲，零 DB 读）。
+    fn resolve_with(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<Resolution> {
         self.validate_rel_or_root(rel)?;
         if !rel.is_empty() && is_temp_name(basename(rel)) {
             return Ok(Resolution::NotFound);
@@ -303,11 +563,11 @@ impl Overlay {
                 has_upper: true,
             });
         }
-        let mapped = match map_to_lower_with(&self.renames()?, rel) {
+        let mapped = match map_to_lower_with(&ctx.renames()?, rel) {
             LowerLookup::Same(s) | LowerLookup::Mapped(s) => s,
             LowerLookup::MovedAway => return Ok(Resolution::NotFound),
         };
-        let whites = self.store.whiteouts(self.config.worktree_id)?;
+        let whites = ctx.whiteouts()?;
         let blocked = whiteout_blocks(&mapped, &whites);
         let lower_file = self.lookup_lower(&mapped);
         let has_lower_dir = !blocked && lower_file.is_none() && self.has_lower_dir(&mapped);
@@ -337,14 +597,22 @@ impl Overlay {
         Ok(Resolution::NotFound)
     }
 
-    /// 目录合并枚举；`initializing` 状态返回空（让 Git 通过"目录必须为空"检查）。
+    /// 解析顺序：upper > whiteout > lower（spec §6.5）。
+    pub fn resolve(&self, rel: &str) -> Result<Resolution> {
+        let ctx = self.meta_ctx();
+        self.resolve_with(&ctx, rel)
+    }
+
+    /// 目录合并枚举；`initializing` 状态返回空（让 Git 通过"目录必须为空"检查），
+    /// 只读内存标志、零 DB。
     pub fn list(&self, dir_rel: &str) -> Result<Vec<OverlayDirEntry>> {
         self.validate_rel_or_root(dir_rel)?;
         if self.is_initializing()? {
             return Ok(Vec::new());
         }
-        let whites = self.store.whiteouts(self.config.worktree_id)?;
-        let renames = self.renames()?;
+        let ctx = self.meta_ctx();
+        let whites = ctx.whiteouts()?;
+        let renames = ctx.renames()?;
         let mut names: BTreeMap<String, EntryKind> = BTreeMap::new();
 
         // lower 侧：模板清单按 dir 前缀取直接子项，逐名应用 whiteout。
@@ -441,6 +709,7 @@ impl Overlay {
 
     /// 流式写入：边写临时文件边哈希，与模板一致则丢弃（回落 lower），
     /// 否则原子改名落 upper。返回 (决策, 实际字节数)。
+    /// initializing 期元数据全部进内存缓冲（零事务）；ready 后逐操作持久化。
     pub fn write_from(&self, rel: &str, reader: &mut impl Read) -> Result<(DedupeState, u64)> {
         self.validate_rel(rel)?;
         if is_temp_name(basename(rel)) {
@@ -484,13 +753,13 @@ impl Overlay {
             }
         };
 
-        let mapped = self.mapped_or_same(rel)?;
+        let mut ctx = self.meta_ctx();
+        let mapped = self.mapped_or_same(&ctx, rel)?;
         let template_entry = self.lookup_lower(&mapped);
-        let id = self.config.worktree_id;
         if self.config.dedupe_enabled {
             if let Some(t) = &template_entry {
                 if t.hash == hash {
-                    let whites = self.store.whiteouts(id)?;
+                    let whites = ctx.whiteouts()?;
                     if !ancestor_whiteout_blocks(&mapped, &whites) {
                         // 与模板一致且 lower 视图可见（路径自身的 whiteout 会被
                         // remove_whiteout 撤销）：丢弃副本回落 lower。
@@ -499,9 +768,10 @@ impl Overlay {
                         if final_path.symlink_metadata().is_ok() {
                             std::fs::remove_file(&final_path)?;
                         }
-                        self.store.remove_stat_entry(id, rel)?;
-                        self.store.record_dedupe_state(id, rel, DedupeState::Lower)?;
-                        self.store.remove_whiteout(id, &mapped)?;
+                        // 缓冲无条目时两者均为 no-op（M8：per-file 无用功短路）。
+                        ctx.remove_stat_entry(rel)?;
+                        ctx.record_dedupe_state(rel, DedupeState::Lower)?;
+                        ctx.remove_whiteout(&mapped)?;
                         return Ok((DedupeState::Lower, size));
                     }
                     // 祖先目录被 whiteout：回落会让刚写入的文件不可见——
@@ -516,14 +786,10 @@ impl Overlay {
         } else {
             DedupeState::New
         };
-        self.store.record_dedupe_state(id, rel, state)?;
-        self.store.remove_whiteout(id, &mapped)?;
-        let mtime = self.issue_logical_mtime()?;
-        self.store.set_stat_entry(
-            id,
-            rel,
-            StatCacheEntry { mtime_ns: mtime, size, flags: 0 },
-        )?;
+        ctx.record_dedupe_state(rel, state)?;
+        ctx.remove_whiteout(&mapped)?;
+        let mtime = self.issue_logical_mtime();
+        ctx.set_stat_entry(rel, StatCacheEntry { mtime_ns: mtime, size, flags: 0 })?;
         Ok((state, size))
     }
 
@@ -531,23 +797,19 @@ impl Overlay {
     pub fn copy_up(&self, rel: &str) -> Result<Option<PathBuf>> {
         self.validate_rel(rel)?;
         let final_path = self.upper_abs(rel);
-        match self.resolve(rel)? {
+        let mut ctx = self.meta_ctx();
+        match self.resolve_with(&ctx, rel)? {
             Resolution::Lower { path, .. } => {
                 if let Some(parent) = final_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::copy(&path, &final_path)?;
                 let size = std::fs::metadata(&final_path)?.len();
-                let mapped = self.mapped_or_same(rel)?;
-                let id = self.config.worktree_id;
-                self.store.remove_whiteout(id, &mapped)?;
-                self.store.record_dedupe_state(id, rel, DedupeState::Upper)?;
-                let mtime = self.issue_logical_mtime()?;
-                self.store.set_stat_entry(
-                    id,
-                    rel,
-                    StatCacheEntry { mtime_ns: mtime, size, flags: 0 },
-                )?;
+                let mapped = self.mapped_or_same(&ctx, rel)?;
+                ctx.remove_whiteout(&mapped)?;
+                ctx.record_dedupe_state(rel, DedupeState::Upper)?;
+                let mtime = self.issue_logical_mtime();
+                ctx.set_stat_entry(rel, StatCacheEntry { mtime_ns: mtime, size, flags: 0 })?;
                 Ok(Some(final_path))
             }
             Resolution::Upper { path } => Ok(Some(path)),
@@ -558,16 +820,16 @@ impl Overlay {
     /// 删除：upper 删真实文件；lower 有则记 whiteout（否则被删文件会在合并视图重现）。
     pub fn remove(&self, rel: &str) -> Result<bool> {
         self.validate_rel(rel)?;
-        let id = self.config.worktree_id;
+        let mut ctx = self.meta_ctx();
         let upper_path = self.upper_abs(rel);
-        match self.resolve(rel)? {
+        match self.resolve_with(&ctx, rel)? {
             Resolution::Upper { .. } => {
                 std::fs::remove_file(&upper_path)?;
-                self.store.remove_stat_entry(id, rel)?;
-                self.store.remove_dedupe(id, rel)?;
-                let mapped = self.mapped_or_same(rel)?;
+                ctx.remove_stat_entry(rel)?;
+                ctx.remove_dedupe(rel)?;
+                let mapped = self.mapped_or_same(&ctx, rel)?;
                 if self.lower_has_file_or_dir(&mapped) {
-                    self.store.add_whiteout(id, &mapped)?;
+                    ctx.add_whiteout(&mapped)?;
                 }
                 Ok(true)
             }
@@ -575,16 +837,16 @@ impl Overlay {
                 if has_upper {
                     std::fs::remove_dir_all(&upper_path)?;
                 }
-                self.store.remove_meta_subtree(id, rel)?;
-                let mapped = self.mapped_or_same(rel)?;
+                ctx.remove_meta_subtree(rel)?;
+                let mapped = self.mapped_or_same(&ctx, rel)?;
                 if has_lower || self.lower_has_file_or_dir(&mapped) {
-                    self.store.add_whiteout(id, &mapped)?;
+                    ctx.add_whiteout(&mapped)?;
                 }
                 Ok(true)
             }
             Resolution::Lower { .. } => {
-                let mapped = self.mapped_or_same(rel)?;
-                self.store.add_whiteout(id, &mapped)?;
+                let mapped = self.mapped_or_same(&ctx, rel)?;
+                ctx.add_whiteout(&mapped)?;
                 Ok(true)
             }
             Resolution::Whiteout | Resolution::NotFound => Ok(false),
@@ -604,12 +866,12 @@ impl Overlay {
                 "rename {from:?} -> {to:?}: cannot rename into own subtree"
             )));
         }
-        let id = self.config.worktree_id;
-        let source = self.resolve(from)?;
+        let mut ctx = self.meta_ctx();
+        let source = self.resolve_with(&ctx, from)?;
         if matches!(source, Resolution::NotFound | Resolution::Whiteout) {
             return Err(Error::NotFound(from.to_string()));
         }
-        let target = self.resolve(to)?;
+        let target = self.resolve_with(&ctx, to)?;
         match (&source, &target) {
             (_, Resolution::Directory { .. }) => {
                 return Err(Error::Overlay(format!(
@@ -623,8 +885,8 @@ impl Overlay {
             }
             _ => {}
         }
-        let mapped_from = self.mapped_or_same(from)?;
-        let mapped_to = self.mapped_or_same(to)?;
+        let mapped_from = self.mapped_or_same(&ctx, from)?;
+        let mapped_to = self.mapped_or_same(&ctx, to)?;
         let is_upper_src = matches!(source, Resolution::Upper { .. });
 
         match source {
@@ -642,20 +904,16 @@ impl Overlay {
                     std::fs::copy(&path, &to_upper)?;
                 }
                 if self.lower_has_file_or_dir(&mapped_from) {
-                    self.store.add_whiteout(id, &mapped_from)?;
+                    ctx.add_whiteout(&mapped_from)?;
                 }
-                self.store.remove_whiteout(id, &mapped_to)?;
-                self.store.rewrite_meta_prefix(id, from, to)?;
-                self.store.record_dedupe_state(id, to, DedupeState::Upper)?;
+                ctx.remove_whiteout(&mapped_to)?;
+                ctx.rewrite_meta_prefix(from, to)?;
+                ctx.record_dedupe_state(to, DedupeState::Upper)?;
                 if !is_upper_src {
                     // lower copy-up：新 upper 路径需要逻辑 mtime。
                     let size = std::fs::metadata(&to_upper)?.len();
-                    let mtime = self.issue_logical_mtime()?;
-                    self.store.set_stat_entry(
-                        id,
-                        to,
-                        StatCacheEntry { mtime_ns: mtime, size, flags: 0 },
-                    )?;
+                    let mtime = self.issue_logical_mtime();
+                    ctx.set_stat_entry(to, StatCacheEntry { mtime_ns: mtime, size, flags: 0 })?;
                 }
             }
             Resolution::Directory { has_lower, has_upper } => {
@@ -667,11 +925,11 @@ impl Overlay {
                     std::fs::rename(self.upper_abs(from), &to_upper)?;
                 }
                 if has_lower || self.lower_has_file_or_dir(&mapped_from) {
-                    self.store.record_rename(id, &mapped_from, &mapped_to)?;
+                    ctx.record_rename(&mapped_from, &mapped_to)?;
                 }
                 // upper 内容物理随迁：dedupe/stat_cache 键改写；
                 // whiteout 保留在 lower 命名空间（改写后的 lower 查询仍能命中）。
-                self.store.rewrite_meta_prefix(id, from, to)?;
+                ctx.rewrite_meta_prefix(from, to)?;
             }
             Resolution::Whiteout | Resolution::NotFound => unreachable!("checked above"),
         }
@@ -682,6 +940,7 @@ impl Overlay {
 
     /// 逻辑 stat：lower 固定（dev/ino/mtime/ctime 恒定，size/mode 来自模板），
     /// upper 用逻辑 mtime；目录 `0o040755`。whiteout/not-found → None。
+    /// 单一 [`MetaCtx`] 贯穿解析/file_id/mtime，initializing 期零 DB 读。
     pub fn stat(&self, rel: &str) -> Result<Option<Stat>> {
         self.validate_rel_or_root(rel)?;
         if !rel.is_empty() && is_temp_name(basename(rel)) {
@@ -689,20 +948,21 @@ impl Overlay {
         }
         let vs = u64::from(self.config.volume_serial);
         let epoch = self.config.fixed_stat_epoch_ns;
-        let resolution = self.resolve(rel)?;
+        let mut ctx = self.meta_ctx();
+        let resolution = self.resolve_with(&ctx, rel)?;
         let out = match resolution {
             Resolution::Whiteout | Resolution::NotFound => return Ok(None),
             Resolution::Upper { path } => {
                 let md = std::fs::metadata(&path)?;
-                let mode = if self.lower_mode_is_exec(rel)? {
+                let mode = if self.lower_mode_is_exec(&ctx, rel)? {
                     0o100755
                 } else {
                     0o100644
                 };
-                let mtime = self.cached_mtime(rel, md.len(), false)?;
+                let mtime = self.cached_mtime(&mut ctx, rel, md.len(), false)?;
                 Stat {
                     dev: vs,
-                    ino: self.file_id(rel)?,
+                    ino: ctx.file_id(rel)?,
                     mode,
                     size: md.len(),
                     mtime_ns: mtime,
@@ -711,16 +971,16 @@ impl Overlay {
             }
             Resolution::Lower { file, .. } => Stat {
                 dev: vs,
-                ino: self.file_id(rel)?,
+                ino: ctx.file_id(rel)?,
                 mode: file.mode,
                 size: file.size,
                 mtime_ns: epoch,
                 ctime_ns: epoch,
             },
             Resolution::Directory { has_upper, .. } => {
-                let ino = if rel.is_empty() { ROOT_FILE_ID } else { self.file_id(rel)? };
+                let ino = if rel.is_empty() { ROOT_FILE_ID } else { ctx.file_id(rel)? };
                 let mtime = if has_upper {
-                    self.cached_mtime(rel, 0, true)?
+                    self.cached_mtime(&mut ctx, rel, 0, true)?
                 } else {
                     epoch
                 };
@@ -738,12 +998,14 @@ impl Overlay {
     }
 
     /// 稳定 file id（Windows FILE_ID 与 index ino；持久映射）。
+    /// initializing 期为内存派生（批量缓冲），ready 后落库持久化。
     pub fn file_id(&self, rel: &str) -> Result<u64> {
-        self.store.file_id(self.config.worktree_id, rel)
+        let mut ctx = self.meta_ctx();
+        ctx.file_id(rel)
     }
 
-    fn lower_mode_is_exec(&self, rel: &str) -> Result<bool> {
-        let mapped = self.mapped_or_same(rel)?;
+    fn lower_mode_is_exec(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<bool> {
+        let mapped = self.mapped_or_same(ctx, rel)?;
         Ok(self
             .lower
             .as_ref()
@@ -752,22 +1014,26 @@ impl Overlay {
             .unwrap_or(false))
     }
 
-    /// 单调递增逻辑时钟：max(系统 now, 已发放最大值 + 1)。
-    fn issue_logical_mtime(&self) -> Result<i64> {
+    /// 单调递增逻辑时钟：`max(系统 now, 已发放最大值 + 1)`，原子推进。
+    /// 打开时已从 `MAX(mtime_ns)` 初始化一次（[`init_mtime_clock`]），
+    /// 逐 upper 写的 `SELECT MAX(mtime_ns)` 已移除（M8/B080100）。
+    fn issue_logical_mtime(&self) -> i64 {
         let now = now_unix_ns();
-        let last = self.store.max_stat_mtime(self.config.worktree_id)?;
-        Ok(now.max(last.unwrap_or(0) + 1))
+        match self.mtime_clock.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+            Some(now.max(prev.saturating_add(1)))
+        }) {
+            Ok(next) => next,
+            Err(_) => unreachable!("mtime clock closure always returns Some"),
+        }
     }
 
     /// 读取或发放并缓存逻辑 mtime（同一 upper 路径的 stat 在两次写之间稳定）。
-    fn cached_mtime(&self, rel: &str, size: u64, is_dir: bool) -> Result<i64> {
-        let id = self.config.worktree_id;
-        if let Some(entry) = self.store.stat_entry(id, rel)? {
+    fn cached_mtime(&self, ctx: &mut MetaCtx<'_>, rel: &str, size: u64, is_dir: bool) -> Result<i64> {
+        if let Some(entry) = ctx.stat_entry(rel)? {
             return Ok(entry.mtime_ns);
         }
-        let mtime = self.issue_logical_mtime()?;
-        self.store.set_stat_entry(
-            id,
+        let mtime = self.issue_logical_mtime();
+        ctx.set_stat_entry(
             rel,
             StatCacheEntry {
                 mtime_ns: mtime,
@@ -1197,6 +1463,10 @@ mod tests {
             let of = Overlay::new(cfg, Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
             of.write("a/1.txt", b"ONE!").unwrap();
             of.remove("b.txt").unwrap();
+            // M8：initializing 期元数据在内存缓冲，mark_ready 单事务落库；
+            // 此处 flush 后重开，验证持久化往返（崩溃于 ready 前 = 缓冲丢失，
+            // 见 crash_before_ready_keeps_initializing_and_upper_files）。
+            of.mark_ready().unwrap();
             let ino = of.file_id("a/1.txt").unwrap();
             let mtime = of.stat("a/1.txt").unwrap().unwrap().mtime_ns;
             (of, ino, mtime)
@@ -1229,5 +1499,183 @@ mod tests {
             Ok(_) => panic!("reopen of unregistered worktree must fail"),
         };
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    // ---- M8/B080100：批量元数据与 O(1) 事务 ----
+
+    const N_FILES: usize = 48;
+
+    /// N 文件 checkout（initializing 期全内存批量）→ 写事务 O(1)：
+    /// register + mark_ready flush 共 2 个事务、0 次 autocommit 写
+    /// （旧实现 ~4N：file_id 插入 + remove_stat_entry + record_dedupe +
+    /// remove_whiteout 各一个事务/文件）。
+    #[test]
+    fn batched_checkout_uses_constant_transactions_and_flushes_rows() {
+        let fx = fixture(true);
+        let base = fx.store.db().tx_stats();
+        let of = make(&fx, true); // register：+1 事务
+
+        for i in 0..N_FILES {
+            let (path, content, expect_state): (String, &[u8], DedupeState) = match i % 3 {
+                0 => ("a/1.txt".to_string(), ONE, DedupeState::Lower),
+                1 => ("a/2.txt".to_string(), b"changed!", DedupeState::Upper),
+                _ => (format!("new/f{i}.txt"), b"fresh", DedupeState::New),
+            };
+            let (state, _) = of.write(&path, content).unwrap();
+            assert_eq!(state, expect_state);
+            // checkout 的 stat：file_id / 逻辑 mtime 全内存发放。
+            of.stat(&path).unwrap();
+        }
+        // 批量窗口内：仅 register 的 1 个事务，零 autocommit 写。
+        let during = fx.store.db().tx_stats();
+        assert_eq!(during.committed - base.committed, 1, "仅 register");
+        assert_eq!(during.autocommit_writes - base.autocommit_writes, 0);
+        assert_eq!(during.rolled_back - base.rolled_back, 0);
+
+        of.mark_ready().unwrap();
+        let after = fx.store.db().tx_stats();
+        let total = (after.committed - base.committed)
+            + (after.autocommit_writes - base.autocommit_writes)
+            + (after.rolled_back - base.rolled_back);
+        assert_eq!(total, 2, "O(1)：register + flush；旧实现约 4N={}", 4 * N_FILES);
+
+        // 状态与批量行都已落库：Lower 文件回落 lower（无 stat 行），
+        // Upper/New 文件有 stat 行；file_ids 覆盖全部 stat 过的路径。
+        assert_eq!(
+            fx.store.state(WorktreeId(1)).unwrap(),
+            Some(crate::WorktreeState::Ready)
+        );
+        let per_class = N_FILES / 3;
+        assert_eq!(fx.store.stat_entries(WorktreeId(1)).unwrap().len(), 1 + per_class);
+        assert_eq!(fx.store.dedupe_states(WorktreeId(1)).unwrap().len(), 2 + per_class);
+        let inos = fx.store.file_id_rows(WorktreeId(1)).unwrap();
+        assert_eq!(inos.len(), 2 + per_class, "a/1.txt + a/2.txt + new/f*");
+        assert_eq!(inos["a/1.txt"], of.file_id("a/1.txt").unwrap(), "ino 持久不重发放");
+    }
+
+    /// 崩溃于 mark_ready 前：worktree 保持 initializing、upper 文件完整
+    /// （缓冲丢失可接受，spec §6.3.6）；重开后仍隐藏视图、可继续累积并 flush。
+    #[test]
+    fn crash_before_ready_keeps_initializing_and_upper_files() {
+        let fx = fixture(true);
+        let of = make(&fx, true);
+        of.write("a/1.txt", b"changed!").unwrap(); // upper（改动）
+        of.write("b.txt", BEE).unwrap(); // 与模板一致 → 无副本
+        of.write("new.txt", b"fresh").unwrap(); // upper（新文件）
+        drop(of); // 模拟崩溃：缓冲不 flush
+
+        assert_eq!(
+            fx.store.state(WorktreeId(1)).unwrap(),
+            Some(crate::WorktreeState::Initializing)
+        );
+        assert!(fx.store.stat_entries(WorktreeId(1)).unwrap().is_empty());
+        assert!(fx.upper_dir.join("new.txt").is_file(), "upper 文件是数据真相");
+        assert!(fx.upper_dir.join("a/1.txt").is_file());
+
+        let mut cfg = OverlayConfig::new(WorktreeId(1), &fx.upper_dir);
+        cfg.lower_root = Some(fx.lower_dir.clone());
+        cfg.template_id = Some(TemplateId(1));
+        let of2 = Overlay::reopen(cfg, Some(lower_fixture(&fx.lower_dir)), fx.store.clone()).unwrap();
+        assert!(of2.is_initializing().unwrap(), "崩溃后保持 initializing");
+        assert_eq!(of2.list("").unwrap().len(), 0, "readdir 仍为空");
+        let (state, _) = of2.write("late.txt", b"late").unwrap();
+        assert_eq!(state, DedupeState::New, "重开后继续 checkout");
+        of2.mark_ready().unwrap();
+        assert_eq!(
+            fx.store.state(WorktreeId(1)).unwrap(),
+            Some(crate::WorktreeState::Ready)
+        );
+        assert!(fx.store.stat_entries(WorktreeId(1)).unwrap().contains_key("late.txt"));
+        assert_eq!(of2.read("new.txt").unwrap().as_deref(), Some(b"fresh".as_slice()));
+    }
+
+    /// 逻辑 mtime：同会话严格单调；flush 持久化最大值；重开时钟从 MAX 初始化、
+    /// 新发放严格大于既有值（不倒退、不重发放）。
+    #[test]
+    fn logical_mtime_monotonic_within_session_and_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("meta.db");
+        let lower_dir = dir.path().join("lower");
+        let upper_dir = dir.path().join("upper");
+        std::fs::create_dir_all(&lower_dir).unwrap();
+        let store = Arc::new(SqliteOverlayStore::new(Db::open(&db_path).unwrap()));
+        let mut cfg = OverlayConfig::new(WorktreeId(5), &upper_dir);
+        cfg.lower_root = Some(lower_dir.clone());
+        cfg.dedupe_enabled = true;
+        let mut max_seen = 0i64;
+        {
+            let of = Overlay::new(cfg.clone(), Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+            for i in 0..32 {
+                let path = format!("n{i}.txt");
+                of.write(&path, b"x").unwrap();
+                let t = of.stat(&path).unwrap().unwrap().mtime_ns;
+                assert!(t > max_seen, "同会话严格单调: {max_seen} -> {t}");
+                assert!(t > crate::FIXED_STAT_EPOCH_UNIX_NS);
+                max_seen = t;
+            }
+            // 同路径重写也严格前进
+            of.write("n0.txt", b"xx").unwrap();
+            let t = of.stat("n0.txt").unwrap().unwrap().mtime_ns;
+            assert!(t > max_seen);
+            max_seen = t;
+            of.mark_ready().unwrap();
+            let flushed = store.max_stat_mtime(WorktreeId(5)).unwrap().unwrap();
+            assert!(flushed >= max_seen, "flush 持久化最大逻辑 mtime");
+            max_seen = max_seen.max(flushed);
+        }
+        let of2 = Overlay::reopen(cfg, Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+        of2.write("after.txt", b"y").unwrap();
+        let t = of2.stat("after.txt").unwrap().unwrap().mtime_ns;
+        assert!(t > max_seen, "重开后时钟从 MAX 初始化、不倒退: {max_seen} -> {t}");
+    }
+
+    /// 并发 VFS 回调线程安全：多线程同写 initializing 缓冲，flush 后行完整。
+    #[test]
+    fn concurrent_init_writes_are_thread_safe_and_fully_flushed() {
+        let fx = fixture(true);
+        let of = Arc::new(make(&fx, true));
+        let threads = 4u64;
+        let per_thread = 16u64;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let of = of.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_thread {
+                    let p = format!("t{t}/f{i}.txt");
+                    let (state, _) = of.write(&p, b"payload").unwrap();
+                    assert_eq!(state, DedupeState::New);
+                    of.stat(&p).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        of.mark_ready().unwrap();
+        let id = WorktreeId(1);
+        let total = threads * per_thread;
+        assert_eq!(fx.store.dedupe_states(id).unwrap().len() as u64, total);
+        assert_eq!(fx.store.stat_entries(id).unwrap().len() as u64, total);
+        assert_eq!(fx.store.file_id_rows(id).unwrap().len() as u64, total);
+    }
+
+    /// 幂等 mark_ready：已 ready 的重开实例二次 mark_ready 只切状态，
+    /// 绝不重写/清空既有元数据行（daemon watcher 的 already-ready 路径）。
+    #[test]
+    fn mark_ready_without_batch_never_touches_existing_rows() {
+        let fx = fixture(true);
+        let of = make(&fx, true);
+        of.write("a/2.txt", b"changed!").unwrap();
+        of.mark_ready().unwrap();
+        let before = fx.store.stat_entries(WorktreeId(1)).unwrap();
+        assert_eq!(before.len(), 1);
+        // 模拟 watcher 二次 mark_ready（无缓冲的实例走仅状态分支）
+        of.mark_ready().unwrap();
+        assert_eq!(
+            fx.store.state(WorktreeId(1)).unwrap(),
+            Some(crate::WorktreeState::Ready)
+        );
+        assert_eq!(fx.store.stat_entries(WorktreeId(1)).unwrap(), before);
+        // 结构性保证：无缓冲分支只 UPDATE worktrees，不触碰任何子表行。
     }
 }

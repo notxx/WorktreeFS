@@ -262,6 +262,131 @@ impl SqliteOverlayStore {
         .map(|opt| opt.flatten())
     }
 
+    /// 全部 file_id 行（path → ino）；initializing 缓冲的崩溃重开装载用。
+    pub fn file_id_rows(&self, id: WorktreeId) -> Result<HashMap<String, u64>> {
+        let conn = self.db.lock();
+        let mut stmt = conn
+            .prepare("SELECT path, id FROM file_ids WHERE worktree_id = ?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![id.0], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .map_err(db_err)?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (path, ino) = row.map_err(db_err)?;
+            out.insert(path, ino);
+        }
+        Ok(out)
+    }
+
+    /// initializing 内存缓冲的一次性落库：**单事务**内整批写入
+    /// `file_ids` / `dedupe` / `stat_cache` / `whiteouts` / `renames`，
+    /// 并把 `worktrees.status` 切到 `state`（通常是 ready）。
+    ///
+    /// 崩溃安全：整批 + 状态切换原子生效——事务提交前 worktree 仍是
+    /// initializing（缓冲丢失可接受，upper 文件是数据真相）；提交后视图
+    /// 一次性完整可见。缓冲是该 worktree 元数据的权威视图，因此各子表
+    /// 先按 worktree_id 清空再整批插入，与崩溃重开装载（[`crate::overlay_batch::InitBatch::load`]）
+    /// 往返收敛。要求行已注册；未注册返回 [`Error::NotFound`]。
+    pub(crate) fn flush_init_batch(
+        &self,
+        id: WorktreeId,
+        batch: &crate::overlay_batch::InitBatch,
+        state: WorktreeState,
+    ) -> Result<()> {
+        self.db.with_tx(|tx| {
+            tx.execute(
+                "DELETE FROM file_ids WHERE worktree_id = ?1",
+                params![id.0],
+            )
+            .map_err(db_err)?;
+            tx.execute("DELETE FROM dedupe WHERE worktree_id = ?1", params![id.0])
+                .map_err(db_err)?;
+            tx.execute(
+                "DELETE FROM stat_cache WHERE worktree_id = ?1",
+                params![id.0],
+            )
+            .map_err(db_err)?;
+            tx.execute(
+                "DELETE FROM whiteouts WHERE worktree_id = ?1",
+                params![id.0],
+            )
+            .map_err(db_err)?;
+            tx.execute(
+                "DELETE FROM renames WHERE worktree_id = ?1",
+                params![id.0],
+            )
+            .map_err(db_err)?;
+
+            let rows = batch.rows();
+            if !rows.file_ids.is_empty() {
+                let mut stmt = tx
+                    .prepare("INSERT OR IGNORE INTO file_ids(worktree_id, path, id) VALUES (?1, ?2, ?3)")
+                    .map_err(db_err)?;
+                for (path, ino) in rows.file_ids.iter() {
+                    stmt.execute(params![id.0, path, *ino as i64]).map_err(db_err)?;
+                }
+            }
+            if !rows.dedupe.is_empty() {
+                let mut stmt = tx
+                    .prepare("INSERT INTO dedupe(worktree_id, path, state) VALUES (?1, ?2, ?3)")
+                    .map_err(db_err)?;
+                for (path, dedupe_state) in rows.dedupe.iter() {
+                    stmt.execute(params![id.0, path, dedupe_state.as_str()]).map_err(db_err)?;
+                }
+            }
+            if !rows.stat.is_empty() {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO stat_cache(worktree_id, path, mtime_ns, size, flags)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )
+                    .map_err(db_err)?;
+                for (path, entry) in rows.stat.iter() {
+                    stmt.execute(params![
+                        id.0,
+                        path,
+                        entry.mtime_ns,
+                        entry.size as i64,
+                        entry.flags as i64
+                    ])
+                    .map_err(db_err)?;
+                }
+            }
+            if !rows.renames.is_empty() {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO renames(worktree_id, from_path, to_path) VALUES (?1, ?2, ?3)",
+                    )
+                    .map_err(db_err)?;
+                for (from, to) in rows.renames.iter() {
+                    stmt.execute(params![id.0, from, to]).map_err(db_err)?;
+                }
+            }
+            if !rows.whiteouts.is_empty() {
+                let mut stmt = tx
+                    .prepare("INSERT OR IGNORE INTO whiteouts(worktree_id, path) VALUES (?1, ?2)")
+                    .map_err(db_err)?;
+                for path in rows.whiteouts.iter() {
+                    stmt.execute(params![id.0, path]).map_err(db_err)?;
+                }
+            }
+
+            let n = tx
+                .execute(
+                    "UPDATE worktrees SET status = ?1 WHERE id = ?2",
+                    params![state.to_string(), id.0],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                return Err(Error::NotFound(id.to_string()));
+            }
+            Ok(())
+        })
+    }
+
     /// 三态 dedupe 记录（trait `record_dedupe` 只能表达 lower/upper）。
     pub fn record_dedupe_state(&self, id: WorktreeId, path: &str, state: DedupeState) -> Result<()> {
         validate_relative_path(path)?;
@@ -546,6 +671,8 @@ impl OverlayStore for SqliteOverlayStore {
             params![id.0, path, candidate],
         )
         .map_err(db_err)?;
+        // autocommit INSERT 自带一个写事务：计入测试用事务计数。
+        self.db.count_autocommit_write();
         let v: i64 = conn
             .query_row(
                 "SELECT id FROM file_ids WHERE worktree_id = ?1 AND path = ?2",

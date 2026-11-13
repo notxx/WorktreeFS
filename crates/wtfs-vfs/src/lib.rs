@@ -8,10 +8,13 @@
 //!   外的按名查找一律不存在，`git worktree add` 的"目录必须为空"检查因此
 //!   通过；Git 写完 worktree index 后由 daemon 调
 //!   [`registry::VfsRegistry::mark_ready`]（M3 暴露钩子，index 监听归 M4）。
-//! * 写入路径 dedupe：暂存/就地两段式，cleanup/flush 时经
-//!   [`wtfs_core::Overlay::write_from`] 与模板比对——一致则丢弃副本回落
-//!   lower，不同才写 upper；判定逻辑全部复用 M2 合并实现，失败保留
-//!   upper 全量内容（正确性优先）。
+//! * 写入路径 dedupe：暂存/就地两段式。暂存流（checkout）cleanup/flush 时经
+//!   [`wtfs_core::Overlay::finish_staged`] 直接终裁（M9/B090100 零拷贝：
+//!   一致则丢弃暂存回落 lower——零 upper 文件、零 fsync、零临时副本；不同才
+//!   溢写改名 / 内存经临时文件原子改名 upper，恰好一次 fsync）；就地流（worker
+//!   编辑）仍经 [`wtfs_core::Overlay::write_from`] post-hoc 比对回收。失败保留
+//!   upper 全量内容（正确性优先）。I/O 计数器见
+//!   [`wtfs_core::Overlay::io_stats`]。
 //! * stat：lower 报 [`wtfs_core::Stat::fixed_lower`] 固定值（与 index 对
 //!   齐），upper 报逻辑 mtime；稳定 file id；卷序列号固定。
 //! * 通知：变更事件经 notify timer 发 `FspFileSystemNotify`。

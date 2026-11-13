@@ -15,6 +15,9 @@
 //!   缺失则全量 copy 兜底）。
 //! * M8/B080100：initializing 期内存元数据批量（`overlay_batch`），mark_ready
 //!   单事务整批落库 + 状态切换原子生效；全量 checkout 事务数 O(1)。
+//! * M9/B090100：暂存写零拷贝终裁（[`overlay::Overlay::finish_staged`]）——
+//!   一致内容零 upper 文件、零 fsync；不一致才物化 upper 且恰好一次 fsync；
+//!   I/O 计数器（[`overlay::OverlayIoStats`]）供测试插桩。
 //!
 //! 稳定性承诺：类型与 trait 只做 additive 变更；方法语义不变。
 //! 两个 trait 均为对象安全（`Send + Sync`），可放入 `Arc<dyn TemplateStore>`。
@@ -39,7 +42,9 @@ pub mod tower_state;
 
 pub use db::Db;
 pub use dedupe::{DedupeState, decide_for_path, hash_bytes, hash_file, hash_reader};
-pub use overlay::{EntryKind, Overlay, OverlayDirEntry, Resolution, attributes_for};
+pub use overlay::{
+    EntryKind, Overlay, OverlayDirEntry, OverlayIoStats, Resolution, StagedContent, attributes_for,
+};
 pub use overlay_store::{SqliteOverlayStore, StatCacheEntry, WorktreeRegistration};
 pub use template_store::SqliteTemplateStore;
 pub use tower_state::{

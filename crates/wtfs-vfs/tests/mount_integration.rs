@@ -181,6 +181,76 @@ fn is_junction(path: &Path) -> bool {
 }
 
 #[test]
+#[ignore = "requires real WinFSP runtime and git CLI"]
+fn real_mount_clean_checkout_has_zero_upper_writes_and_single_fsync_for_git_pointer() {
+    // M9/B090100 验收（真实 WinFSP + git）：干净 checkout 的模板文件经
+    // finish_staged 零 upper 物化、零 fsync；仅 worktree 内的 `.git` 指针
+    // （模板外新路径）物化 upper 并恰好一次 fsync。
+    let base = tempfile::tempdir().expect("tempdir");
+    let base = base.path().to_path_buf();
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# hello\n").unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").unwrap();
+    std::fs::write(repo.join("src/main.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+    let (ok, out) = git(&repo, &["init", "-b", "master"]);
+    assert!(ok, "git init failed: {out}");
+    let (ok, out) = git(&repo, &["config", "core.autocrlf", "false"]);
+    assert!(ok, "git config failed: {out}");
+    let (ok, out) = git(&repo, &["add", "."]);
+    assert!(ok, "git add failed: {out}");
+    let (ok, out) = git(&repo, &["commit", "-m", "init", "-q"]);
+    assert!(ok, "git commit failed: {out}");
+
+    let store_root = base.join("store");
+    let template_store = SqliteTemplateStore::open(&store_root).unwrap();
+    let template = template_store
+        .create_or_update(&TemplateSpec::new(&repo, "master"))
+        .expect("template creation must succeed");
+    assert!(template_store.files(template.id).unwrap().len() >= 3);
+
+    let mount_point = repo.join(".tower").join("worktrees");
+    std::fs::create_dir_all(&mount_point).unwrap();
+    let cfg = VfsConfig::new(&repo, &store_root);
+    let registry = Arc::new(VfsRegistry::open(cfg).unwrap());
+    let volume = mount_directory(&mount_point, registry.clone())
+        .expect("WinFSP directory mount must succeed (is the WinFSP runtime installed?)");
+
+    let worktree = mount_point.join("wt-1");
+    let (ok, out) = git(&repo, &["worktree", "add", &worktree.to_string_lossy(), "-b", "feat/m9-io-stats"]);
+    assert!(ok, "git worktree add failed: {out}");
+    registry.mark_ready("wt-1").expect("mark_ready hook");
+
+    // I/O 插桩：模板内容零物化零 fsync；`.git` 指针 1 物化 + 1 fsync。
+    let overlay = registry.get("wt-1").expect("overlay registered");
+    let stats = overlay.io_stats();
+    assert_eq!(
+        stats.upper_writes(),
+        1,
+        "只有 .git 指针物化 upper（模板内容零物化）；fsyncs={} upper={}",
+        stats.fsyncs(),
+        stats.upper_writes()
+    );
+    assert_eq!(
+        stats.fsyncs(), 1,
+        "物化恰好一次 fsync；fsyncs={} upper={}",
+        stats.fsyncs(),
+        stats.upper_writes()
+    );
+
+    // 上层目录只剩 `.git` 指针；git status 干净（dedupe 语义不变）。
+    let upper = store_root.join("worktrees").join("wt-1").join("upper");
+    let (upper_files, _) = count_files(&upper);
+    assert_eq!(upper_files, 1, "upper 只剩 .git 指针，模板内容零残留");
+    let (ok, out) = git(&worktree, &["status", "--porcelain"]);
+    assert!(ok, "git status failed: {out}");
+    assert_eq!(out.trim(), "", "git status must be clean, got: {out:?}");
+
+    volume.unmount();
+}
+
+#[test]
 #[ignore = "requires real WinFSP runtime"]
 fn real_mount_unmount_restores_empty_mount_dir_for_tower() {
     // B070100 回归：卸载后 Tower 契约目录 `<repo>/.tower/worktrees` 必须

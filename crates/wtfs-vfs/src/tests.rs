@@ -92,6 +92,64 @@ fn fixture() -> Fixture {
     }
 }
 
+/// 带空文件的模板 fixture（B100100）：在 [`fixture`] 的文件之外增加根级
+/// `empty.txt` 与嵌套 `nested/empty.txt`（模板含空 blob 条目，git checkout
+/// 的零字节 blob 路径依赖它）。
+fn fixture_with_empty() -> Fixture {
+    // DirBuffer/notify 走 WinFSP DLL（delayload）；先按 PATH/注册表加载。
+    crate::win::ensure_winfsp_runtime().expect("WinFSP runtime must be loadable");
+    let dir = TempDir::new().unwrap();
+    let lower_dir = dir.path().join("lower");
+    let upper_dir = dir.path().join("upper-wt1");
+    std::fs::create_dir_all(lower_dir.join("a")).unwrap();
+    std::fs::create_dir_all(lower_dir.join("nested")).unwrap();
+    std::fs::create_dir_all(&upper_dir).unwrap();
+    std::fs::write(lower_dir.join("a/1.txt"), ONE).unwrap();
+    std::fs::write(lower_dir.join("a/2.txt"), TWO).unwrap();
+    std::fs::write(lower_dir.join("b.txt"), BEE).unwrap();
+    std::fs::write(lower_dir.join("exec.sh"), RUN).unwrap();
+    std::fs::write(lower_dir.join("empty.txt"), b"").unwrap();
+    std::fs::write(lower_dir.join("nested/empty.txt"), b"").unwrap();
+
+    let mut map: HashMap<String, TemplateFile> = HashMap::new();
+    for (path, content, mode) in [
+        ("a/1.txt", ONE, 0o100644u32),
+        ("a/2.txt", TWO, 0o100644),
+        ("b.txt", BEE, 0o100644),
+        ("exec.sh", RUN, 0o100755),
+        ("empty.txt", &b""[..], 0o100644),
+        ("nested/empty.txt", &b""[..], 0o100644),
+    ] {
+        map.insert(
+            path.to_string(),
+            TemplateFile {
+                path: path.to_string(),
+                hash: wtfs_core::hash_bytes(content),
+                size: content.len() as u64,
+                mode,
+            },
+        );
+    }
+
+    let cfg = VfsConfig::new(dir.path().join("repo"), dir.path().join("store"));
+    let registry = Arc::new(VfsRegistry::open(cfg).unwrap());
+    let mut config = OverlayConfig::new(WorktreeId(1), &upper_dir);
+    config.lower_root = Some(lower_dir.clone());
+    config.dedupe_enabled = true;
+    let store = Arc::new(SqliteOverlayStore::new(Db::open_in_memory().unwrap()));
+    let overlay = Arc::new(Overlay::new(config, Some(map), store).unwrap());
+    registry.register("wt-1", overlay);
+
+    let ctx = WtfsContext::new(registry.clone());
+    Fixture {
+        _dir: dir,
+        lower_dir,
+        upper_dir,
+        registry,
+        ctx,
+    }
+}
+
 fn p(s: &str) -> U16CString {
     U16CString::from_str(s).unwrap()
 }
@@ -328,12 +386,14 @@ fn staged_delete_discards_without_visible_trace() {
     let fx = fixture();
     let fctx = create_file(&fx, "\\wt-1\\b.txt");
     write(&fx, &fctx, b"partial");
-    // delete-on-close：暂存直接丢弃，视图无痕
+    // delete-on-close：暂存直接丢弃（"partial" 不得出现）。B100100 起
+    // create 的文件当场存在，delete 语义 = 删除（R2：撤占位 / 记 whiteout），
+    // 不得回落 lower 复活旧内容。
     fx.ctx.set_delete(&fctx, &p("\\wt-1\\b.txt"), true).unwrap();
     cleanup(&fx, fctx, 0);
     assert!(!fx.upper_dir.join("b.txt").exists());
     let overlay = fx.registry.get("wt-1").unwrap();
-    assert!(matches!(overlay.resolve("b.txt").unwrap(), Resolution::Lower { .. }));
+    assert_eq!(overlay.resolve("b.txt").unwrap(), Resolution::Whiteout);
 }
 
 #[test]
@@ -541,6 +601,233 @@ fn whiteout_delete_and_recreate() {
     cleanup(&fx, fctx, 0);
     let s = sec(&fx, "\\wt-1\\b.txt").unwrap();
     assert!(s.attributes & wtfs_core::FileAttributes::ARCHIVE.bits() != 0);
+}
+
+// ---- B100100：新建零写入关闭（git checkout 零字节 blob） ----
+
+/// git checkout 写一个文件的完整回调序列（force 检出）：
+/// 前置 lstat 命中 → unlink（whiteout）→ CREATE_NEW 新建 →（可选写入）→ close。
+/// 返回 `rel` 的最终解析结果断言由调用方完成。
+fn checkout_rewrite(fx: &Fixture, rel: &str, content: Option<&[u8]>) {
+    let path = format!("\\wt-1\\{rel}");
+    assert!(sec(fx, &path).is_ok(), "checkout 前置 lstat 必须命中模板: {rel}");
+    let fctx = open(fx, &path).unwrap();
+    fx.ctx.set_delete(&fctx, &p(&path), true).unwrap();
+    cleanup(fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    let fctx = create_file(fx, &path);
+    if let Some(data) = content {
+        write(fx, &fctx, data);
+    }
+    cleanup(fx, fctx, 0);
+}
+
+/// B100100 核心回归（模板覆盖的根级空文件）：修复前 unlink 留下的 whiteout
+/// 无人撤销（零写入 close 无终裁），git 报 "unable to stat just-written file"；
+/// 修复后 create 当场撤销 whiteout——一致空内容回落 lower，零 upper 物化、
+/// 零 fsync。
+#[test]
+fn zero_write_create_clears_checkout_whiteout_for_template_empty_file() {
+    let fx = fixture_with_empty();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    checkout_rewrite(&fx, "empty.txt", None);
+    assert!(
+        matches!(overlay.resolve("empty.txt").unwrap(), Resolution::Lower { .. }),
+        "whiteout 必须被撤销，回落 lower"
+    );
+    let s = sec(&fx, "\\wt-1\\empty.txt").unwrap();
+    assert!(s.attributes & wtfs_core::FileAttributes::ARCHIVE.bits() != 0);
+    assert!(!fx.upper_dir.join("empty.txt").exists(), "一致内容零 upper 残留");
+    assert_eq!(overlay.io_stats().fsyncs(), 0, "空 blob 回落 lower 零 fsync");
+    assert_eq!(overlay.io_stats().upper_writes(), 0, "空 blob 零 upper 物化");
+
+    // 决策落批量缓冲，mark_ready 单事务落库（M8 语义不变）。
+    overlay.mark_ready().unwrap();
+    assert_eq!(
+        overlay
+            .store()
+            .dedupe_states(WorktreeId(1))
+            .unwrap()
+            .get("empty.txt"),
+        Some(&DedupeState::Lower)
+    );
+}
+
+/// 嵌套空文件（git 先 mkdir 子目录再写）：同样必须恢复可见。
+#[test]
+fn zero_write_create_clears_checkout_whiteout_for_nested_empty_file() {
+    let fx = fixture_with_empty();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    let dctx = create_dir(&fx, "\\wt-1\\nested");
+    cleanup(&fx, dctx, 0);
+    checkout_rewrite(&fx, "nested/empty.txt", None);
+
+    assert!(
+        matches!(overlay.resolve("nested/empty.txt").unwrap(), Resolution::Lower { .. })
+    );
+    assert!(!fx.upper_dir.join("nested/empty.txt").exists());
+    assert_eq!(overlay.io_stats().fsyncs(), 0);
+    assert_eq!(overlay.io_stats().upper_writes(), 0);
+}
+
+/// 模板外新路径（含全量 copy 兜底模式）：create 当场物化空 upper 占位（路径
+/// 立即可解析），零写入 close 经终裁持久化（NT 语义 CREATE_NEW + close =
+/// 文件存在、EOF 0）。
+#[test]
+fn zero_write_create_materializes_new_empty_file() {
+    let fx = fixture_with_empty();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    let fctx = create_file(&fx, "\\wt-1\\brand-new.txt");
+    cleanup(&fx, fctx, 0);
+
+    assert!(matches!(
+        overlay.resolve("brand-new.txt").unwrap(),
+        Resolution::Upper { .. }
+    ));
+    let st = overlay.stat("brand-new.txt").unwrap().unwrap();
+    assert_eq!(st.size, 0);
+    assert_eq!(
+        fx.upper_dir.join("brand-new.txt").metadata().unwrap().len(),
+        0,
+        "空 upper 文件 EOF 精确为 0"
+    );
+    // create 时占位物化（无 fsync）+ cleanup 零写入终裁持久化（1 fsync）。
+    assert_eq!(overlay.io_stats().fsyncs(), 1);
+    assert_eq!(overlay.io_stats().upper_writes(), 2);
+    overlay.mark_ready().unwrap();
+    assert_eq!(
+        overlay
+            .store()
+            .dedupe_states(WorktreeId(1))
+            .unwrap()
+            .get("brand-new.txt"),
+        Some(&DedupeState::New)
+    );
+}
+
+/// ready 态的 `git checkout <空文件>`（lstat→unlink→create→零写 close）：
+/// 修复前同样报 "unable to stat just-written file"；回归守护。
+#[test]
+fn ready_zero_write_recreate_of_empty_lower_file_stays_visible() {
+    let fx = fixture_with_empty();
+    let overlay = fx.registry.get("wt-1").unwrap();
+    fx.registry.mark_ready("wt-1").unwrap();
+
+    checkout_rewrite(&fx, "empty.txt", None);
+    assert!(matches!(overlay.resolve("empty.txt").unwrap(), Resolution::Lower { .. }));
+    assert!(!fx.upper_dir.join("empty.txt").exists());
+}
+
+/// B100100 混合检出序列：空文件 + 嵌套空文件 + 非空文件按 checkout 顺序
+/// 全部走 unlink→create→写/close；模板一致内容零 upper/零 fsync，mark_ready
+/// 后枚举完整、内容正确（git status 干净的 FS 侧前提）。
+#[test]
+fn mixed_checkout_empty_nested_and_nonempty_files_end_clean() {
+    let fx = fixture_with_empty();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    checkout_rewrite(&fx, "empty.txt", None);
+    let dctx = create_dir(&fx, "\\wt-1\\nested");
+    cleanup(&fx, dctx, 0);
+    checkout_rewrite(&fx, "nested/empty.txt", None);
+    checkout_rewrite(&fx, "b.txt", Some(BEE));
+    checkout_rewrite(&fx, "a/1.txt", Some(ONE));
+
+    for rel in ["empty.txt", "nested/empty.txt", "b.txt", "a/1.txt"] {
+        assert!(
+            matches!(overlay.resolve(rel).unwrap(), Resolution::Lower { .. }),
+            "{rel} 必须可见"
+        );
+        assert!(!fx.upper_dir.join(rel).exists(), "{rel} 零 upper 残留");
+    }
+    assert_eq!(overlay.io_stats().fsyncs(), 0, "模板一致混合检出零 fsync");
+    assert_eq!(overlay.io_stats().upper_writes(), 0, "模板一致混合检出零物化");
+
+    overlay.mark_ready().unwrap();
+    let mut root: Vec<String> = overlay
+        .list("")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    root.sort();
+    assert_eq!(root, vec!["a", "b.txt", "empty.txt", "exec.sh", "nested"]);
+    assert_eq!(
+        overlay
+            .list("nested")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect::<Vec<_>>(),
+        vec!["empty.txt"]
+    );
+    assert_eq!(overlay.read("empty.txt").unwrap().as_deref(), Some(&b""[..]));
+}
+
+/// B100100 R2 回归：create→write→delete-on-close 不得残留 create 当场留下的
+/// 状态——NotFound 占位连带 stat/dedupe 删除（幽灵空文件会让后续 CREATE_NEW
+/// collision）；whiteout 已撤销的模板路径重新记 whiteout，lower 内容不复活。
+#[test]
+fn staged_delete_on_close_cleans_state_left_by_create() {
+    let fx = fixture_with_empty();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    // NotFound 变体（模板外新路径）：占位删除 + 后续 CREATE_NEW 不 collision
+    let fctx = create_file(&fx, "\\wt-1\\brand-new.txt");
+    write(&fx, &fctx, b"temp");
+    let path = "\\wt-1\\brand-new.txt";
+    fx.ctx.set_delete(&fctx, &p(path), true).unwrap();
+    cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    assert_eq!(
+        overlay.resolve("brand-new.txt").unwrap(),
+        Resolution::NotFound,
+        "delete-on-close 后不得残留幽灵占位"
+    );
+    assert!(!fx.upper_dir.join("brand-new.txt").exists());
+    let recreated = create_file(&fx, path);
+    cleanup(&fx, recreated, 0);
+    assert!(matches!(
+        overlay.resolve("brand-new.txt").unwrap(),
+        Resolution::Upper { .. }
+    ));
+
+    // whiteout 变体（模板覆盖空 blob）：unlink → create 撤销 whiteout →
+    // 暂存写 → delete-on-close：重新记 whiteout，lower 内容不复活
+    let path = "\\wt-1\\empty.txt";
+    let unlink = open(&fx, path).unwrap();
+    fx.ctx.set_delete(&unlink, &p(path), true).unwrap();
+    cleanup(&fx, unlink, FspCleanupFlags::FspCleanupDelete as u32);
+    let fctx = create_file(&fx, path);
+    write(&fx, &fctx, b"temporary");
+    fx.ctx.set_delete(&fctx, &p(path), true).unwrap();
+    cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    assert_eq!(
+        overlay.resolve("empty.txt").unwrap(),
+        Resolution::Whiteout,
+        "已删除内容不得回落 lower 复活"
+    );
+    assert!(!fx.upper_dir.join("empty.txt").exists());
+
+    // whiteout 变体（非空模板 b.txt）：同序列同语义
+    let path = "\\wt-1\\b.txt";
+    let unlink = open(&fx, path).unwrap();
+    fx.ctx.set_delete(&unlink, &p(path), true).unwrap();
+    cleanup(&fx, unlink, FspCleanupFlags::FspCleanupDelete as u32);
+    let fctx = create_file(&fx, path);
+    write(&fx, &fctx, b"temporary");
+    fx.ctx.set_delete(&fctx, &p(path), true).unwrap();
+    cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    assert_eq!(overlay.resolve("b.txt").unwrap(), Resolution::Whiteout);
+    assert!(!fx.upper_dir.join("b.txt").exists());
+
+    // 对照：正常 checkout 序列（无 delete-on-close）不受影响
+    checkout_rewrite(&fx, "nested/empty.txt", None);
+    assert!(matches!(
+        overlay.resolve("nested/empty.txt").unwrap(),
+        Resolution::Lower { .. }
+    ));
 }
 
 #[test]
@@ -1052,7 +1339,8 @@ fn staged_spill_write_finalizes_via_rename_with_single_fsync() {
     cleanup(&fx, fctx, 0);
 
     assert_eq!(overlay.io_stats().fsyncs(), 1, "溢写物化恰好一次 fsync");
-    assert_eq!(overlay.io_stats().upper_writes(), 1);
+    // B100100：create 当场物化空 upper 占位（1）+ 溢写终裁内容（1）= 2。
+    assert_eq!(overlay.io_stats().upper_writes(), 2);
     assert_eq!(spill_count(&fx), 0, "溢写文件经 rename 消费");
     assert_eq!(overlay.stat("big.bin").unwrap().unwrap().size, big.len() as u64);
     let data = overlay.read("big.bin").unwrap().unwrap();
@@ -1100,7 +1388,8 @@ fn staged_spill_set_file_size_updates_spill_eof_and_finalizes_consistently() {
         data[crate::context::STAGE_SPILL_BYTES + 4..].iter().all(|&b| b == 0),
         "扩张区零填充"
     );
-    // M9 目标不受影响：物化恰好 1 upper + 1 fsync
+    // M9 目标不受影响：fsync 恰好 1（B100100 起 upper 物化计数含 create
+    // 占位 1 + 终裁内容 1 = 2）
     assert_eq!(overlay.io_stats().fsyncs(), 1);
-    assert_eq!(overlay.io_stats().upper_writes(), 1);
+    assert_eq!(overlay.io_stats().upper_writes(), 2);
 }

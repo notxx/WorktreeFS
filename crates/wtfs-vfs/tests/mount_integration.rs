@@ -223,21 +223,18 @@ fn real_mount_clean_checkout_has_zero_upper_writes_and_single_fsync_for_git_poin
     registry.mark_ready("wt-1").expect("mark_ready hook");
 
     // I/O 插桩：模板内容零物化零 fsync；`.git` 指针 1 物化 + 1 fsync。
+    // （B100100 起 .git 的 create 当场物化空 upper 占位 + staged 终裁物化
+    // 内容 = 2 次记录，fsync 仍恰好 1 次。）
     let overlay = registry.get("wt-1").expect("overlay registered");
     let stats = overlay.io_stats();
     assert_eq!(
         stats.upper_writes(),
-        1,
-        "只有 .git 指针物化 upper（模板内容零物化）；fsyncs={} upper={}",
+        2,
+        "只有 .git 指针落 upper（create 占位 + 内容终裁）；fsyncs={} upper={}",
         stats.fsyncs(),
         stats.upper_writes()
     );
-    assert_eq!(
-        stats.fsyncs(), 1,
-        "物化恰好一次 fsync；fsyncs={} upper={}",
-        stats.fsyncs(),
-        stats.upper_writes()
-    );
+    assert_eq!(stats.fsyncs(), 1, "物化恰好一次 fsync（.git 指针）");
 
     // 上层目录只剩 `.git` 指针；git status 干净（dedupe 语义不变）。
     let upper = store_root.join("worktrees").join("wt-1").join("upper");
@@ -246,6 +243,121 @@ fn real_mount_clean_checkout_has_zero_upper_writes_and_single_fsync_for_git_poin
     let (ok, out) = git(&worktree, &["status", "--porcelain"]);
     assert!(ok, "git status failed: {out}");
     assert_eq!(out.trim(), "", "git status must be clean, got: {out:?}");
+
+    volume.unmount();
+}
+
+#[test]
+#[ignore = "requires real WinFSP runtime and git CLI"]
+fn real_mount_git_worktree_add_with_empty_files_mixed_checkout() {
+    // B100100 回归（真实 WinFSP + git）：模板含根级空文件、嵌套空文件与
+    // 非空文件的混合检出。修复前 git worktree add 报
+    // "unable to stat just-written file empty.txt: No such file or directory"
+    // 与 "fatal: Could not reset index file to revision 'HEAD'"（force 检出的
+    // unlink 留下 whiteout，零字节 blob 写路径无终裁）；修复后必须成功、
+    // git status 干净、空文件可读可 stat，模板一致内容仍零 upper 物化、
+    // 零 fsync（仅 worktree 内 `.git` 指针落 upper，一次 fsync）。
+    let base = tempfile::tempdir().expect("tempdir");
+    let base = base.path().to_path_buf();
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# hello\n").unwrap();
+    std::fs::write(repo.join("empty.txt"), b"").unwrap();
+    std::fs::create_dir_all(repo.join("nested")).unwrap();
+    std::fs::write(repo.join("nested/empty.txt"), b"").unwrap();
+    let (ok, out) = git(&repo, &["init", "-b", "master"]);
+    assert!(ok, "git init failed: {out}");
+    let (ok, out) = git(&repo, &["config", "core.autocrlf", "false"]);
+    assert!(ok, "git config failed: {out}");
+    let (ok, out) = git(&repo, &["add", "."]);
+    assert!(ok, "git add failed: {out}");
+    let (ok, out) = git(&repo, &["commit", "-m", "init", "-q"]);
+    assert!(ok, "git commit failed: {out}");
+
+    let store_root = base.join("store");
+    let template_store = SqliteTemplateStore::open(&store_root).unwrap();
+    let template = template_store
+        .create_or_update(&TemplateSpec::new(&repo, "master"))
+        .expect("template creation must succeed");
+    // 模板必须包含空文件条目（size 0；hash = 空 blob 的 blake3）。
+    let empty_entries: Vec<_> = template_store
+        .files(template.id)
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.size == 0)
+        .collect();
+    assert_eq!(empty_entries.len(), 2, "模板必须含两个空文件条目");
+
+    let mount_point = repo.join(".tower").join("worktrees");
+    std::fs::create_dir_all(&mount_point).unwrap();
+    let cfg = VfsConfig::new(&repo, &store_root);
+    let registry = Arc::new(VfsRegistry::open(cfg).unwrap());
+    let volume = mount_directory(&mount_point, registry.clone())
+        .expect("WinFSP directory mount must succeed (is the WinFSP runtime installed?)");
+
+    // worktree add --detach：与基准（大仓库发现 B100100）相同的调用形态。
+    let worktree = mount_point.join("wt-1");
+    let (ok, out) = git(&repo, &["worktree", "add", "--detach", &worktree.to_string_lossy(), "HEAD"]);
+    assert!(
+        ok,
+        "git worktree add with empty files must succeed (B100100); output: {out}"
+    );
+    assert!(
+        !out.contains("unable to stat"),
+        "no just-written stat errors allowed: {out}"
+    );
+
+    registry.mark_ready("wt-1").expect("mark_ready hook");
+
+    // 空文件可读、可 stat（EOF 0）；非空文件内容正确。
+    assert_eq!(
+        std::fs::read(worktree.join("empty.txt")).expect("read empty.txt"),
+        b"",
+        "empty.txt must be readable through the mount"
+    );
+    assert_eq!(
+        std::fs::read(worktree.join("nested/empty.txt")).expect("read nested/empty.txt"),
+        b""
+    );
+    assert_eq!(
+        std::fs::metadata(worktree.join("empty.txt"))
+            .expect("stat empty.txt")
+            .len(),
+        0
+    );
+    assert_eq!(std::fs::read(worktree.join("README.md")).unwrap(), b"# hello\n");
+
+    // git status 干净（index 与 FS 固定 stat 对齐，spec §6.3 验收）。
+    let (ok, out) = git(&worktree, &["status", "--porcelain"]);
+    assert!(ok, "git status failed: {out}");
+    assert_eq!(out.trim(), "", "git status must be clean, got: {out:?}");
+
+    // dedupe 不回归：模板一致内容零 upper 物化、零 fsync；upper 只剩 .git。
+    // （B100100 起 .git 的 create 当场物化空 upper 占位 + staged 终裁物化
+    // 内容 = 2 次记录，fsync 仍恰好 1 次。）
+    let overlay = registry.get("wt-1").expect("overlay registered");
+    let stats = overlay.io_stats();
+    assert_eq!(
+        stats.upper_writes(),
+        2,
+        "只有 .git 指针落 upper（create 占位 + 内容终裁；含空文件在内模板内容零物化）；fsyncs={} upper={}",
+        stats.fsyncs(),
+        stats.upper_writes()
+    );
+    assert_eq!(stats.fsyncs(), 1, "物化恰好一次 fsync（.git 指针）");
+    let upper = store_root.join("worktrees").join("wt-1").join("upper");
+    let (upper_files, _) = count_files(&upper);
+    assert_eq!(upper_files, 1, "upper 只剩 .git 指针，模板内容（含空文件）零残留");
+
+    // 编辑空文件 → copy-up 可见（worker 流不受影响）。
+    std::fs::write(worktree.join("empty.txt"), b"now nonempty\n").unwrap();
+    let (ok, out) = git(&worktree, &["status", "--porcelain"]);
+    assert!(ok, "git status after edit failed: {out}");
+    assert!(out.contains("M empty.txt"), "expected ` M empty.txt`, got: {out:?}");
+    assert_eq!(
+        std::fs::read(worktree.join("empty.txt")).unwrap(),
+        b"now nonempty\n"
+    );
 
     volume.unmount();
 }

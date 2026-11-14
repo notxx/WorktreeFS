@@ -35,6 +35,14 @@
 //!   `OPEN_ALWAYS`（=`FILE_OPEN_IF`）+ `FileAllocationInfo(0)` 手动清空）：
 //!   [`FileSystemContext::set_file_size`] 对分配大小收缩按 NT 语义截断
 //!   EOF（增长/持平仍是预占提示，不改变 EOF）。
+//! * 新建零写入关闭（B100100）：`create`（CREATE_NEW，git checkout 的
+//!   O_CREAT|O_EXCL 零字节 blob）在回调内经
+//!   [`wtfs_core::Overlay::prepare_created_file`] 当场保证路径可解析
+//!   （whiteout 撤销 / 空 upper 占位）——WinFSP 在 create 后对路径按名
+//!   查询，不解析则零字节文件"刚写入即消失"，git 报
+//!   "unable to stat just-written file"；零写入 close 再经
+//!   [`wtfs_core::Overlay::finish_staged`] 补终裁（NT 语义 = 文件存在
+//!   EOF 0；一致空 blob 回落 lower，零 upper/零 fsync）。
 //! * 任何一步失败保留 upper 已写内容（正确性优先，spec §6.3.6）。
 //!
 //! 并发：回调以 `&self` 并发进入（FineGuard 多线程）；文件级状态在
@@ -185,6 +193,11 @@ pub struct FileContext {
     /// 覆写类 disposition 打开（CREATE_ALWAYS/TRUNCATE_EXISTING，B060100）：
     /// EOF 必须收缩到新内容——首次写状态建立时清空；零写入句柄 cleanup 兜底。
     truncate_open: AtomicBool,
+    /// `create` 回调新建的文件句柄（B100100）：零写入关闭也必须物化空文件
+    /// （NT 语义 CREATE_NEW + close = 文件存在 EOF 0；git checkout 的
+    /// O_CREAT|O_EXCL 零字节 blob 路径依赖此兜底）；delete-on-close 时
+    /// 撤销 create 当场留下的占位/whiteout 撤销（B100100 R2）。
+    created_new: AtomicBool,
 }
 
 impl Drop for FileContext {
@@ -216,6 +229,7 @@ impl FileContext {
             write: Mutex::new(None),
             delete_pending: AtomicBool::new(false),
             truncate_open: AtomicBool::new(false),
+            created_new: AtomicBool::new(false),
         }
     }
 
@@ -229,6 +243,7 @@ impl FileContext {
             write: Mutex::new(None),
             delete_pending: AtomicBool::new(false),
             truncate_open: AtomicBool::new(false),
+            created_new: AtomicBool::new(false),
         }
     }
 
@@ -740,6 +755,11 @@ impl FileSystemContext for WtfsContext {
                     // whiteout 目标可重建（POSIX 语义）；真实存在才冲突。
                     return Err(err_collision());
                 }
+                // B100100：create 返回后路径必须立即可解析（WinFSP 紧接着对该
+                // 路径按名查询）——whiteout 当场撤销（模板空 blob 走零拷贝
+                // 终裁），NotFound 物化空 upper 占位；零字节 blob 没有写入、
+                // 也就没有 staged 终裁可依赖。
+                overlay.prepare_created_file(&rel).map_err(fsp_err)?;
                 let st = Stat {
                     dev: u64::from(overlay.config().volume_serial),
                     ino: overlay.file_id(&rel).map_err(fsp_err)?,
@@ -749,8 +769,13 @@ impl FileSystemContext for WtfsContext {
                     ctime_ns: wtfs_core::FIXED_STAT_EPOCH_UNIX_NS,
                 };
                 fill_file_info(file_info.as_mut(), &st);
+                let fctx = FileContext::file(Some(name.clone()), overlay.clone(), rel.clone());
+                // B100100：标记为"新建文件句柄"——零写入关闭也要在 cleanup
+                // 物化空文件（NT 语义），否则 git checkout 的零字节 blob
+                // （O_CREAT|O_EXCL 写 0 字节）在视图里不存在。
+                fctx.created_new.store(true, Ordering::SeqCst);
                 self.notify_change(&name, &rel, FILE_ACTION_ADDED);
-                return Ok(FileContext::file(Some(name), overlay, rel));
+                return Ok(fctx);
             }
         }
     }
@@ -830,6 +855,15 @@ impl FileSystemContext for WtfsContext {
                 if delete {
                     // 从未可见：直接丢弃暂存。
                     discard_staged(staged);
+                    // B100100 R2：create 当场留下的状态不得残留（delete-on-close
+                    // 语义 = 路径最终不存在）——NotFound 占位连带 stat/dedupe 行
+                    // 删除（否则幽灵空文件让后续 CREATE_NEW collision）；
+                    // whiteout 已撤销的路径重新记上，lower 内容不得"复活"。
+                    if context.created_new.load(Ordering::SeqCst) {
+                        if let Err(e) = overlay.remove(&rel) {
+                            tracing::warn!(rel = %rel, error = %e, "delete after staged discard failed");
+                        }
+                    }
                     return;
                 }
                 match FileContext::finalize_staged(&overlay, &rel, staged) {
@@ -871,10 +905,17 @@ impl FileSystemContext for WtfsContext {
                         Ok(_) => self.notify_change(&name, &rel, FILE_ACTION_REMOVED),
                         Err(e) => tracing::warn!(rel = %rel, error = %e, "delete failed"),
                     }
-                } else if context.truncate_open.load(Ordering::SeqCst) {
-                    // 覆写类打开后零写入（B060100 兜底）：Windows CREATE_ALWAYS
-                    // 语义 = 打开即清空。走 finish_staged 终裁：与模板一致的空
-                    // 内容回落 lower，否则落空 upper（git 空文件 blob 路径）。
+                } else if context.truncate_open.load(Ordering::SeqCst)
+                    || context.created_new.load(Ordering::SeqCst)
+                {
+                    // 零写入关闭兜底，两条路径同语义（与模板一致的空内容回落
+                    // lower，否则落空 upper——git 空文件 blob 路径）：
+                    // * B060100：覆写类打开（CREATE_ALWAYS/TRUNCATE_EXISTING）
+                    //   打开即清空，EOF = 0；
+                    // * B100100：新建打开（CREATE_NEW，git checkout 的
+                    //   O_CREAT|O_EXCL 零字节 blob）NT 语义 = 文件已存在、
+                    //   EOF = 0。create 当场已由 prepare_created_file 保证
+                    //   路径可解析，此处补终裁（持久性 + 模板一致回收）。
                     let result = overlay
                         .finish_staged(
                             &rel,
@@ -889,7 +930,7 @@ impl FileSystemContext for WtfsContext {
                         Err(e) => tracing::warn!(
                             rel = %rel,
                             error = %e,
-                            "zero-write overwrite finalize failed; content preserved"
+                            "zero-write finalize failed; content preserved"
                         ),
                     }
                 }

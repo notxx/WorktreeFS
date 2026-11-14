@@ -148,7 +148,7 @@ M2+（mount 在 workspace 根）：
 
 - 模板管理：创建/更新/快照 index。
 - overlay 元数据：SQLite WAL。
-- copy-up、whiteout、rename map、file id、逻辑 mtime。
+- copy-up、whiteout、rename map、file id（路径哈希派生）；mtime：lower 固定 epoch、upper 真实文件 mtime（M11）。
 - dedupe：模板文件 hash、写入路径比较、lower/upper 决策。
 - index 读写（M1+；优先 `gix-index`，必要时自写 v2）。
 - 路径/大小写/保留名校验。
@@ -304,7 +304,7 @@ git worktree add <path> <branch>
 - 重命名：文件级 whiteout + copy-up/upper rename；目录级 rename map。
 - stat：
   - lower：固定 dev/ino/mtime/ctime，size/mode 来自模板 index。
-  - upper：真实/逻辑 mtime；稳定 file id。
+  - upper：真实 mtime；稳定 file id（路径哈希派生）。
 - 目录枚举：lower + upper 合并，应用 whiteout/rename。
 - 通知：变更后 `FspFileSystemNotify`。
 - mmap/锁：WinFSP 原生支持；M2/M4 用真实工具验证。

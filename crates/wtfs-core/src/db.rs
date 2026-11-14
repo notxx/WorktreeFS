@@ -113,12 +113,10 @@ CREATE TABLE stat_cache (
 );
 "#;
 
-/// v1 → v2：`stat_cache` 的 `(worktree_id, mtime_ns)` 兜底索引。
-///
-/// 常规写路径已由内存逻辑 mtime 时钟取代逐写 `MAX(mtime_ns)` 查询；
-/// 索引服务剩下的一次性查询——Overlay 打开时初始化时钟的
-/// [`crate::overlay_store::SqliteOverlayStore::max_stat_mtime`]（无索引时
-/// 在 stat_cache 增长后退化为全表扫描）。
+/// v1 → v2（历史迁移步骤）：`stat_cache` 的 `(worktree_id, mtime_ns)` 兜底
+/// 索引。v1/v2 时代的 stat_cache 已在 v3 删除（当时曾由内存逻辑 mtime 时钟
+/// 写入并靠本索引服务一次性 MAX 查询；该机制随 M11 派生表删除一并移除，
+/// 现为 upper 真实文件 mtime）。本步骤仅为历史库升级路径保留。
 const SCHEMA_V2: &str =
     "CREATE INDEX IF NOT EXISTS idx_stat_cache_wt_mtime ON stat_cache(worktree_id, mtime_ns);";
 

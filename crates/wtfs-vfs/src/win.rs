@@ -9,8 +9,9 @@ use std::path::Path;
 use winfsp::{U16CStr, U16CString};
 use windows::Win32::Foundation::{
     STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_FILE_IS_A_DIRECTORY,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_NO_MORE_FILES,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_NOT_SAME_DEVICE,
+    STATUS_NO_MORE_FILES, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID,
+    STATUS_OBJECT_NAME_NOT_FOUND,
 };
 use winfsp::FspError;
 
@@ -109,6 +110,13 @@ pub fn err_invalid_name() -> FspError {
     nt_err(STATUS_OBJECT_NAME_INVALID)
 }
 
+/// 跨层目录 rename（M12：core `Error::CrossDevice`）：OverlayFS 默认 EXDEV
+/// 语义的 NT 状态（Win32 `ERROR_NOT_SAME_DEVICE`），调用方按跨设备退化为
+/// 递归复制+删除。
+pub fn err_not_same_device() -> FspError {
+    nt_err(STATUS_NOT_SAME_DEVICE)
+}
+
 /// Unix 纳秒 → FILETIME（100ns tick）。
 pub fn filetime_from_unix_ns(ns: i64) -> u64 {
     // 负值（1970 前）按 0 截断；本项目时间戳均为正。
@@ -121,6 +129,7 @@ pub fn fsp_err(e: wtfs_core::Error) -> FspError {
     match e {
         wtfs_core::Error::NotFound(_) => err_not_found(),
         wtfs_core::Error::InvalidPath { .. } => err_invalid_name(),
+        wtfs_core::Error::CrossDevice(_) => err_not_same_device(),
         wtfs_core::Error::Io(io) => FspError::from(io),
         wtfs_core::Error::Overlay(_) | wtfs_core::Error::Template(_) => err_invalid_parameter(),
     }

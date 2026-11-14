@@ -61,10 +61,49 @@ wtfs unmount [--pipe <name>]
   `config.worktree`（`core.checkStat=minimal`、`core.trustctime=false`、
   `core.untrackedCache=false`），ready 后 `git status` 不需要全量哈希。
 - dedupe 上界：无改动的 worktree，upper 只剩 `.git` 指针文件（几十字节）。
-- 编辑 → copy-up 到 upper；删除 lower 文件 → whiteout；覆写（含缩短）EOF
-  精确截断（B060100 修复）。
+- 编辑 → copy-up 到 upper；删除 lower 文件 → whiteout 标记；删除 lower 目录 →
+  opaque 标记；覆写（含缩短）EOF 精确截断（B060100 修复）。
 - `git worktree remove` 在挂载中直接成功（B060100 修复：worktree 根目录删除
-  已放开，空视图校验后放行）。
+  已放开，空视图校验后放行）；注销 worktree 时标记树整树删除，无残留。
+
+## whiteout / rename 语义（M12/B120100，append-only 标记日志）
+
+删除与改名的状态不再存 SQLite 表（schema v4 起 `whiteouts` / `renames` 两张表
+已删除，v3 及更早的库打开时自动迁移为标记），而是落在每个 worktree 私有的
+append-only 标记日志里：
+
+```
+<store>/worktrees/<id>/
+├─ upper/                  # 改动文件（数据真相，无标记文件）
+└─ meta/
+   ├─ markers.log          # append-only 删除标记日志（ready 态）
+   └─ redirect/<view-rel>  # 内容 = 原路径：v3 目录改名映射的迁移形态（只读）
+```
+
+- 记录格式：u32 LE 长度 + op（1=add 删除 / 2=remove 撤销）+ UTF-8 相对路径。
+  unlink/rmdir 每文件只追加一条记录（句柄常驻、单次 write_all、µs 级、无
+  fsync），**零 SQLite 写事务**——大仓库逐文件删除不再产生逐文件事务。
+- 内存镜像为读路径真相：daemon 打开 worktree 时顺序重放日志装载删除集合；
+  每次删除/撤销先更新内存再追加。撕裂尾记录（长度越界/非法 op）在重放时
+  忽略——崩溃可能丢失部分删除标记，被删 lower 内容重现（spec §8.3 允许，
+  与 M11 一致）。
+- 压实：日志条目数 >1024 且 > 2× 存活数时，打开时用 temp+rename 压缩为只含
+  存活 add 记录的快照。
+- 解析顺序：upper > whiteout > lower；删除标记命中自身或任一祖先目录时
+  lower 内容隐藏（目录删除与文件删除共用一种标记，阻塞语义同构：目录若在
+  upper 重建则只显示 upper 内容）。重建文件（写回）即追加 remove 记录撤销。
+- **initializing 期（git checkout）删除标记只缓冲在内存**——checkout 的
+  unlink→重建循环每文件产生一对标记增删，缓冲后干净检出零标记写入；
+  daemon 切 ready 时把存活集合一次性写成快照（`markers.log`）。
+- 文件 rename = 源 whiteout + 目标 upper（搬移或 copy-up）。
+- 目录 rename：lower 有内容 → `STATUS_NOT_SAME_DEVICE`（OverlayFS 默认 EXDEV，
+  调用方按跨设备语义退化为递归复制+删除）；仅 upper 新建的目录（lower 无内容）
+  → 纯物理改名，零标记。
+- redirect 标记只由 v3→v4 迁移产生（旧 `renames` 行：`redirect/<to>` 内容为
+  `from`），迁移后的改名子树 readdir/stat/read 正确；运行期不再新增。
+- 注销 worktree（`git worktree remove` / watcher 元数据消失路径）：DB 行删除；
+  日志与 `meta/` 随 upper 目录作为孤儿由 `wtfs gc` 整树回收——注销路径零逐项
+  工作。同 id 重新注册时清扫残留日志，旧墓碑不复活。
 
 ## 限制（M0 已知）
 

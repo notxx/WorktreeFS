@@ -1,28 +1,27 @@
 //! overlay 元数据的 SQLite 实现（spec §8.2/§8.3：[`OverlayStore`] 契约）。
 //!
-//! M11/B110100 起 overlay 元数据只保留**不可推导**的状态：`worktrees`
-//! （注册/状态机/config JSON）、`whiteouts`（删除墓碑）、`renames`（目录
-//! 级改名映射）。`dedupe` / `file_ids` / `stat_cache` 三张派生表已删除
-//! （schema v3）：upper 物理文件 + 模板清单本身即权威状态——upper 存在即
-//! Upper、缺失即 Lower；ino = 路径稳定哈希（[`derive_ino`]）；upper mtime =
-//! 真实文件 mtime。
+//! M12/B120100 起 overlay 元数据只保留 `worktrees`（注册/状态机/config JSON）。
+//! `whiteouts` / `renames` 两张表随 schema v4 删除：删除墓碑改为 upper 层内的
+//! OverlayFS 同款 `.wh.<name>` 标记文件，rename 映射改为 `meta/redirect/`
+//! 标记（[`crate::overlay_markers`]）——unlink/rmdir 只写一个 O(1) 标记文件，
+//! 不再开 SQLite 写事务；标记随 upper 目录由 gc 整体回收。M11 已删除的
+//! `dedupe` / `file_ids` / `stat_cache` 派生表保持删除：upper 物理文件 +
+//! 模板清单本身即权威状态——upper 存在即 Upper、缺失即 Lower；ino =
+//! 路径稳定哈希（[`derive_ino`]）；upper mtime = 真实文件 mtime。
 //!
 //! * `register` 落 `state='initializing'` 行；整份 [`OverlayConfig`] 以 JSON
 //!   持久化在 `worktrees.config_json`，`config()` 原样往返（volume_serial、
 //!   dedupe 开关等）。
-//! * 子表全部 `ON DELETE CASCADE`，`unregister` 只需删 `worktrees` 行。
+//! * `unregister`：删 `worktrees` 行（幂等）；标记随 upper 目录由 gc 回收。
 //! * `file_id` 不再持久化：blake3(小写路径) 直接派生 62 位稳定值，跨进程
 //!   天然一致（见 [`crate::overlay::Overlay::file_id`]）。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use rusqlite::{params, OptionalExtension};
 
 use crate::db::{db_err, now_ms};
-use crate::{
-    Error, OverlayConfig, OverlayStore, Result, WorktreeId, WorktreeState, validate_relative_path,
-};
+use crate::{Error, OverlayConfig, OverlayStore, Result, WorktreeId, WorktreeState};
 
 /// overlay 元数据存储；与模板存储共享同一 [`Db`]（一个仓库一份 meta.db）。
 pub struct SqliteOverlayStore {
@@ -118,97 +117,6 @@ impl SqliteOverlayStore {
         })
     }
 
-    // ---- 引擎用的批量/单点查询（trait 之外的 additive 补充） ----
-
-    /// 全部 whiteout（lower 命名空间路径）。Overlay 打开时一次性装载进内存。
-    pub fn whiteouts(&self, id: WorktreeId) -> Result<HashSet<String>> {
-        let conn = self.db.lock();
-        let mut stmt = conn
-            .prepare("SELECT path FROM whiteouts WHERE worktree_id = ?1")
-            .map_err(db_err)?;
-        let rows = stmt.query_map(params![id.0], |r| r.get::<_, String>(0)).map_err(db_err)?;
-        let mut out = HashSet::new();
-        for row in rows {
-            out.insert(row.map_err(db_err)?);
-        }
-        Ok(out)
-    }
-
-    /// 全部目录重命名映射 (from → to)。Overlay 打开时一次性装载进内存。
-    pub fn renames(&self, id: WorktreeId) -> Result<Vec<(String, String)>> {
-        let conn = self.db.lock();
-        let mut stmt = conn
-            .prepare("SELECT from_path, to_path FROM renames WHERE worktree_id = ?1")
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map(params![id.0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .map_err(db_err)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(db_err)?);
-        }
-        Ok(out)
-    }
-
-    /// initializing 内存缓冲的一次性落库：**单事务**内整批写入
-    /// `whiteouts` / `renames`，并把 `worktrees.status` 切到 `state`
-    /// （通常是 ready）。
-    ///
-    /// 崩溃安全：整批 + 状态切换原子生效——事务提交前 worktree 仍是
-    /// initializing（缓冲丢失可接受，upper 文件是数据真相）；提交后视图
-    /// 一次性完整可见。缓冲是该 worktree 元数据的权威视图，因此两张子表
-    /// 先按 worktree_id 清空再整批插入，与崩溃重开装载（[`crate::overlay_batch::InitBatch::load`]）
-    /// 往返收敛。要求行已注册；未注册返回 [`Error::NotFound`]。
-    pub(crate) fn flush_init_batch(
-        &self,
-        id: WorktreeId,
-        batch: &crate::overlay_batch::InitBatch,
-        state: WorktreeState,
-    ) -> Result<()> {
-        self.db.with_tx(|tx| {
-            tx.execute(
-                "DELETE FROM whiteouts WHERE worktree_id = ?1",
-                params![id.0],
-            )
-            .map_err(db_err)?;
-            tx.execute(
-                "DELETE FROM renames WHERE worktree_id = ?1",
-                params![id.0],
-            )
-            .map_err(db_err)?;
-
-            if !batch.rows().renames.is_empty() {
-                let mut stmt = tx
-                    .prepare(
-                        "INSERT INTO renames(worktree_id, from_path, to_path) VALUES (?1, ?2, ?3)",
-                    )
-                    .map_err(db_err)?;
-                for (from, to) in batch.rows().renames.iter() {
-                    stmt.execute(params![id.0, from, to]).map_err(db_err)?;
-                }
-            }
-            if !batch.rows().whiteouts.is_empty() {
-                let mut stmt = tx
-                    .prepare("INSERT OR IGNORE INTO whiteouts(worktree_id, path) VALUES (?1, ?2)")
-                    .map_err(db_err)?;
-                for path in batch.rows().whiteouts.iter() {
-                    stmt.execute(params![id.0, path]).map_err(db_err)?;
-                }
-            }
-
-            let n = tx
-                .execute(
-                    "UPDATE worktrees SET status = ?1 WHERE id = ?2",
-                    params![state.to_string(), id.0],
-                )
-                .map_err(db_err)?;
-            if n == 0 {
-                return Err(Error::NotFound(id.to_string()));
-            }
-            Ok(())
-        })
-    }
-
     /// 已注册 worktree 的状态清单（daemon 崩溃恢复用，additive）。
     pub fn registered(&self) -> Result<Vec<(WorktreeId, WorktreeState)>> {
         let conn = self.db.lock();
@@ -281,54 +189,11 @@ impl OverlayStore for SqliteOverlayStore {
         Ok(())
     }
 
-    fn add_whiteout(&self, id: WorktreeId, path: &str) -> Result<()> {
-        validate_relative_path(path)?;
-        self.db
-            .with_tx(|tx| {
-                tx.execute(
-                    "INSERT OR IGNORE INTO whiteouts(worktree_id, path) VALUES (?1, ?2)",
-                    params![id.0, path],
-                )
-                .map_err(db_err)?;
-                Ok(())
-            })
-    }
-
-    fn remove_whiteout(&self, id: WorktreeId, path: &str) -> Result<()> {
-        validate_relative_path(path)?;
-        self.db
-            .with_tx(|tx| {
-                tx.execute(
-                    "DELETE FROM whiteouts WHERE worktree_id = ?1 AND path = ?2",
-                    params![id.0, path],
-                )
-                .map_err(db_err)?;
-                Ok(())
-            })
-    }
-
-    fn record_rename(&self, id: WorktreeId, from: &str, to: &str) -> Result<()> {
-        validate_relative_path(from)?;
-        validate_relative_path(to)?;
-        if from == to {
-            return Err(Error::Overlay(format!(
-                "rename source and target are identical: {from}"
-            )));
-        }
-        self.db
-            .with_tx(|tx| {
-                tx.execute(
-                    "INSERT INTO renames(worktree_id, from_path, to_path) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(worktree_id, from_path) DO UPDATE SET to_path = excluded.to_path",
-                    params![id.0, from, to],
-                )
-                .map_err(db_err)?;
-                Ok(())
-            })
-    }
-
     fn unregister(&self, id: WorktreeId) -> Result<()> {
-        // 子表 ON DELETE CASCADE：删主行即清空全部元数据；幂等。
+        // M12：v4 起无子表可级联（whiteouts/renames 已删）。删除标记为 upper
+        // 内的 `.wh.*` 文件，随 upper 目录由 `wtfs gc` 整树回收（spec §6.6）——
+        // 注销路径保持零逐项工作；同 id 重新注册时 [`MarkerStore::clear`]
+        // 会清扫残留标记。
         self.db
             .with_tx(|tx| {
                 tx.execute("DELETE FROM worktrees WHERE id = ?1", params![id.0])
@@ -348,6 +213,7 @@ fn assert_object_safe(store: std::sync::Arc<SqliteOverlayStore>) -> std::sync::A
 mod tests {
     use super::*;
     use crate::{Db, TemplateId, WorktreeId};
+    use tempfile::TempDir;
 
     fn config(id: i64, upper: &str) -> OverlayConfig {
         let mut cfg = OverlayConfig::new(WorktreeId(id), upper);
@@ -410,67 +276,32 @@ mod tests {
         );
     }
 
+    /// unregister 幂等删行；标记日志（meta/markers.log）与 meta/redirect 随
+    /// meta/ 目录由 gc 回收——同 id 重新注册时 `MarkerStore::clear` 清扫残留。
     #[test]
-    fn whiteout_and_rename_roundtrip_cleared_on_unregister() {
+    fn unregister_is_idempotent_and_markers_follow_upper() {
+        let dir = TempDir::new().unwrap();
+        let upper = dir.path().join("worktrees").join("wt-1").join("upper");
+        std::fs::create_dir_all(&upper).unwrap();
+        let markers = crate::overlay_markers::MarkerStore::new(upper.clone());
+        markers.create_whiteout("gone.txt").unwrap();
+        markers.create_redirect("z", "a").unwrap();
+
         let store = SqliteOverlayStore::new(Db::open_in_memory().unwrap());
         seed_template(&store, 1);
-        store.register(&config(1, "C:/tmp/u1")).unwrap();
-        let id = WorktreeId(1);
-
-        store.add_whiteout(id, "gone.txt").unwrap();
-        assert!(store.whiteouts(id).unwrap().contains("gone.txt"));
-        // 重复添加幂等
-        store.add_whiteout(id, "gone.txt").unwrap();
-        assert_eq!(store.whiteouts(id).unwrap().len(), 1);
-        store.remove_whiteout(id, "gone.txt").unwrap();
-        assert!(store.whiteouts(id).unwrap().is_empty());
-
-        store.record_rename(id, "src", "dst").unwrap();
-        assert_eq!(store.renames(id).unwrap(), vec![("src".to_string(), "dst".to_string())]);
-        // 同 from upsert
-        store.record_rename(id, "src", "dst2").unwrap();
-        assert_eq!(store.renames(id).unwrap(), vec![("src".to_string(), "dst2".to_string())]);
-        assert!(matches!(
-            store.record_rename(id, "x", "x").unwrap_err(),
-            Error::Overlay(_)
-        ));
-
-        store.unregister(id).unwrap();
-        assert!(store.state(id).unwrap().is_none());
-        assert!(store.whiteouts(id).unwrap().is_empty());
-        assert!(store.renames(id).unwrap().is_empty());
-        // unregister 幂等。
-        store.unregister(id).unwrap();
-    }
-
-    #[test]
-    fn whiteout_rejects_invalid_paths() {
-        let store = SqliteOverlayStore::new(Db::open_in_memory().unwrap());
-        seed_template(&store, 1);
-        store.register(&config(1, "C:/tmp/u1")).unwrap();
-        let id = WorktreeId(1);
-        assert!(matches!(
-            store.add_whiteout(id, "../bad").unwrap_err(),
-            Error::InvalidPath { .. }
-        ));
-        assert!(matches!(
-            store.remove_whiteout(id, "../bad").unwrap_err(),
-            Error::InvalidPath { .. }
-        ));
-        assert!(store.whiteouts(id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn unregister_cascades_children() {
-        let store = SqliteOverlayStore::new(Db::open_in_memory().unwrap());
-        seed_template(&store, 1);
-        store.register(&config(1, "C:/tmp/u1")).unwrap();
-        let id = WorktreeId(1);
-        store.add_whiteout(id, "x.txt").unwrap();
-        store.record_rename(id, "a", "b").unwrap();
-        store.unregister(id).unwrap();
-        assert!(store.whiteouts(id).unwrap().is_empty());
-        assert!(store.renames(id).unwrap().is_empty());
+        store.register(&config(1, upper.to_string_lossy().as_ref())).unwrap();
+        assert_eq!(store.state(WorktreeId(1)).unwrap(), Some(WorktreeState::Initializing));
+        store.unregister(WorktreeId(1)).unwrap();
+        assert!(store.state(WorktreeId(1)).unwrap().is_none());
+        // 幂等。
+        store.unregister(WorktreeId(1)).unwrap();
+        // 标记日志随 meta/ 保留（gc 回收）；重新注册前清扫。
+        assert!(
+            markers.load().unwrap().whites.contains("gone.txt"),
+            "标记日志随 meta/ 保留给 gc"
+        );
+        markers.clear().unwrap();
+        assert!(markers.load().unwrap().whites.is_empty());
     }
 
     #[test]
@@ -483,36 +314,5 @@ mod tests {
             let v = derive_ino(&format!("p{i}"));
             assert!(v > 0);
         }
-    }
-
-    #[test]
-    fn flush_init_batch_writes_whites_renames_and_flips_status() {
-        let store = SqliteOverlayStore::new(Db::open_in_memory().unwrap());
-        seed_template(&store, 1);
-        store.register(&config(1, "C:/tmp/u1")).unwrap();
-        let id = WorktreeId(1);
-
-        let mut batch = crate::overlay_batch::InitBatch::empty();
-        batch.add_whiteout("gone.txt");
-        batch.record_rename("src", "dst");
-        store.flush_init_batch(id, &batch, WorktreeState::Ready).unwrap();
-        assert_eq!(store.state(id).unwrap(), Some(WorktreeState::Ready));
-        assert!(store.whiteouts(id).unwrap().contains("gone.txt"));
-        assert_eq!(
-            store.renames(id).unwrap(),
-            vec![("src".to_string(), "dst".to_string())]
-        );
-
-        // 重放空批：清空子表（缓冲是权威视图），状态保持 ready。
-        let empty = crate::overlay_batch::InitBatch::empty();
-        store.flush_init_batch(id, &empty, WorktreeState::Ready).unwrap();
-        assert!(store.whiteouts(id).unwrap().is_empty());
-        assert!(store.renames(id).unwrap().is_empty());
-
-        // 未注册 id 报 NotFound。
-        let err = store
-            .flush_init_batch(WorktreeId(9), &empty, WorktreeState::Ready)
-            .unwrap_err();
-        assert!(matches!(err, Error::NotFound(_)));
     }
 }

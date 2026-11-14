@@ -1,22 +1,31 @@
 //! 单个 worktree 的 overlay 视图引擎（spec §6.5/§7：[`OverlayStore`] 之上的语义层）。
 //!
-//! * 解析顺序：upper > whiteout > lower；目录 = lower ∪ upper 再剔除 whiteout。
-//! * 目录级重命名走 rename map（lower 侧路径改写），文件级 = whiteout + upper 搬移。
+//! * 解析顺序：upper > whiteout/opaque > lower；目录 = lower ∪ upper 再剔除
+//!   被隐藏项。
+//! * 文件级重命名 = whiteout 源 + upper 搬移/copy-up；目录级重命名默认
+//!   EXDEV（OverlayFS 无 redirect_dir 的默认行为；仅 upper-only 目录可纯物理
+//!   rename）。rename 映射（redirect 标记）只由 v3→v4 迁移产生并继续可读。
 //! * 写入路径 dedupe：流式写临时文件并同步 blake3，与模板一致则丢弃副本回落
 //!   lower，不同则落 upper；模板缺失时全部 upper（全量 copy 兜底），绝不丢数据。
 //! * stat 纯推导（M11/B110100，OverlayFS 三态口径）：lower 文件固定
 //!   dev/ino/mtime/ctime（size/mode 来自模板，mtime = per-worktree epoch）；
 //!   upper 文件/目录 = 真实文件系统 mtime；ino = 路径稳定哈希（根目录固定值）；
-//!   whiteout/not-found → None。**零写副作用、零 DB 读**：whiteouts/renames
-//!   打开时一次性缓存进内存（写路径同步镜像 DB，M12 前表保留），模板清单在
+//!   whiteout/not-found → None。**零写副作用、零 DB 读**：标记树
+//!   （[`crate::overlay_markers`]）在打开时一次性装载进内存镜像，模板清单在
 //!   打开时构建成目录索引（目录集合 + 每目录子项），status/list 热路径不再
-//!   逐 entry 查库。
-//! * M8/B080100 批量元数据：`initializing` 阶段（对 readdir 隐藏的安全批量窗口）
-//!   把 whiteouts / renames 累积在内存（[`InitBatch`]），**每文件零事务、零 DB
-//!   读**；[`Overlay::mark_ready`] 在单个 SQLite 事务内整批落库并切 ready
-//!   （崩溃安全：提交前崩溃保持 initializing、upper 文件完整，缓冲丢失可接受，
-//!   spec §6.3.6）。ready 后的编辑回到逐操作持久化（spec 允许）。initializing
-//!   标志缓存在内存，per-file 操作不再查询 `worktrees.status`。
+//!   逐 entry 查库或扫标记。
+//! * M12/B120100 标记日志：删除墓碑（whiteout，含目录 opaque 语义）持久化
+//!   为 `meta/markers.log` 的 **append-only 日志**（ready 态每删除/撤销一条
+//!   µs 级追加记录，句柄常驻，无 fsync；撕裂尾记录在重放时忽略——被删
+//!   lower 内容可能重现，spec §8.3 允许，与 M11 一致）；rename 映射
+//!   （redirect，仅迁移产物）在 `meta/redirect/`。内存镜像（[`MetaState`]）
+//!   是读路径真相（打开时重放装载，写路径同步追加），零标记文件 I/O。
+//!   readdir 合并按目录应用标记（逐名 whiteout/redirect 过滤），不做全树
+//!   扫描；被删目录重建后仅显示 upper 内容。**initializing 期删除标记只
+//!   缓冲在内存**（git checkout 的 unlink→重建循环每文件产生一对标记增删，
+//!   缓冲后干净检出零标记写入），[`Overlay::mark_ready`] 把存活集合一次性
+//!   写成快照再切状态（崩溃丢缓冲 = 被删 lower 内容重现）；ready 态即时
+//!   追加。
 //! * M9/B090100 暂存写零拷贝终裁：[`Overlay::finish_staged`] 接收暂存期已
 //!   流式算好的哈希/长度/内容（内存或溢写路径），一致 → 丢弃回落 lower
 //!   （零 upper 文件、零 fsync、零临时副本）；否则溢写同卷改名 / 内存经
@@ -40,7 +49,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::overlay_batch::InitBatch;
+use std::sync::atomic::AtomicI64 as DiagAtomic;
+/// 诊断：initializing 期缓冲的删除标记 add/remove 次数（mark_ready 时随
+/// 观测日志输出；O(1) 原子计数，不构成热路径成本）。
+static DIAG_W_ADD: DiagAtomic = DiagAtomic::new(0);
+static DIAG_W_DEL: DiagAtomic = DiagAtomic::new(0);
+
+use crate::overlay_markers::MarkerStore;
 use crate::overlay_store::{SqliteOverlayStore, derive_ino};
 use crate::{
     DedupeState, Error, FileAttributes, FileHash, FileHashMap, OverlayConfig, OverlayStore,
@@ -131,18 +146,19 @@ pub struct OverlayDirEntry {
     pub kind: EntryKind,
 }
 
-/// lower 侧查找时经过 rename map 改写的结果。
+/// lower 侧查找时经过 redirect 映射改写的结果（映射来源 = redirect 标记，
+/// 仅 v3→v4 迁移会产生；M12 起目录级 rename 默认 EXDEV，不再新增映射）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LowerLookup {
-    /// 无 rename 命中，lower 路径即原路径。
+    /// 无 redirect 命中，lower 路径即原路径。
     Same(String),
-    /// 命中 rename：lower 侧应查改写后的路径。
+    /// 命中 redirect：lower 侧应查改写后的路径。
     Mapped(String),
-    /// 位于某 rename 的 from 子树下（已搬走），lower 侧不可见。
+    /// 位于某 redirect 的 from 子树下（目录改名前已搬走），lower 侧不可见。
     MovedAway,
 }
 
-/// rename map 的纯改写（单层映射；链式 rename 不支持）。
+/// rename/redirect 映射的纯改写（单层映射；链式 rename 不支持）。
 pub(crate) fn map_to_lower_with(renames: &[(String, String)], rel: &str) -> LowerLookup {
     for (from, to) in renames {
         if rel == to {
@@ -160,7 +176,7 @@ pub(crate) fn map_to_lower_with(renames: &[(String, String)], rel: &str) -> Lowe
     LowerLookup::Same(rel.to_string())
 }
 
-/// `mapped` 是否被 whiteout 挡住（自身或任一祖先目录命中）。
+/// `mapped` 是否被删除标记挡住（自身或任一祖先目录命中）。
 pub(crate) fn whiteout_blocks(mapped: &str, whites: &HashSet<String>) -> bool {
     if mapped.is_empty() {
         return false;
@@ -172,7 +188,7 @@ pub(crate) fn whiteout_blocks(mapped: &str, whites: &HashSet<String>) -> bool {
 }
 
 /// 仅祖先目录命中（不含路径自身）。路径自身的 whiteout 可以被
-/// `remove_whiteout` 精确撤销，回落 lower 后仍然可见；祖先目录的 whiteout
+/// `remove_whiteout` 精确撤销，回落 lower 后仍然可见；祖先目录的删除标记
 /// 则会继续隐藏子树，回落会导致"写入成功但文件不可见"。
 pub(crate) fn ancestor_whiteout_blocks(mapped: &str, whites: &HashSet<String>) -> bool {
     let mut cur = mapped;
@@ -192,6 +208,7 @@ fn basename(rel: &str) -> &str {
 fn is_temp_name(name: &str) -> bool {
     name.starts_with(TEMP_PREFIX)
 }
+
 
 fn join_rel(dir: &str, name: &str) -> String {
     if dir.is_empty() {
@@ -262,163 +279,104 @@ impl LowerIndex {
     }
 }
 
-/// overlay 视图：config + lower 模板索引 + 元数据存储 + whiteout/rename 内存缓存。
+/// overlay 视图：config + lower 模板索引 + 元数据存储 + 标记树内存镜像。
 pub struct Overlay {
     config: OverlayConfig,
     /// lower 模板索引；`None` = 无模板（全量 copy 模式）。
     lower: Option<LowerIndex>,
     store: Arc<SqliteOverlayStore>,
-    /// initializing 标志 + whiteout/rename 内存缓存（同锁）：标志缓存自
-    /// worktrees.status；initializing 期 whiteouts/renames 累积在 batch，
-    /// ready 后读缓存、写路径同步镜像 DB。per-file 操作不再查库。
-    init_meta: Mutex<InitMeta>,
+    /// worktree 私有标记存储（upper 内 whiteout + meta/redirect）。
+    markers: MarkerStore,
+    /// initializing 标志 + 标记树内存镜像（同锁）：标志缓存自
+    /// worktrees.status；镜像在打开时从标记树一次装载，写路径同步更新镜像
+    /// 与标记文件。per-file 操作不再查库、不再扫标记树。
+    meta: Mutex<MetaState>,
     /// I/O 插桩计数（upper 物化 / fsync；测试与诊断用）。
     io: OverlayIoStats,
 }
 
-/// [`Overlay::init_meta` 的守卫状态]：initializing 标志 + whiteout/rename 视图。
+/// [`Overlay::meta` 的守卫状态]：initializing 标志 + 标记树内存镜像。
 ///
-/// * initializing：权威视图在 `batch`（mark_ready 整批落库）。
-/// * ready：`whites`/`renames` 为打开时从 DB 一次性装载的缓存；写路径
-///   先更新缓存再镜像 DB（缓存与表保持一致）。
+/// 打开时从标记树一次性装载；写路径先更新镜像再写标记文件（同一把锁内，
+/// 两者不发散）。标记文件是持久真相，镜像只服务读热路径。
 #[derive(Debug, Default)]
-struct InitMeta {
+struct MetaState {
     initializing: bool,
-    /// initializing 期的权威元数据视图；ready/failed 后为 `None`。
-    batch: Option<InitBatch>,
-    /// whiteout 集合（lower 命名空间路径）。
+    /// 删除标记路径（lower 命名空间；文件与目录删除共用，阻塞语义同构）。
     whites: HashSet<String>,
-    /// 目录重命名映射 (from → to)，保持插入序（与 store 读取序一致）。
-    renames: Vec<(String, String)>,
+    /// 目录改名映射 (from → to)，保持插入序（与标记树装载序一致；仅迁移产生）。
+    redirects: Vec<(String, String)>,
 }
 
-/// 元数据操作的上下文：initializing = 持锁内存缓冲（零 DB）；
-/// ready = 持锁缓存 + 直连 store 镜像（逐操作持久化）。由
-/// [`Overlay::meta_ctx`] 在锁内判定，不存在"初始化中但缓冲缺席"的中间态。
-enum MetaCtx<'a> {
-    Init {
-        guard: MutexGuard<'a, InitMeta>,
-    },
-    Ready {
-        guard: MutexGuard<'a, InitMeta>,
-        id: WorktreeId,
-        store: &'a SqliteOverlayStore,
-    },
+/// 元数据操作上下文：持锁镜像 + 标记树句柄。写方法同步更新镜像与标记文件，
+/// initializing / ready 行为一致（标记即时持久，零事务）。
+struct MetaCtx<'a> {
+    guard: MutexGuard<'a, MetaState>,
+    markers: &'a MarkerStore,
 }
 
 impl<'a> MetaCtx<'a> {
-    fn batch(&self) -> &InitBatch {
-        match self {
-            MetaCtx::Init { guard, .. } => guard
-                .batch
-                .as_ref()
-                .expect("Init meta context without batch"),
-            MetaCtx::Ready { .. } => unreachable!("batch access in Ready context"),
-        }
+    /// 全部目录改名映射 (from → to)；内存镜像，零 I/O。
+    fn redirects(&self) -> &[(String, String)] {
+        &self.guard.redirects
     }
 
-    fn batch_mut(&mut self) -> &mut InitBatch {
-        match self {
-            MetaCtx::Init { guard, .. } => guard
-                .batch
-                .as_mut()
-                .expect("Init meta context without batch"),
-            MetaCtx::Ready { .. } => unreachable!("batch access in Ready context"),
-        }
-    }
-
-    /// 全部目录重命名映射 (from → to)；内存视图，零 DB。
-    fn renames(&self) -> &[(String, String)] {
-        match self {
-            MetaCtx::Init { .. } => self.batch().renames(),
-            MetaCtx::Ready { guard, .. } => &guard.renames,
-        }
-    }
-
-    /// 全部 whiteout（lower 命名空间路径）；内存视图，零 DB。
-    fn whites(&self) -> &HashSet<String> {
-        match self {
-            MetaCtx::Init { .. } => self.batch().whiteouts(),
-            MetaCtx::Ready { guard, .. } => &guard.whites,
-        }
-    }
-
+    /// 记 whiteout（删除 lower 文件/目录）：镜像 + 标记文件。
+    ///
+    /// **initializing 期仅缓冲在内存（M8 模式的 M12 适配）**：git checkout
+    /// 对按名可见的 lower 文件走"lstat→unlink→CREATE_NEW 重建"，每个文件
+    /// 产生一对标记创建/撤销——立即落盘会让干净检出多出 ~1 万次 NTFS
+    /// 创建/删除（评审 P1 实测 add +6s）。缓冲到 mark_ready 时一次性把
+    /// 存活集合同步为 `meta/markers.log` 快照（空集 = 零写入）；ready 态即时追加。
     fn add_whiteout(&mut self, path: &str) -> Result<()> {
         validate_relative_path(path)?;
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().add_whiteout(path);
-                Ok(())
-            }
-            MetaCtx::Ready { guard, id, store } => {
-                // 缓存未命中 = DB 也没有（缓存是打开时装载 + 写路径镜像）：
-                // 跳过事务（M8 无用功短路的延伸）。
-                if guard.whites.insert(path.to_string()) {
-                    store.add_whiteout(*id, path)?;
-                }
-                Ok(())
-            }
+        DIAG_W_ADD.fetch_add(1, Ordering::Relaxed);
+        if self.guard.initializing {
+            self.guard.whites.insert(path.to_string());
+            return Ok(());
         }
+        if self.guard.whites.insert(path.to_string()) {
+            self.markers.create_whiteout(path)?;
+        }
+        Ok(())
     }
 
-    /// 撤销 whiteout；缓存无条目时零事务（M8：per-file 无用功短路）。
+    /// 撤销 whiteout（重建/写回）：initializing 期仅动缓冲；ready 态镜像
+    /// 无条目时零 I/O（无用功短路）。
     fn remove_whiteout(&mut self, path: &str) -> Result<()> {
         validate_relative_path(path)?;
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().remove_whiteout(path);
-                Ok(())
-            }
-            MetaCtx::Ready { guard, id, store } => {
-                if guard.whites.remove(path) {
-                    store.remove_whiteout(*id, path)?;
-                }
-                Ok(())
-            }
+        DIAG_W_DEL.fetch_add(1, Ordering::Relaxed);
+        if self.guard.initializing {
+            self.guard.whites.remove(path);
+            return Ok(());
         }
+        if self.guard.whites.remove(path) {
+            self.markers.remove_whiteout(path)?;
+        }
+        Ok(())
     }
 
-    fn record_rename(&mut self, from: &str, to: &str) -> Result<()> {
-        validate_relative_path(from)?;
-        validate_relative_path(to)?;
-        if from == to {
-            return Err(Error::Overlay(format!(
-                "rename source and target are identical: {from}"
-            )));
-        }
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().record_rename(from, to);
-                Ok(())
-            }
-            MetaCtx::Ready { guard, id, store } => {
-                match guard.renames.iter_mut().find(|(f, _)| f == from) {
-                    Some(pair) => pair.1 = to.to_string(),
-                    None => guard.renames.push((from.to_string(), to.to_string())),
-                }
-                store.record_rename(*id, from, to)
-            }
-        }
-    }
 }
 
 impl Overlay {
     /// 新建并注册（写 `worktrees` 行，状态 initializing）；同 id 已注册则报错
-    /// （恢复既有注册用 [`Overlay::reopen`]）。
+    /// （恢复既有注册用 [`Overlay::reopen`]）。注册成功后清除同路径可能残留的
+    /// 旧标记树（v4 起标记在 `meta/`；同 id 重建必须从零开始，防旧墓碑复活）。
     pub fn new(
         config: OverlayConfig,
         lower_files: Option<FileHashMap>,
         store: Arc<SqliteOverlayStore>,
     ) -> Result<Self> {
         store.register(&config)?;
+        let markers = MarkerStore::new(config.upper_root.clone());
+        markers.clear()?;
         Ok(Self {
             lower: lower_files.map(LowerIndex::build),
             store,
-            init_meta: Mutex::new(InitMeta {
+            markers,
+            meta: Mutex::new(MetaState {
                 initializing: true,
-                batch: Some(InitBatch::empty()),
-                whites: HashSet::new(),
-                renames: Vec::new(),
+                ..MetaState::default()
             }),
             config,
             io: OverlayIoStats::default(),
@@ -426,9 +384,9 @@ impl Overlay {
     }
 
     /// 重新挂到已注册的 worktree（崩溃恢复/重开视图）；未注册报 [`Error::NotFound`]。
-    /// initializing 行（崩溃于 ready 前）：一次性从 DB 装载既有 whiteouts/
-    /// renames 为缓冲，之后继续零事务累积，mark_ready 时整批落库。
-    /// ready 行：whiteouts/renames 一次性装载进内存缓存（此后读路径零 DB）。
+    /// 标记树一次性装载进内存镜像（whiteout/opaque/redirect），之后读路径零
+    /// 标记 I/O、写路径同步镜像。initializing / ready 的写路径一致——标记
+    /// 即时持久（M12 起崩溃不再丢墓碑）。
     pub fn reopen(
         config: OverlayConfig,
         lower_files: Option<FileHashMap>,
@@ -438,18 +396,17 @@ impl Overlay {
             .state(config.worktree_id)?
             .ok_or_else(|| Error::NotFound(format!("worktree {} not registered", config.worktree_id)))?;
         let initializing = state.hides_entries();
-        let (batch, whites, renames) = if initializing {
-            let batch = InitBatch::load(&store, config.worktree_id)?;
-            let whites = batch.whiteouts().clone();
-            let renames = batch.renames().to_vec();
-            (Some(batch), whites, renames)
-        } else {
-            (None, store.whiteouts(config.worktree_id)?, store.renames(config.worktree_id)?)
-        };
+        let markers = MarkerStore::new(config.upper_root.clone());
+        let loaded = markers.load()?;
         Ok(Self {
             lower: lower_files.map(LowerIndex::build),
             store,
-            init_meta: Mutex::new(InitMeta { initializing, batch, whites, renames }),
+            markers,
+            meta: Mutex::new(MetaState {
+                initializing,
+                whites: loaded.whites,
+                redirects: loaded.redirects,
+            }),
             config,
             io: OverlayIoStats::default(),
         })
@@ -481,68 +438,57 @@ impl Overlay {
 
     /// initializing 标志（内存缓存；per-file 调用不再查询 `worktrees.status`）。
     pub fn is_initializing(&self) -> Result<bool> {
-        Ok(self.init_meta.lock().initializing)
+        Ok(self.meta.lock().initializing)
     }
 
-    /// `initializing → ready`：缓冲元数据整批 + 状态切换在**同一事务**落库
-    /// （崩溃安全：提交前崩溃 = 保持 initializing、upper 文件完整，缓冲丢失
-    /// 可接受）。持锁执行落库——落库期间并发操作短暂阻塞，切 ready 后一次性
-    /// 看到完整视图。无缓冲（已 ready 的重开/幂等调用）时仅切状态，
-    /// 不重写任何既有行。
+    /// `initializing → ready`：M12 起无批量缓冲可 flush——标记树即时持久，
+    /// 本方法只做一次状态切换事务（崩溃安全：切换前崩溃保持 initializing，
+    /// upper 文件与标记都完整，spec §6.3.6）。幂等：已 ready 的重开/重复调用
+    /// 仅重写同一状态，不触碰任何标记。
     pub fn mark_ready(&self) -> Result<()> {
-        let mut guard = self.init_meta.lock();
-        match guard.batch.take() {
-            Some(batch) => match self.store.flush_init_batch(
-                self.config.worktree_id,
-                &batch,
-                crate::WorktreeState::Ready,
-            ) {
-                Ok(()) => {
-                    // 批量内容（whiteouts/renames）平移为 ready 缓存，
-                    // 之后读路径零 DB、写路径镜像 DB。
-                    guard.whites = batch.whiteouts().clone();
-                    guard.renames = batch.renames().to_vec();
-                    guard.initializing = false;
-                    Ok(())
-                }
-                Err(e) => {
-                    // 落库失败：恢复缓冲，保持 initializing，可重试。
-                    guard.batch = Some(batch);
-                    Err(e)
-                }
-            },
-            None => {
-                self.store
-                    .set_state(self.config.worktree_id, crate::WorktreeState::Ready)?;
-                guard.initializing = false;
-                Ok(())
-            }
+        let mut guard = self.meta.lock();
+        if guard.initializing {
+            // 缓冲的删除标记一次性同步为 meta/markers.log 快照（只写存
+            // 活集合，空集 = 零写入）；先同步后切状态——提交窗口内崩溃
+            // 重开仍为 initializing，缓冲续写并在下次 mark_ready 收敛。
+            let created = self.markers.sync(&guard.whites)?;
+            tracing::info!(
+                target: "ov_mark_ready",
+                worktree = %self.config.worktree_id,
+                buffered_adds = DIAG_W_ADD.swap(0, Ordering::Relaxed),
+                buffered_removes = DIAG_W_DEL.swap(0, Ordering::Relaxed),
+                materialized = created,
+                surviving = guard.whites.len(),
+                "initializing marker buffer flushed"
+            );
+            self.store
+                .set_state(self.config.worktree_id, crate::WorktreeState::Ready)?;
+            guard.initializing = false;
+            Ok(())
+        } else {
+            self.store
+                .set_state(self.config.worktree_id, crate::WorktreeState::Ready)?;
+            guard.initializing = false;
+            Ok(())
         }
     }
 
-    /// 初始化失败标记：丢弃未落库缓冲（upper 文件是数据真相，保留），
-    /// 状态落库为 failed——不允许 worker 在半初始化的 worktree 上启动
-    /// （spec §6.3.6）。
+    /// 初始化失败标记：标记树保留（已即时持久；worktree 目录随后由
+    /// unregister/gc 整体回收），状态落库为 failed——不允许 worker 在半
+    /// 初始化的 worktree 上启动（spec §6.3.6）。
     pub fn mark_failed(&self) -> Result<()> {
-        let mut guard = self.init_meta.lock();
+        let mut guard = self.meta.lock();
         self.store
             .set_state(self.config.worktree_id, crate::WorktreeState::Failed)?;
-        guard.batch = None;
         guard.initializing = false;
         Ok(())
     }
 
-    /// 元数据操作上下文：initializing → 持锁缓冲；ready → 持锁缓存 + store 镜像。
+    /// 元数据操作上下文：持锁镜像 + 标记树句柄（initializing / ready 一致）。
     fn meta_ctx(&self) -> MetaCtx<'_> {
-        let guard = self.init_meta.lock();
-        if guard.initializing {
-            MetaCtx::Init { guard }
-        } else {
-            MetaCtx::Ready {
-                guard,
-                id: self.config.worktree_id,
-                store: &self.store,
-            }
+        MetaCtx {
+            guard: self.meta.lock(),
+            markers: &self.markers,
         }
     }
 
@@ -569,7 +515,7 @@ impl Overlay {
     /// lower 命名空间改写；`MovedAway` 时写入场景退回原路径（upper 物理位置）。
     /// `ctx` 由调用方持有（勿经 [`Overlay::meta_ctx`] 重复加锁）。
     fn mapped_or_same(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<String> {
-        match map_to_lower_with(ctx.renames(), rel) {
+        match map_to_lower_with(ctx.redirects(), rel) {
             LowerLookup::Same(s) | LowerLookup::Mapped(s) => Ok(s),
             LowerLookup::MovedAway => Ok(rel.to_string()),
         }
@@ -606,9 +552,9 @@ impl Overlay {
 
     // ---- 解析与枚举 ----
 
-    /// 解析顺序：upper > whiteout > lower（spec §6.5）。`ctx` 由调用方持有，
-    /// 同一逻辑操作的元数据视图一致（initializing 期 = 内存缓冲，零 DB 读；
-    /// ready = 内存缓存，同样零 DB 读）。
+    /// 解析顺序：upper > whiteout/opaque > lower（spec §6.5）。`ctx` 由调用方
+    /// 持有，同一逻辑操作的元数据视图一致（initializing/ready 均为内存镜像，
+    /// 零 DB 读、零标记 I/O）。
     fn resolve_with(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<Resolution> {
         self.validate_rel_or_root(rel)?;
         if !rel.is_empty() && is_temp_name(basename(rel)) {
@@ -626,17 +572,18 @@ impl Overlay {
                 has_upper: true,
             });
         }
-        let mapped = match map_to_lower_with(ctx.renames(), rel) {
+        let mapped = match map_to_lower_with(ctx.redirects(), rel) {
             LowerLookup::Same(s) | LowerLookup::Mapped(s) => s,
+            // 目录改名（迁移来的 redirect）前已搬走的旧路径：不可见。
             LowerLookup::MovedAway => return Ok(Resolution::NotFound),
         };
-        let whites = ctx.whites();
-        let blocked = whiteout_blocks(&mapped, whites);
+        let blocked = whiteout_blocks(&mapped, &ctx.guard.whites);
         let lower_file = self.lookup_lower(&mapped);
         let has_lower_dir = !blocked && lower_file.is_none() && self.has_lower_dir(&mapped);
         let upper_is_dir = upper_path.is_dir();
         if blocked {
-            // upper 文件已查无；upper 目录可能已重建。
+            // upper 文件已查无；upper 目录可能已重建（opaque 语义：只显示
+            // upper 内容，lower 子树继续隐藏）。
             if upper_is_dir {
                 return Ok(Resolution::Directory {
                     has_lower: false,
@@ -667,34 +614,36 @@ impl Overlay {
     }
 
     /// 目录合并枚举；`initializing` 状态返回空（让 Git 通过"目录必须为空"检查），
-    /// 只读内存标志 + 内存 lower 索引 + 真实 upper 目录，零 DB。
+    /// 只读内存标志 + 内存 lower 索引 + 真实 upper 目录，零 DB、零标记 I/O。
+    /// lower 子项逐名应用 redirect 映射与 whiteout/opaque 标记（对应标记目录
+    /// 的子项过滤），不做全树扫描。
     pub fn list(&self, dir_rel: &str) -> Result<Vec<OverlayDirEntry>> {
         self.validate_rel_or_root(dir_rel)?;
         if self.is_initializing()? {
             return Ok(Vec::new());
         }
         let ctx = self.meta_ctx();
-        let whites = ctx.whites();
-        let renames = ctx.renames();
         let mut names: BTreeMap<String, EntryKind> = BTreeMap::new();
 
-        // lower 侧：内存索引按目录取直接子项，逐名应用 whiteout。
-        match map_to_lower_with(renames, dir_rel) {
+        // lower 侧：内存索引按目录取直接子项，逐名应用 redirect + 删除标记。
+        match map_to_lower_with(ctx.redirects(), dir_rel) {
             LowerLookup::MovedAway => {}
             LowerLookup::Same(m) | LowerLookup::Mapped(m) => {
-                if !whiteout_blocks(&m, whites) {
-                    if let Some(idx) = self.lower.as_ref() {
-                        if let Some(entries) = idx.children_of(&m) {
-                            for (name, kind) in entries {
-                                let mapped_name = if m.is_empty() {
-                                    name.clone()
-                                } else {
-                                    format!("{m}/{name}")
-                                };
-                                if whiteout_blocks(&mapped_name, whites) {
-                                    continue;
+                if !whiteout_blocks(&m, &ctx.guard.whites) {
+                    if let Some(entries) = self.lower.as_ref().and_then(|idx| idx.children_of(&m)) {
+                        for (name, kind) in entries {
+                            // 按子项的"视图路径"应用 redirect 映射（目录改名后
+                            // 旧路径整棵 MovedAway，不得出现在父目录枚举里；
+                            // 目标路径改写到 lower 命名空间），再查删除标记。
+                            let view_child = join_rel(dir_rel, name);
+                            match map_to_lower_with(ctx.redirects(), &view_child) {
+                                LowerLookup::MovedAway => continue,
+                                LowerLookup::Same(n) | LowerLookup::Mapped(n) => {
+                                    if whiteout_blocks(&n, &ctx.guard.whites) {
+                                        continue;
+                                    }
+                                    names.insert(name.clone(), *kind);
                                 }
-                                names.insert(name.clone(), *kind);
                             }
                         }
                     }
@@ -713,6 +662,7 @@ impl Overlay {
                         continue;
                     };
                     if is_temp_name(name) {
+                        // 写入临时文件对视图不可见。
                         continue;
                     }
                     let kind = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -763,7 +713,7 @@ impl Overlay {
 
     /// 流式写入：边写临时文件边哈希，与模板一致则丢弃（回落 lower），
     /// 否则原子改名落 upper。返回 (决策, 实际字节数)。
-    /// initializing 期元数据全部进内存缓冲（零事务）；ready 后逐操作持久化。
+    /// 删除标记即时持久（M12：镜像 + 标记文件，零事务），两阶段一致。
     pub fn write_from(&self, rel: &str, reader: &mut impl Read) -> Result<(DedupeState, u64)> {
         self.validate_rel(rel)?;
         if is_temp_name(basename(rel)) {
@@ -814,7 +764,7 @@ impl Overlay {
         if self.config.dedupe_enabled {
             if let Some(t) = &template_entry {
                 if t.hash == hash {
-                    if !ancestor_whiteout_blocks(&mapped, ctx.whites()) {
+                    if !ancestor_whiteout_blocks(&mapped, &ctx.guard.whites) {
                         // 与模板一致且 lower 视图可见（路径自身的 whiteout 会被
                         // remove_whiteout 撤销）：丢弃副本回落 lower。
                         // copy-up 后改回模板内容同样回收。
@@ -858,7 +808,7 @@ impl Overlay {
     ///   隐藏临时文件后原子改名（P2-1：两条路径的最终 upper 路径都零半截
     ///   文件），随后**恰好一次 fsync**（溢写先 fsync 再 rename：数据先于
     ///   可见性落盘，崩溃不留半截可见文件）。记 `Upper`/`New` 决策、撤销
-    ///   whiteout（initializing 期进 InitBatch 内存缓冲，ready 后镜像落库）；
+    ///   whiteout（M12：镜像 + 标记文件即时持久，零事务）；
     ///   mtime = 真实文件 mtime。
     ///
     /// `Spill` 的句柄必须已由调用方关闭。返回 (决策, 字节数)；失败时溢写
@@ -881,7 +831,7 @@ impl Overlay {
         let mapped = self.mapped_or_same(&ctx, rel)?;
         let template_entry = self.lookup_lower(&mapped);
         if self.config.dedupe_enabled && template_entry.as_ref().is_some_and(|t| t.hash == hash) {
-            if !ancestor_whiteout_blocks(&mapped, ctx.whites()) {
+            if !ancestor_whiteout_blocks(&mapped, &ctx.guard.whites) {
                 // 与模板一致且 lower 视图可见（路径自身的 whiteout 会被
                 // remove_whiteout 撤销）：丢弃暂存内容回落 lower。
                 if let StagedContent::Spill(spill) = &content {
@@ -1025,7 +975,10 @@ impl Overlay {
         }
     }
 
-    /// 删除：upper 删真实文件；lower 有则记 whiteout（否则被删文件会在合并视图重现）。
+    /// 删除：upper 删真实文件；lower 有内容则记 whiteout 标记（文件与目录
+    /// 同一种标记——阻塞语义同构：隐藏该路径及其 lower 子树；目录若在 upper
+    /// 重建则只显示 upper 内容）。M12：每个标记只付一次 O(1) 文件操作，
+    /// 零 SQLite 事务。
     pub fn remove(&self, rel: &str) -> Result<bool> {
         self.validate_rel(rel)?;
         let mut ctx = self.meta_ctx();
@@ -1047,6 +1000,8 @@ impl Overlay {
                 if has_lower || self.lower_has_file_or_dir(&mapped) {
                     ctx.add_whiteout(&mapped)?;
                 }
+                // redirect 标记保留（只读迁移产物；目标路径此后由标记经映射
+                // 继续隐藏，与 v3 rename map 语义一致）。
                 Ok(true)
             }
             Resolution::Lower { .. } => {
@@ -1058,8 +1013,12 @@ impl Overlay {
         }
     }
 
-    /// 重命名：文件级 = whiteout 源 + upper 搬移/copy-up；目录级 = rename map。
-    /// 目标若是目录报错；目标是文件则覆盖（POSIX rename 语义）。
+    /// 重命名：文件级 = whiteout 源 + upper 搬移/copy-up。目录级（M12/B120100）
+    /// 默认返回 [`Error::CrossDevice`]（OverlayFS 未开 redirect_dir 的默认
+    /// 行为，VFS 映射为 NTSTATUS `STATUS_NOT_SAME_DEVICE`；调用方按跨设备
+    /// 语义退化为递归复制+删除）——仅 upper-only 目录（lower 无内容）可以
+    /// 纯物理 rename，不产生任何标记。目标若是目录报错；目标是文件则覆盖
+    /// （POSIX rename 语义）。
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.validate_rel(from)?;
         self.validate_rel(to)?;
@@ -1117,6 +1076,14 @@ impl Overlay {
                 ctx.remove_whiteout(&mapped_to)?;
             }
             Resolution::Directory { has_lower, has_upper } => {
+                // lower 有内容 → 目录级改名默认 EXDEV（不复制子树、不新增
+                // redirect 标记）；redirect 标记仅由 v3→v4 迁移产生。
+                if has_lower || self.lower_has_file_or_dir(&mapped_from) {
+                    return Err(Error::CrossDevice(format!(
+                        "directory rename {from:?} -> {to:?} spans overlay layers (EXDEV)"
+                    )));
+                }
+                // upper-only 目录：纯物理改名，零标记。
                 if has_upper {
                     let to_upper = self.upper_abs(to);
                     if let Some(parent) = to_upper.parent() {
@@ -1124,10 +1091,7 @@ impl Overlay {
                     }
                     std::fs::rename(self.upper_abs(from), &to_upper)?;
                 }
-                if has_lower || self.lower_has_file_or_dir(&mapped_from) {
-                    ctx.record_rename(&mapped_from, &mapped_to)?;
-                }
-                // whiteout 保留在 lower 命名空间（改写后的 lower 查询仍能命中）。
+                ctx.remove_whiteout(&mapped_to)?;
             }
             Resolution::Whiteout | Resolution::NotFound => unreachable!("checked above"),
         }
@@ -1359,6 +1323,11 @@ mod tests {
             .collect()
     }
 
+    /// 该 fixture 的标记存储（标记日志在 `meta/markers.log`）。断言日志语义用。
+    fn markers(fx: &Fixture) -> MarkerStore {
+        MarkerStore::new(fx.upper_dir.clone())
+    }
+
     #[test]
     fn resolution_precedence_upper_over_whiteout_over_lower() {
         let fx = fixture(true);
@@ -1388,15 +1357,29 @@ mod tests {
         assert!(!fx.upper_dir.join("b.txt").exists());
         assert_eq!(of.read("b.txt").unwrap().as_deref(), Some(BEE));
 
-        // 删除 → whiteout（lower 有）
+        // 删除 → whiteout（lower 有；initializing 期缓冲在内存）
         assert!(of.remove("b.txt").unwrap());
         assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
         assert_eq!(of.read("b.txt").unwrap(), None);
+        assert!(
+            markers(&fx).load().unwrap().whites.is_empty(),
+            "initializing 期标记只缓冲：视图正确且日志尚无记录"
+        );
+        // mark_ready：存活的删除标记一次性写成快照
+        of.mark_ready().unwrap();
+        assert!(
+            markers(&fx).load().unwrap().whites.contains("b.txt"),
+            "mark_ready 必须把存活的 whiteout 写入标记日志"
+        );
 
-        // 重写一致内容 → whiteout 撤销，重新可见
+        // 重写一致内容 → whiteout 撤销（追加 remove 记录），重新可见
         let (state, _) = of.write("b.txt", BEE).unwrap();
         assert_eq!(state, DedupeState::Lower);
         assert_eq!(of.read("b.txt").unwrap().as_deref(), Some(BEE));
+        assert!(
+            !markers(&fx).load().unwrap().whites.contains("b.txt"),
+            "重建后 whiteout 必须从日志撤销"
+        );
 
         // 新文件 → New
         let (state, _) = of.write("new.txt", b"fresh").unwrap();
@@ -1429,10 +1412,14 @@ mod tests {
         of.write("a/3.txt", b"three").unwrap();
         assert_eq!(names(&of, "a"), vec!["1.txt", "2.txt", "3.txt"]);
 
-        // 删 lower-only 目录 → whiteout 隐藏整棵子树
+        // 删 lower-only 目录 → opaque 标记隐藏整棵子树（物理标记可查）
         assert!(of.remove("a").unwrap());
         assert!(!names(&of, "").contains(&"a".to_string()));
         assert_eq!(of.resolve("a/1.txt").unwrap(), Resolution::Whiteout);
+        assert!(
+            markers(&fx).load().unwrap().whites.contains("a"),
+            "lower 目录删除必须落删除标记（目录与文件共用一种标记）"
+        );
 
         // upper 重建目录 → 只显示 upper 内容，lower 子树仍隐藏
         of.write("a/9.txt", b"nine").unwrap();
@@ -1502,37 +1489,107 @@ mod tests {
         assert!(!of.is_initializing().unwrap());
     }
 
+    /// M12/B120100：lower 有内容的目录 rename → EXDEV（[`Error::CrossDevice`]，
+    /// 不复制子树、不新增 redirect 标记）；upper-only 目录仍纯物理 rename。
     #[test]
-    fn rename_dir_with_rename_map() {
+    fn dir_rename_exdev_with_lower_content_but_plain_for_upper_only() {
         let fx = fixture(true);
         let of = make_ready(&fx);
         of.write("a/3.txt", b"three").unwrap();
-        of.rename("a", "z").unwrap();
 
-        // 源路径消失；目标目录合并 lower(rename map) + upper(物理随迁)
-        assert_eq!(of.resolve("a").unwrap(), Resolution::NotFound);
+        // lower 有内容 → EXDEV，视图与标记树完全不变。
+        let err = of.rename("a", "z").unwrap_err();
+        assert!(matches!(err, Error::CrossDevice(_)), "got {err:?}");
+        assert!(matches!(
+            of.resolve("a").unwrap(),
+            Resolution::Directory { has_lower: true, has_upper: true }
+        ));
+        assert_eq!(of.resolve("z").unwrap(), Resolution::NotFound);
+        let state = markers(&fx).load().unwrap();
+        assert!(state.blockers().is_empty(), "EXDEV 不产生任何标记");
+        assert!(state.redirects.is_empty(), "EXDEV 不新增 redirect");
+
+        // upper-only 目录（lower 无内容）→ 纯物理 rename，零标记。
+        of.write("u/f.txt", b"upper-only").unwrap();
+        of.rename("u", "v").unwrap();
+        assert_eq!(of.resolve("u").unwrap(), Resolution::NotFound);
+        assert!(matches!(
+            of.resolve("v").unwrap(),
+            Resolution::Directory { has_lower: false, has_upper: true }
+        ));
+        assert_eq!(of.read("v/f.txt").unwrap().as_deref(), Some(b"upper-only".as_slice()));
+        assert!(fx.upper_dir.join("v").join("f.txt").is_file(), "物理随迁");
+
+        // 错误分支：目标为目录 / 源不存在 / 自子树
+        assert!(of.rename("v/f.txt", "v").is_err());
+        assert!(of.rename("ghost", "z2").is_err());
+        assert!(of.rename("v", "v/inner").is_err());
+    }
+
+    /// M12 回归：v3→v4 迁移产生的 redirect 标记（目录 rename map 的持久
+    /// 形态）——改名后子树 readdir/stat/read 正确；目标内文件级 rename 正确；
+    /// 一致内容 dedupe 回落 lower；删除目标目录后整树不可见且 redirect 清理。
+    #[test]
+    fn migrated_redirect_marker_subtree_readable_and_removable() {
+        let fx = fixture(true);
+        // v3 时代的行为重放：upper/a 物理搬迁到 upper/z + renames 行（现
+        // 由迁移转成 redirect 标记）。
+        let of = make_ready(&fx);
+        of.write("a/3.txt", b"three").unwrap();
+        std::fs::rename(fx.upper_dir.join("a"), fx.upper_dir.join("z")).unwrap();
+        markers(&fx).create_redirect("z", "a").unwrap();
+
+        // 新进程重开：redirect 标记装载进内存镜像。
+        let mut cfg = OverlayConfig::new(WorktreeId(1), &fx.upper_dir);
+        cfg.lower_root = Some(fx.lower_dir.clone());
+        cfg.template_id = Some(TemplateId(1));
+        let of = Overlay::reopen(cfg, Some(lower_fixture(&fx.lower_dir)), fx.store.clone()).unwrap();
+        of.mark_ready().unwrap();
+
+        // 目标目录：lower(redirect 改写) + upper 合并正确。
         assert!(matches!(
             of.resolve("z").unwrap(),
             Resolution::Directory { has_lower: true, has_upper: true }
         ));
         assert_eq!(names(&of, "z"), vec!["1.txt", "2.txt", "3.txt"]);
         assert_eq!(of.read("z/1.txt").unwrap().as_deref(), Some(ONE));
-        // lower 内容经 rename map 命中，stat 仍是固定值
         match of.resolve("z/1.txt").unwrap() {
             Resolution::Lower { file, .. } => assert_eq!(file.mode, 0o100644),
             other => panic!("expected Lower, got {other:?}"),
         }
-        // 再做一次文件级重命名（upper → upper）
+        // 旧路径不可见；根目录枚举不再显示旧名（M11 会在 readdir 里残留幽灵条目）。
+        assert_eq!(of.resolve("a").unwrap(), Resolution::NotFound);
+        assert_eq!(of.resolve("a/1.txt").unwrap(), Resolution::NotFound);
+        let root = names(&of, "");
+        assert!(!root.contains(&"a".to_string()));
+        assert!(root.contains(&"z".to_string()));
+
+        // 目标内一致内容 → dedupe 回落 lower（redirect 改写后命中模板）且可见。
+        let (state, _) = of.write("z/2.txt", TWO).unwrap();
+        assert_eq!(state, DedupeState::Lower);
+        assert_eq!(of.read("z/2.txt").unwrap().as_deref(), Some(TWO));
+
+        // 目标内文件级 rename：3.txt 是 upper-only（无模板条目）→ 源路径
+        // 自然消失、无需墓碑；upper 内容随迁 top.txt。
         of.rename("z/3.txt", "top.txt").unwrap();
         assert_eq!(of.resolve("z/3.txt").unwrap(), Resolution::NotFound);
         assert!(matches!(of.resolve("top.txt").unwrap(), Resolution::Upper { .. }));
-        assert_eq!(of.read("top.txt").unwrap().as_deref(), Some(b"three".as_slice()));
         assert_eq!(names(&of, "z"), vec!["1.txt", "2.txt"]);
 
-        // 错误分支：目标为目录 / 源不存在 / 自子树
-        assert!(of.rename("top.txt", "z").is_err());
-        assert!(of.rename("ghost", "z2").is_err());
-        assert!(of.rename("z", "z/inner").is_err());
+        // 删除目标目录：删除标记落在映射路径（a）；redirect 标记保留（只读
+        // 迁移产物，与 v3 rename map 语义一致）——z 经映射由标记隐藏，
+        // a 侧 MovedAway，新旧路径（含子树）全部不可见。
+        assert!(of.remove("z").unwrap());
+        let markers_state = markers(&fx).load().unwrap();
+        assert!(markers_state.blockers().contains("a"));
+        assert_eq!(
+            markers_state.redirects,
+            vec![("a".to_string(), "z".to_string())]
+        );
+        assert_eq!(of.resolve("z").unwrap(), Resolution::Whiteout);
+        assert_eq!(of.resolve("a").unwrap(), Resolution::NotFound);
+        assert_eq!(of.resolve("a/1.txt").unwrap(), Resolution::NotFound);
+        assert_eq!(of.resolve("z/1.txt").unwrap(), Resolution::Whiteout);
     }
 
     #[test]
@@ -1650,7 +1707,14 @@ mod tests {
         // 删除无 lower → 无 whiteout，直接消失
         assert!(of.remove("x.txt").unwrap());
         assert_eq!(of.resolve("x.txt").unwrap(), Resolution::NotFound);
-        assert!(of.store().whiteouts(WorktreeId(1)).unwrap().is_empty());
+        // 无 lower 内容 → 无任何标记残留。
+        assert!(
+            MarkerStore::new(upper_dir.clone())
+                .load()
+                .unwrap()
+                .blockers()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1670,9 +1734,8 @@ mod tests {
             let of = Overlay::new(cfg, Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
             of.write("a/1.txt", b"ONE!").unwrap();
             of.remove("b.txt").unwrap();
-            // M8：initializing 期元数据在内存缓冲，mark_ready 单事务落库；
-            // 此处 flush 后重开，验证持久化往返（崩溃于 ready 前 = 缓冲丢失，
-            // 见 crash_before_ready_keeps_initializing_and_upper_files）。
+            // M12：删除标记即时持久（镜像 + 标记文件，零事务）；mark_ready
+            // 后重开，验证持久化往返（标记跨重开完整，无缓冲可丢）。
             of.mark_ready().unwrap();
             let ino = of.file_id("a/1.txt").unwrap();
             let mtime = of.stat("a/1.txt").unwrap().unwrap().mtime_ns;
@@ -1729,7 +1792,7 @@ mod tests {
     }
 
     /// 干净 N 文件 checkout：finish_staged 全部与模板一致 → 零 upper 文件、
-    /// 零 fsync、零临时副本；决策记 InitBatch，mark_ready 单事务落库。
+    /// 零 fsync、零临时副本；无删除标记（干净 checkout 的目标路径）。
     #[test]
     fn finish_staged_clean_checkout_zero_upper_zero_fsync() {
         let fx = fixture(true);
@@ -1762,7 +1825,7 @@ mod tests {
                 "{p} must resolve to lower after clean checkout"
             );
         }
-        assert!(fx.store.whiteouts(WorktreeId(1)).unwrap().is_empty(), "lower 无 whiteout");
+        assert!(markers(&fx).load().unwrap().blockers().is_empty(), "lower 无删除标记");
     }
 
     /// 改动文件恰好一次物化 + 一次 fsync；再写回模板内容回收 upper
@@ -1905,8 +1968,8 @@ mod tests {
         assert_eq!(of2.io_stats().fsyncs(), 0);
         assert_eq!(of2.io_stats().upper_writes(), 0);
         of2.mark_ready().unwrap();
-        // 撤销后的 whiteout 不落库（回落 lower 视图）。
-        assert!(fx.store.whiteouts(WorktreeId(2)).unwrap().is_empty());
+        // 撤销后的标记已删除（回落 lower 视图）。
+        assert!(markers(&fx).load().unwrap().blockers().is_empty());
         assert!(matches!(of2.resolve("empty.txt").unwrap(), Resolution::Lower { .. }));
     }
 
@@ -2041,8 +2104,8 @@ mod tests {
 
     const N_FILES: usize = 48;
 
-    /// N 文件 checkout（initializing 期全内存批量）→ 写事务 O(1)：
-    /// register + mark_ready flush 共 2 个事务（M11 后 per-file 零 DB 读写）。
+    /// N 文件 checkout → 写事务 O(1)：register + mark_ready 状态切换共
+    /// 2 个事务（M12 起 per-file 删除连事务都没有——只写 O(1) 标记文件）。
     #[test]
     fn batched_checkout_uses_constant_transactions_and_flushes_rows() {
         let fx = fixture(true);
@@ -2060,7 +2123,7 @@ mod tests {
             // checkout 的 stat：file_id（路径哈希）/ mtime（真实值）纯推导。
             of.stat(&path).unwrap();
         }
-        // 批量窗口内：仅 register 的 1 个事务。
+        // checkout 窗口内：仅 register 的 1 个事务。
         let during = fx.store.db().tx_stats();
         assert_eq!(during.committed - base.committed, 1, "仅 register");
         assert_eq!(during.rolled_back - base.rolled_back, 0);
@@ -2068,14 +2131,14 @@ mod tests {
         of.mark_ready().unwrap();
         let after = fx.store.db().tx_stats();
         let total = (after.committed - base.committed) + (after.rolled_back - base.rolled_back);
-        assert_eq!(total, 2, "O(1)：register + flush");
+        assert_eq!(total, 2, "O(1)：register + 状态切换");
 
-        // 状态落库；本批无删除 → 无 whiteout 行；ino = 路径哈希纯推导。
+        // 状态落库；本批无删除 → 无删除标记；ino = 路径哈希纯推导。
         assert_eq!(
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Ready)
         );
-        assert!(fx.store.whiteouts(WorktreeId(1)).unwrap().is_empty());
+        assert!(markers(&fx).load().unwrap().blockers().is_empty());
         assert_eq!(
             of.file_id("a/1.txt").unwrap(),
             crate::overlay_store::derive_ino("a/1.txt") as u64,
@@ -2084,7 +2147,7 @@ mod tests {
     }
 
     /// 崩溃于 mark_ready 前：worktree 保持 initializing、upper 文件完整
-    /// （缓冲丢失可接受，spec §6.3.6）；重开后仍隐藏视图、可继续累积并 flush。
+    /// （spec §6.3.6）；M12 起标记即时持久，重开后视图（含删除标记）完整。
     #[test]
     fn crash_before_ready_keeps_initializing_and_upper_files() {
         let fx = fixture(true);
@@ -2098,7 +2161,7 @@ mod tests {
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Initializing)
         );
-        assert!(fx.store.whiteouts(WorktreeId(1)).unwrap().is_empty());
+        assert!(markers(&fx).load().unwrap().blockers().is_empty());
         assert!(fx.upper_dir.join("new.txt").is_file(), "upper 文件是数据真相");
         assert!(fx.upper_dir.join("a/1.txt").is_file());
 
@@ -2195,9 +2258,8 @@ mod tests {
         }
         of.mark_ready().unwrap();
         let id = WorktreeId(1);
-        let total = threads * per_thread;
         assert_eq!(fx.store.state(id).unwrap(), Some(crate::WorktreeState::Ready));
-        assert!(fx.store.whiteouts(id).unwrap().is_empty());
+        assert!(markers(&fx).load().unwrap().blockers().is_empty());
         // flush 后全部路径可解析 upper、内容正确；ino 纯推导一致。
         for t in 0..threads {
             for i in 0..per_thread {
@@ -2209,25 +2271,24 @@ mod tests {
         }
     }
 
-    /// 幂等 mark_ready：已 ready 的重开实例二次 mark_ready 只切状态，
-    /// 绝不重写/清空既有元数据行（daemon watcher 的 already-ready 路径）。
+    /// 幂等 mark_ready：重复 mark_ready 只切状态，绝不触碰既有标记
+    /// （daemon watcher 的 already-ready 路径）。
     #[test]
-    fn mark_ready_without_batch_never_touches_existing_rows() {
+    fn mark_ready_is_idempotent_and_never_touches_markers() {
         let fx = fixture(true);
         let of = make(&fx, true);
         of.write("a/2.txt", b"changed!").unwrap();
-        assert!(of.remove("b.txt").unwrap(), "制造一条 whiteout");
+        assert!(of.remove("b.txt").unwrap(), "制造一条 whiteout 标记");
         of.mark_ready().unwrap();
-        let before = fx.store.whiteouts(WorktreeId(1)).unwrap();
-        assert_eq!(before.len(), 1);
-        // 模拟 watcher 二次 mark_ready（无缓冲的实例走仅状态分支）
+        let state = markers(&fx).load().unwrap();
+        assert_eq!(state.whites.len(), 1);
+        // 模拟 watcher 二次 mark_ready
         of.mark_ready().unwrap();
         assert_eq!(
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Ready)
         );
-        assert_eq!(fx.store.whiteouts(WorktreeId(1)).unwrap(), before);
-        // 结构性保证：无缓冲分支只 UPDATE worktrees，不触碰任何子表行。
+        assert_eq!(markers(&fx).load().unwrap(), state, "标记树不被触碰");
     }
 
     // ---- M11/B110100 回归：派生元数据（哈希 ino / 内存索引 / 真实 mtime）----
@@ -2298,12 +2359,137 @@ mod tests {
             vec![("9.txt", EntryKind::File)]
         );
 
-        // mark_ready 幂等（无缓冲分支）：whiteout 行不被清空。
+        // mark_ready 幂等：whiteout 标记不被清空。
         of2.mark_ready().unwrap();
         assert!(
-            !store.whiteouts(WorktreeId(6)).unwrap().is_empty(),
-            "幂等 mark_ready 不得清空既有 whiteout 行"
+            MarkerStore::new(upper_dir.clone())
+                .load()
+                .unwrap()
+                .whites
+                .contains("b.txt"),
+            "幂等 mark_ready 不得清空 whiteout 标记"
         );
         assert_eq!(of2.resolve("b.txt").unwrap(), Resolution::Whiteout);
+    }
+
+    /// M12 回归：删除 lower 文件 → 不可见；重建 → 可见；注销 worktree 整树
+    /// 删除标记（无残留）；同 id 重新注册从干净状态开始。
+    #[test]
+    fn delete_rebuild_unregister_leaves_no_marker_residue() {
+        let dir = TempDir::new().unwrap();
+        let lower_dir = dir.path().join("lower");
+        let upper_dir = dir.path().join("upper");
+        let db = Db::open_in_memory().unwrap();
+        let store = Arc::new(SqliteOverlayStore::new(db));
+        lower_fixture(&lower_dir);
+        seed_template(&store);
+        let mut cfg = OverlayConfig::new(WorktreeId(1), &upper_dir);
+        cfg.lower_root = Some(lower_dir.clone());
+        cfg.template_id = Some(TemplateId(1));
+
+        let of = Overlay::new(cfg.clone(), Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+        of.mark_ready().unwrap();
+
+        // 删除 lower 文件与 lower 目录 → 各自标记（日志记录），视图不可见。
+        assert!(of.remove("b.txt").unwrap());
+        assert!(of.remove("a").unwrap());
+        assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
+        assert_eq!(of.resolve("a").unwrap(), Resolution::Whiteout);
+        let mstate = MarkerStore::new(upper_dir.clone()).load().unwrap();
+        assert!(mstate.whites.contains("b.txt") && mstate.whites.contains("a"));
+
+        // 重建文件 → whiteout 撤销、可见；重建目录 → upper-only（lower 子树
+        // 仍被 opaque 隐藏）。
+        of.write("b.txt", b"rebuilt").unwrap();
+        assert_eq!(of.read("b.txt").unwrap().as_deref(), Some(b"rebuilt".as_slice()));
+        assert!(matches!(of.resolve("b.txt").unwrap(), Resolution::Upper { .. }));
+        std::fs::create_dir_all(upper_dir.join("a")).unwrap();
+        of.write("a/new.txt", b"fresh").unwrap();
+        assert!(matches!(
+            of.resolve("a").unwrap(),
+            Resolution::Directory { has_lower: false, has_upper: true }
+        ));
+        assert_eq!(names(&of, "a"), vec!["new.txt"]);
+
+        // 注销：删行（幂等）；标记日志随 meta/ 留给 gc；同 id 重新注册时
+        // 清扫残留标记（旧墓碑不复活）。
+        store.unregister(WorktreeId(1)).unwrap();
+        assert!(
+            MarkerStore::new(upper_dir.clone()).load().unwrap().whites.contains("a"),
+            "标记随 meta/ 保留给 gc（b.txt 的标记已在重建时撤销）"
+        );
+        assert_eq!(store.state(WorktreeId(1)).unwrap(), None);
+
+        // 同 id 重新注册：旧墓碑不会复活（标记被清扫，视图 = upper 遗留 +
+        // lower；上一世的 b.txt upper 内容仍在——upper 是数据真相，交给 gc，
+        // 但绝不会出现 Whiteout 幽灵）。
+        let of2 = Overlay::new(cfg, Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+        assert!(matches!(of2.resolve("b.txt").unwrap(), Resolution::Upper { .. }));
+        assert!(matches!(
+            of2.resolve("a").unwrap(),
+            Resolution::Directory { has_lower: true, has_upper: true }
+        ));
+        assert_eq!(of2.read("a/1.txt").unwrap().as_deref(), Some(ONE));
+        of2.mark_ready().unwrap();
+        assert!(matches!(
+            of2.resolve("b.txt").unwrap(),
+            Resolution::Upper { .. }
+        ));
+    }
+
+    /// M12 回归：initializing 期删除标记缓冲在内存（M8 模式）——mark_ready
+    /// 时把存活集合同步为 `.wh.` 文件并跨重开持久；ready 后文件级重建撤销
+    /// 标记、目录级删除持续隐藏 lower 子树。崩溃于 mark_ready 前丢缓冲 =
+    /// 被删 lower 内容重现（spec §8.3 允许，M11 同语义）。
+    #[test]
+    fn delete_markers_buffered_until_ready_then_persist() {
+        let dir = TempDir::new().unwrap();
+        let lower_dir = dir.path().join("lower");
+        let upper_dir = dir.path().join("upper");
+        let db_path = dir.path().join("meta.db");
+        let db = Db::open(&db_path).unwrap();
+        let store = Arc::new(SqliteOverlayStore::new(db));
+        lower_fixture(&lower_dir);
+        seed_template(&store);
+        let mut cfg = OverlayConfig::new(WorktreeId(3), &upper_dir);
+        cfg.lower_root = Some(lower_dir.clone());
+        cfg.template_id = Some(TemplateId(1));
+
+        let of = Overlay::new(cfg.clone(), Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+        assert!(of.remove("b.txt").unwrap());
+        assert!(of.remove("a").unwrap());
+        // 缓冲期：视图正确（内存镜像），日志尚无记录。
+        assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
+        assert!(!MarkerStore::new(upper_dir.clone()).load().unwrap().whites.contains("b.txt"));
+
+        // mark_ready：存活集合写成快照。
+        of.mark_ready().unwrap();
+        {
+            let mstate = MarkerStore::new(upper_dir.clone()).load().unwrap();
+            assert!(mstate.whites.contains("b.txt") && mstate.whites.contains("a"));
+        }
+        drop(of);
+
+        // 重开：标记从树装载，语义持久。
+        let of2 = Overlay::reopen(cfg, Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+        assert_eq!(of2.resolve("b.txt").unwrap(), Resolution::Whiteout);
+        assert_eq!(of2.resolve("a").unwrap(), Resolution::Whiteout);
+        assert_eq!(of2.read("b.txt").unwrap(), None);
+        // 文件级重建撤销标记；目录级删除持续（重建后 upper-only）。
+        let (_, _) = of2.write("b.txt", b"back").unwrap();
+        assert!(matches!(of2.resolve("b.txt").unwrap(), Resolution::Upper { .. }));
+        std::fs::create_dir_all(upper_dir.join("a")).unwrap();
+        let (_, _) = of2.write("a/x.txt", b"x").unwrap();
+        assert!(matches!(
+            of2.resolve("a").unwrap(),
+            Resolution::Directory { has_lower: false, has_upper: true }
+        ));
+        assert_eq!(names(&of2, "a"), vec!["x.txt"]);
+        // 重建撤销的标记从日志删除；目录标记持续。
+        {
+            let mstate = MarkerStore::new(upper_dir.clone()).load().unwrap();
+            assert!(!mstate.whites.contains("b.txt"));
+            assert!(mstate.whites.contains("a"));
+        }
     }
 }

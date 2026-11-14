@@ -975,6 +975,55 @@ impl Overlay {
         Ok((state, size))
     }
 
+    /// B100100：文件 `create` 回调返回后路径必须立即可解析——WinFSP 在
+    /// create 之后会对该路径做按名查询，查不到则整个 create 被判不存在，
+    /// 零字节文件（写 0 字节、无 staged 终裁）"刚写入即消失"，git 报
+    /// "unable to stat just-written file"。
+    ///
+    /// * whiteout（git force 检出的前置 unlink）：撤销之。模板命中且
+    ///   size == 0（空 blob）时经 [`Overlay::finish_staged`] 零拷贝终裁——
+    ///   回落 lower，零 upper 物化、零 fsync（干净检出的 0-upper/0-fsync
+    ///   性质不受影响）；模板命中且非空仅撤销（真实内容随后续写入的
+    ///   staged 终裁落地），不物化空 upper。
+    /// * NotFound（无模板覆盖，含全量 copy 兜底）：物化空 upper 占位文件
+    ///   （plain create，无 fsync；持久性由后续写入的 staged 终裁或
+    ///   cleanup 的零写入终裁保证），记 `New` + 逻辑 mtime。
+    /// * 其余（Upper/Lower/Directory）：已可解析，no-op。
+    pub fn prepare_created_file(&self, rel: &str) -> Result<()> {
+        self.validate_rel(rel)?;
+        let mut ctx = self.meta_ctx();
+        match self.resolve_with(&ctx, rel)? {
+            Resolution::Whiteout => {
+                let mapped = self.mapped_or_same(&ctx, rel)?;
+                if self.lookup_lower(&mapped).is_some_and(|t| t.size == 0) {
+                    drop(ctx);
+                    self.finish_staged(
+                        rel,
+                        crate::dedupe::hash_bytes(&[]),
+                        0,
+                        StagedContent::Memory(&[]),
+                    )?;
+                } else {
+                    ctx.remove_whiteout(&mapped)?;
+                }
+                Ok(())
+            }
+            Resolution::NotFound => {
+                let path = self.upper_abs(rel);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::File::create(&path)?;
+                self.io.record_upper_write();
+                let mtime = self.issue_logical_mtime();
+                ctx.set_stat_entry(rel, StatCacheEntry { mtime_ns: mtime, size: 0, flags: 0 })?;
+                ctx.record_dedupe_state(rel, DedupeState::New)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// copy-up：lower 内容复制到 upper 以便就地修改；已在 upper 则返回其路径。
     pub fn copy_up(&self, rel: &str) -> Result<Option<PathBuf>> {
         self.validate_rel(rel)?;
@@ -1833,6 +1882,86 @@ mod tests {
             .unwrap();
         assert_eq!(state, DedupeState::Lower);
         assert_eq!(of.io_stats().fsyncs(), 1, "回落路径不 fsync");
+    }
+
+    /// B100100（core 语义）：prepare_created_file——whiteout 撤销（空 blob
+    /// 零拷贝终裁回落 lower / 非空仅撤销不物化）；NotFound 物化空 upper
+    /// 占位（路径立即可解析）。
+    #[test]
+    fn prepare_created_file_restores_resolvability() {
+        let fx = fixture(true);
+
+        // 非空模板条目：仅撤销 whiteout。
+        let of = make(&fx, true);
+        assert!(of.remove("b.txt").unwrap());
+        assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
+        of.prepare_created_file("b.txt").unwrap();
+        assert!(matches!(of.resolve("b.txt").unwrap(), Resolution::Lower { .. }));
+        assert!(!fx.upper_dir.join("b.txt").exists(), "不得物化空 upper");
+        assert_eq!(of.io_stats().fsyncs(), 0);
+        assert_eq!(of.io_stats().upper_writes(), 0);
+        of.mark_ready().unwrap();
+
+        // 空 blob 模板条目（B100100 主场景）：零拷贝终裁撤销 whiteout、
+        // 回落 lower，零物化零 fsync；决策随 mark_ready 落库。
+        let mut cfg = OverlayConfig::new(WorktreeId(2), &fx.upper_dir);
+        cfg.lower_root = Some(fx.lower_dir.clone());
+        cfg.template_id = Some(TemplateId(1));
+        let mut map = lower_fixture(&fx.lower_dir);
+        map.insert(
+            "empty.txt".to_string(),
+            TemplateFile {
+                path: "empty.txt".to_string(),
+                hash: crate::dedupe::hash_bytes(&[]),
+                size: 0,
+                mode: 0o100644,
+            },
+        );
+        let of2 = Overlay::new(cfg, Some(map), fx.store.clone()).unwrap();
+        assert!(of2.remove("empty.txt").unwrap());
+        assert_eq!(of2.resolve("empty.txt").unwrap(), Resolution::Whiteout);
+        of2.prepare_created_file("empty.txt").unwrap();
+        assert!(matches!(of2.resolve("empty.txt").unwrap(), Resolution::Lower { .. }));
+        assert!(!fx.upper_dir.join("empty.txt").exists());
+        assert_eq!(of2.io_stats().fsyncs(), 0);
+        assert_eq!(of2.io_stats().upper_writes(), 0);
+        of2.mark_ready().unwrap();
+        assert_eq!(
+            fx.store.dedupe_states(WorktreeId(2)).unwrap().get("empty.txt"),
+            Some(&DedupeState::Lower)
+        );
+    }
+
+    /// B100100：NotFound（无模板覆盖）上 prepare_created_file 物化空 upper
+    /// 占位——create 返回后路径立即可解析（全量 copy 兜底模式同此路径）。
+    #[test]
+    fn prepare_created_file_materializes_placeholder_for_uncovered_paths() {
+        let fx = fixture(true);
+        let of = make(&fx, true);
+
+        of.prepare_created_file("brand-new.txt").unwrap();
+        assert!(matches!(
+            of.resolve("brand-new.txt").unwrap(),
+            Resolution::Upper { .. }
+        ));
+        let st = of.stat("brand-new.txt").unwrap().unwrap();
+        assert_eq!(st.size, 0);
+        assert_eq!(
+            fx.upper_dir.join("brand-new.txt").metadata().unwrap().len(),
+            0,
+            "占位文件 EOF 精确为 0"
+        );
+        assert_eq!(of.io_stats().fsyncs(), 0, "占位不 fsync（持久性由终裁保证）");
+        assert_eq!(of.io_stats().upper_writes(), 1);
+
+        // 已可解析的路径 no-op（幂等）。
+        of.prepare_created_file("brand-new.txt").unwrap();
+        assert_eq!(of.io_stats().upper_writes(), 1);
+        of.mark_ready().unwrap();
+        assert_eq!(
+            fx.store.dedupe_states(WorktreeId(1)).unwrap().get("brand-new.txt"),
+            Some(&DedupeState::New)
+        );
     }
 
     /// 崩溃于 mark_ready 前：finish_staged 物化的 upper 文件完整保留

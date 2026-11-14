@@ -14,17 +14,18 @@
 //!   （[`crate::overlay_markers`]）在打开时一次性装载进内存镜像，模板清单在
 //!   打开时构建成目录索引（目录集合 + 每目录子项），status/list 热路径不再
 //!   逐 entry 查库或扫标记。
-//! * M12/B120100 标记树：删除墓碑（whiteout，含目录 opaque 语义）持久化为
-//!   upper 层内的 OverlayFS 同款 `.wh.<name>` 标记文件，**unlink/rmdir 只写
-//!   一个 O(1) 标记文件、零 SQLite 写事务**；rename 映射（redirect，仅迁移
-//!   产物）在 `meta/redirect/`。内存镜像（[`MetaState`]）与标记文件在同一把
-//!   锁下同步更新，读路径零标记 I/O。readdir 合并按目录应用标记（逐名
-//!   whiteout/redirect 过滤），不做全树扫描；被删目录重建后仅显示 upper
-//!   内容。**initializing 期删除标记只缓冲在内存**（git checkout 的
-//!   unlink→重建循环每文件产生一对标记增删，缓冲后干净检出零标记写入），
-//!   [`Overlay::mark_ready`] 把存活集合一次性同步为 `.wh.` 文件再切状态
-//!   （崩溃丢缓冲 = 被删 lower 内容重现，spec §8.3 允许）；ready 态即时
-//!   持久。
+//! * M12/B120100 标记日志：删除墓碑（whiteout，含目录 opaque 语义）持久化
+//!   为 `meta/markers.log` 的 **append-only 日志**（ready 态每删除/撤销一条
+//!   µs 级追加记录，句柄常驻，无 fsync；撕裂尾记录在重放时忽略——被删
+//!   lower 内容可能重现，spec §8.3 允许，与 M11 一致）；rename 映射
+//!   （redirect，仅迁移产物）在 `meta/redirect/`。内存镜像（[`MetaState`]）
+//!   是读路径真相（打开时重放装载，写路径同步追加），零标记文件 I/O。
+//!   readdir 合并按目录应用标记（逐名 whiteout/redirect 过滤），不做全树
+//!   扫描；被删目录重建后仅显示 upper 内容。**initializing 期删除标记只
+//!   缓冲在内存**（git checkout 的 unlink→重建循环每文件产生一对标记增删，
+//!   缓冲后干净检出零标记写入），[`Overlay::mark_ready`] 把存活集合一次性
+//!   写成快照再切状态（崩溃丢缓冲 = 被删 lower 内容重现）；ready 态即时
+//!   追加。
 //! * M9/B090100 暂存写零拷贝终裁：[`Overlay::finish_staged`] 接收暂存期已
 //!   流式算好的哈希/长度/内容（内存或溢写路径），一致 → 丢弃回落 lower
 //!   （零 upper 文件、零 fsync、零临时副本）；否则溢写同卷改名 / 内存经
@@ -37,9 +38,8 @@
 //!   lower 经 rename 落 upper 的内容与模板一致，mtime 归一到 per-worktree
 //!   epoch，index 对齐不因 copy-up 破坏。
 //!
-//! 约定：upper 根下以 `.wtfs-tmp` 开头的名字是写入临时文件，`.wh.` 开头的
-//! 名字是删除标记命名空间；写入请求若使用这两类前缀名会被拒绝（`.wh.`
-//! 路径在解析时跳过 upper，回落 lower/不存在）。
+//! 约定：upper 根下以 `.wtfs-tmp` 开头的名字是写入临时文件，对视图不可见；
+//! 写入请求若使用该前缀名会被拒绝。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -209,11 +209,6 @@ fn is_temp_name(name: &str) -> bool {
     name.starts_with(TEMP_PREFIX)
 }
 
-/// `.wh.` 删除标记对视图不可见（OverlayFS 同款命名限制：仓库内以 `.wh.`
-/// 命名的真实路径跳过 upper，回落 lower/不存在）。
-pub(crate) fn is_marker_name(name: &str) -> bool {
-    crate::overlay_markers::is_marker_name(name)
-}
 
 fn join_rel(dir: &str, name: &str) -> String {
     if dir.is_empty() {
@@ -332,7 +327,7 @@ impl<'a> MetaCtx<'a> {
     /// 对按名可见的 lower 文件走"lstat→unlink→CREATE_NEW 重建"，每个文件
     /// 产生一对标记创建/撤销——立即落盘会让干净检出多出 ~1 万次 NTFS
     /// 创建/删除（评审 P1 实测 add +6s）。缓冲到 mark_ready 时一次性把
-    /// 存活集合同步为 `.wh.` 文件（空集 = 零写入）；ready 态即时持久。
+    /// 存活集合同步为 `meta/markers.log` 快照（空集 = 零写入）；ready 态即时追加。
     fn add_whiteout(&mut self, path: &str) -> Result<()> {
         validate_relative_path(path)?;
         DIAG_W_ADD.fetch_add(1, Ordering::Relaxed);
@@ -453,8 +448,8 @@ impl Overlay {
     pub fn mark_ready(&self) -> Result<()> {
         let mut guard = self.meta.lock();
         if guard.initializing {
-            // 缓冲的删除标记一次性同步为 upper 内 `.wh.` 文件（只补缺失/
-            // 删多余，空集 = 零写入）；先同步后切状态——提交窗口内崩溃
+            // 缓冲的删除标记一次性同步为 meta/markers.log 快照（只写存
+            // 活集合，空集 = 零写入）；先同步后切状态——提交窗口内崩溃
             // 重开仍为 initializing，缓冲续写并在下次 mark_ready 收敛。
             let created = self.markers.sync(&guard.whites)?;
             tracing::info!(
@@ -566,12 +561,9 @@ impl Overlay {
             return Ok(Resolution::NotFound);
         }
         let upper_path = self.upper_abs(rel);
-        if !is_marker_name(basename(rel)) {
-            // `.wh.` 前缀是标记命名空间：跳过 upper（回落 lower/不存在）。
-            if let Ok(md) = std::fs::symlink_metadata(&upper_path) {
-                if !md.is_dir() {
-                    return Ok(Resolution::Upper { path: upper_path });
-                }
+        if let Ok(md) = std::fs::symlink_metadata(&upper_path) {
+            if !md.is_dir() {
+                return Ok(Resolution::Upper { path: upper_path });
             }
         }
         if rel.is_empty() {
@@ -669,8 +661,8 @@ impl Overlay {
                         tracing::warn!(name = ?os_name, "skip non-UTF-8 upper name");
                         continue;
                     };
-                    if is_temp_name(name) || is_marker_name(name) {
-                        // 写入临时文件与 .wh. 删除标记对视图不可见。
+                    if is_temp_name(name) {
+                        // 写入临时文件对视图不可见。
                         continue;
                     }
                     let kind = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -724,9 +716,9 @@ impl Overlay {
     /// 删除标记即时持久（M12：镜像 + 标记文件，零事务），两阶段一致。
     pub fn write_from(&self, rel: &str, reader: &mut impl Read) -> Result<(DedupeState, u64)> {
         self.validate_rel(rel)?;
-        if is_temp_name(basename(rel)) || is_marker_name(basename(rel)) {
+        if is_temp_name(basename(rel)) {
             return Err(Error::Overlay(format!(
-                "path {rel:?} uses a reserved upper-layer prefix ({TEMP_PREFIX:?} / .wh.)"
+                "path {rel:?} uses reserved temp prefix {TEMP_PREFIX:?}"
             )));
         }
         let final_path = self.upper_abs(rel);
@@ -829,9 +821,9 @@ impl Overlay {
         content: StagedContent<'_>,
     ) -> Result<(DedupeState, u64)> {
         self.validate_rel(rel)?;
-        if is_temp_name(basename(rel)) || is_marker_name(basename(rel)) {
+        if is_temp_name(basename(rel)) {
             return Err(Error::Overlay(format!(
-                "path {rel:?} uses a reserved upper-layer prefix ({TEMP_PREFIX:?} / .wh.)"
+                "path {rel:?} uses reserved temp prefix {TEMP_PREFIX:?}"
             )));
         }
         let final_path = self.upper_abs(rel);
@@ -946,13 +938,6 @@ impl Overlay {
                 Ok(())
             }
             Resolution::NotFound => {
-                if is_marker_name(basename(rel)) {
-                    // `.wh.` 前缀是标记命名空间：物化占位会被误读为删除标记
-                    // （隐藏同名条目），与 OverlayFS 一样拒绝此类路径。
-                    return Err(Error::Overlay(format!(
-                        "path {rel:?} uses the reserved whiteout prefix .wh."
-                    )));
-                }
                 let path = self.upper_abs(rel);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -1043,14 +1028,6 @@ impl Overlay {
         if from.starts_with(&format!("{to}/")) || to.starts_with(&format!("{from}/")) {
             return Err(Error::Overlay(format!(
                 "rename {from:?} -> {to:?}: cannot rename into own subtree"
-            )));
-        }
-        if is_marker_name(basename(to)) {
-            // `.wh.` 前缀是标记命名空间：把目标物化成标记文件会让改名结果
-            // 自身不可见（下次装载被当成同名条目的 whiteout），与写入路径
-            // 一致拒绝。
-            return Err(Error::Overlay(format!(
-                "rename target {to:?} uses the reserved whiteout prefix .wh."
             )));
         }
         let mut ctx = self.meta_ctx();
@@ -1346,7 +1323,7 @@ mod tests {
             .collect()
     }
 
-    /// 该 fixture 的标记存储（标记在 upper 内：`.wh.<name>`）。断言物理文件用。
+    /// 该 fixture 的标记存储（标记日志在 `meta/markers.log`）。断言日志语义用。
     fn markers(fx: &Fixture) -> MarkerStore {
         MarkerStore::new(fx.upper_dir.clone())
     }
@@ -1385,19 +1362,24 @@ mod tests {
         assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
         assert_eq!(of.read("b.txt").unwrap(), None);
         assert!(
-            !fx.upper_dir.join(".wh.b.txt").exists(),
-            "initializing 期标记只缓冲，不得落盘"
+            markers(&fx).load().unwrap().whites.is_empty(),
+            "initializing 期标记只缓冲：视图正确且日志尚无记录"
         );
-        // mark_ready：存活的删除标记一次性物化为 0 字节标记文件
+        // mark_ready：存活的删除标记一次性写成快照
         of.mark_ready().unwrap();
-        let marker = fx.upper_dir.join(".wh.b.txt");
-        assert!(marker.is_file(), "mark_ready 必须物化存活的 whiteout 标记");
+        assert!(
+            markers(&fx).load().unwrap().whites.contains("b.txt"),
+            "mark_ready 必须把存活的 whiteout 写入标记日志"
+        );
 
-        // 重写一致内容 → whiteout 标记撤销（物理删除），重新可见
+        // 重写一致内容 → whiteout 撤销（追加 remove 记录），重新可见
         let (state, _) = of.write("b.txt", BEE).unwrap();
         assert_eq!(state, DedupeState::Lower);
         assert_eq!(of.read("b.txt").unwrap().as_deref(), Some(BEE));
-        assert!(!marker.exists(), "重建后 whiteout 标记必须撤销");
+        assert!(
+            !markers(&fx).load().unwrap().whites.contains("b.txt"),
+            "重建后 whiteout 必须从日志撤销"
+        );
 
         // 新文件 → New
         let (state, _) = of.write("new.txt", b"fresh").unwrap();
@@ -1435,7 +1417,7 @@ mod tests {
         assert!(!names(&of, "").contains(&"a".to_string()));
         assert_eq!(of.resolve("a/1.txt").unwrap(), Resolution::Whiteout);
         assert!(
-            fx.upper_dir.join(".wh.a").is_file(),
+            markers(&fx).load().unwrap().whites.contains("a"),
             "lower 目录删除必须落删除标记（目录与文件共用一种标记）"
         );
 
@@ -2408,13 +2390,13 @@ mod tests {
         let of = Overlay::new(cfg.clone(), Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
         of.mark_ready().unwrap();
 
-        // 删除 lower 文件与 lower 目录 → 各自标记（upper 内 `.wh.<name>`），视图不可见。
+        // 删除 lower 文件与 lower 目录 → 各自标记（日志记录），视图不可见。
         assert!(of.remove("b.txt").unwrap());
         assert!(of.remove("a").unwrap());
         assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
         assert_eq!(of.resolve("a").unwrap(), Resolution::Whiteout);
-        assert!(upper_dir.join(".wh.b.txt").is_file());
-        assert!(upper_dir.join(".wh.a").is_file());
+        let mstate = MarkerStore::new(upper_dir.clone()).load().unwrap();
+        assert!(mstate.whites.contains("b.txt") && mstate.whites.contains("a"));
 
         // 重建文件 → whiteout 撤销、可见；重建目录 → upper-only（lower 子树
         // 仍被 opaque 隐藏）。
@@ -2429,12 +2411,12 @@ mod tests {
         ));
         assert_eq!(names(&of, "a"), vec!["new.txt"]);
 
-        // 注销：删行（幂等）；标记随 upper 留给 gc；同 id 重新注册时清扫
-        // 残留标记（旧墓碑不复活）。
+        // 注销：删行（幂等）；标记日志随 meta/ 留给 gc；同 id 重新注册时
+        // 清扫残留标记（旧墓碑不复活）。
         store.unregister(WorktreeId(1)).unwrap();
         assert!(
-            upper_dir.join(".wh.a").is_file(),
-            "标记随 upper 保留给 gc（b.txt 的标记已在重建时撤销）"
+            MarkerStore::new(upper_dir.clone()).load().unwrap().whites.contains("a"),
+            "标记随 meta/ 保留给 gc（b.txt 的标记已在重建时撤销）"
         );
         assert_eq!(store.state(WorktreeId(1)).unwrap(), None);
 
@@ -2476,14 +2458,16 @@ mod tests {
         let of = Overlay::new(cfg.clone(), Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
         assert!(of.remove("b.txt").unwrap());
         assert!(of.remove("a").unwrap());
-        // 缓冲期：视图正确（内存镜像），但不落盘。
+        // 缓冲期：视图正确（内存镜像），日志尚无记录。
         assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
-        assert!(!upper_dir.join(".wh.b.txt").exists());
+        assert!(!MarkerStore::new(upper_dir.clone()).load().unwrap().whites.contains("b.txt"));
 
-        // mark_ready：存活集合物化为 `.wh.` 文件。
+        // mark_ready：存活集合写成快照。
         of.mark_ready().unwrap();
-        assert!(upper_dir.join(".wh.b.txt").is_file());
-        assert!(upper_dir.join(".wh.a").is_file());
+        {
+            let mstate = MarkerStore::new(upper_dir.clone()).load().unwrap();
+            assert!(mstate.whites.contains("b.txt") && mstate.whites.contains("a"));
+        }
         drop(of);
 
         // 重开：标记从树装载，语义持久。
@@ -2501,8 +2485,11 @@ mod tests {
             Resolution::Directory { has_lower: false, has_upper: true }
         ));
         assert_eq!(names(&of2, "a"), vec!["x.txt"]);
-        // 重建撤销的标记物理删除；目录标记持续。
-        assert!(!upper_dir.join(".wh.b.txt").exists());
-        assert!(upper_dir.join(".wh.a").is_file());
+        // 重建撤销的标记从日志删除；目录标记持续。
+        {
+            let mstate = MarkerStore::new(upper_dir.clone()).load().unwrap();
+            assert!(!mstate.whites.contains("b.txt"));
+            assert!(mstate.whites.contains("a"));
+        }
     }
 }

@@ -276,7 +276,7 @@ fn drain_events(fx: &Fixture) -> Vec<crate::NotifyEvent> {
     std::iter::from_fn(|| fx.ctx.notify_hub().pop()).collect()
 }
 
-/// 该 fixture 的标记存储（标记在 upper 内：`.wh.<name>`，M12）。
+/// 该 fixture 的标记存储（append 日志在 `meta/markers.log`，M12）。
 fn marker_root(fx: &Fixture) -> MarkerStore {
     MarkerStore::new(fx.upper_dir.clone())
 }
@@ -594,8 +594,8 @@ fn whiteout_delete_and_recreate() {
     assert!(sec(&fx, "\\wt-1\\b.txt").is_err());
     assert_eq!(overlay.resolve("b.txt").unwrap(), Resolution::Whiteout);
     assert!(
-        fx.upper_dir.join(".wh.b.txt").is_file(),
-        "删除 lower 文件必须落 whiteout 标记文件"
+        marker_root(&fx).load().unwrap().whites.contains("b.txt"),
+        "删除 lower 文件必须落 whiteout 标记（日志记录）"
     );
 
     // 目录非空不可删
@@ -889,10 +889,10 @@ fn set_delete_allows_empty_worktree_root_and_unregisters_on_cleanup() {
             .any(|e| e.name == "\\wt-1" && e.action == FILE_ACTION_REMOVED)
     );
     // overlay DB 行已删（unregister 只删行，M12 v4 无子表）；标记（upper 内
-    // `.wh.*`）与 upper 物理目录保留为孤儿——由 `wtfs gc` 整体回收
+    // markers.log）与 upper 物理目录保留为孤儿——由 `wtfs gc` 整体回收
     // （spec §6.6，与 daemon watcher 注销路径一致）
     assert_eq!(overlay.store().state(WorktreeId(1)).unwrap(), None);
-    // 标记（upper 内 `.wh.*`）随 upper 目录留给 `wtfs gc` 整体回收；同 id
+    // 标记日志（meta/markers.log）随 meta/ 目录留给 `wtfs gc` 整体回收；同 id
     // 重新注册时由 MarkerStore::clear 清扫（core 回归覆盖）。
     assert!(fx.upper_dir.exists(), "upper 目录留给 gc");
 }

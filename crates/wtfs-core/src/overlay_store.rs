@@ -276,8 +276,8 @@ mod tests {
         );
     }
 
-    /// unregister 幂等删行；标记（upper 内 `.wh.*` 与 meta/redirect）随 upper
-    /// 目录由 gc 回收——同 id 重新注册时 `MarkerStore::clear` 清扫残留。
+    /// unregister 幂等删行；标记日志（meta/markers.log）与 meta/redirect 随
+    /// meta/ 目录由 gc 回收——同 id 重新注册时 `MarkerStore::clear` 清扫残留。
     #[test]
     fn unregister_is_idempotent_and_markers_follow_upper() {
         let dir = TempDir::new().unwrap();
@@ -295,8 +295,11 @@ mod tests {
         assert!(store.state(WorktreeId(1)).unwrap().is_none());
         // 幂等。
         store.unregister(WorktreeId(1)).unwrap();
-        // 标记随 upper 保留（gc 回收）；重新注册前清扫。
-        assert!(upper.join(".wh.gone.txt").is_file(), "标记随 upper 保留给 gc");
+        // 标记日志随 meta/ 保留（gc 回收）；重新注册前清扫。
+        assert!(
+            markers.load().unwrap().whites.contains("gone.txt"),
+            "标记日志随 meta/ 保留给 gc"
+        );
         markers.clear().unwrap();
         assert!(markers.load().unwrap().whites.is_empty());
     }

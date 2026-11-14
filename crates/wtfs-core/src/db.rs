@@ -294,8 +294,8 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
 /// OverlayFS 同款标记，然后 DROP 两张表。
 ///
 /// 转换规则：
-/// * `whiteouts(worktree_id, path)` → `upper/parent(path)/.wh.<basename(path)>`
-///   0 字节标记文件（in-parent，与运行期 [`crate::overlay_markers`] 一致）；
+/// * `whiteouts(worktree_id, path)` → `meta/markers.log` 的 add 记录
+///   （append-only 标记日志，与运行期 [`crate::overlay_markers`] 一致）；
 /// * `renames(worktree_id, from_path, to_path)` → `<...>/meta/redirect/<to_path>`
 ///   标记文件（内容 = from_path）。旧 `from_path` 侧的"已搬走"不可见语义由
 ///   redirect 映射本身给出（解析时 [`crate::overlay::map_to_lower_with`] 的
@@ -528,9 +528,14 @@ mod tests {
                 .unwrap();
             assert_eq!(wts, 1);
         }
-        // 标记：whiteout 行 → upper 内 `.wh.<name>`；rename 行 → redirect 标记。
-        assert!(upper.join(".wh.gone.txt").is_file());
-        assert!(upper.join("sub").join("deep").join(".wh.x.txt").is_file());
+        // 标记：whiteout 行 → markers.log 的 add 记录；rename 行 → redirect 标记。
+        {
+            let state = crate::overlay_markers::MarkerStore::new(upper.clone())
+                .load()
+                .unwrap();
+            assert!(state.whites.contains("gone.txt"));
+            assert!(state.whites.contains("sub/deep/x.txt"));
+        }
         let redirect = crate::overlay_markers::marker_root_for_upper(&upper)
             .join("redirect")
             .join("dst");

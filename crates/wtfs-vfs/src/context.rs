@@ -195,7 +195,8 @@ pub struct FileContext {
     truncate_open: AtomicBool,
     /// `create` 回调新建的文件句柄（B100100）：零写入关闭也必须物化空文件
     /// （NT 语义 CREATE_NEW + close = 文件存在 EOF 0；git checkout 的
-    /// O_CREAT|O_EXCL 零字节 blob 路径依赖此兜底）。
+    /// O_CREAT|O_EXCL 零字节 blob 路径依赖此兜底）；delete-on-close 时
+    /// 撤销 create 当场留下的占位/whiteout 撤销（B100100 R2）。
     created_new: AtomicBool,
 }
 
@@ -854,6 +855,15 @@ impl FileSystemContext for WtfsContext {
                 if delete {
                     // 从未可见：直接丢弃暂存。
                     discard_staged(staged);
+                    // B100100 R2：create 当场留下的状态不得残留（delete-on-close
+                    // 语义 = 路径最终不存在）——NotFound 占位连带 stat/dedupe 行
+                    // 删除（否则幽灵空文件让后续 CREATE_NEW collision）；
+                    // whiteout 已撤销的路径重新记上，lower 内容不得"复活"。
+                    if context.created_new.load(Ordering::SeqCst) {
+                        if let Err(e) = overlay.remove(&rel) {
+                            tracing::warn!(rel = %rel, error = %e, "delete after staged discard failed");
+                        }
+                    }
                     return;
                 }
                 match FileContext::finalize_staged(&overlay, &rel, staged) {

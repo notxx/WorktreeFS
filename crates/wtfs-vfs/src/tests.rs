@@ -386,12 +386,14 @@ fn staged_delete_discards_without_visible_trace() {
     let fx = fixture();
     let fctx = create_file(&fx, "\\wt-1\\b.txt");
     write(&fx, &fctx, b"partial");
-    // delete-on-close：暂存直接丢弃，视图无痕
+    // delete-on-close：暂存直接丢弃（"partial" 不得出现）。B100100 起
+    // create 的文件当场存在，delete 语义 = 删除（R2：撤占位 / 记 whiteout），
+    // 不得回落 lower 复活旧内容。
     fx.ctx.set_delete(&fctx, &p("\\wt-1\\b.txt"), true).unwrap();
     cleanup(&fx, fctx, 0);
     assert!(!fx.upper_dir.join("b.txt").exists());
     let overlay = fx.registry.get("wt-1").unwrap();
-    assert!(matches!(overlay.resolve("b.txt").unwrap(), Resolution::Lower { .. }));
+    assert_eq!(overlay.resolve("b.txt").unwrap(), Resolution::Whiteout);
 }
 
 #[test]
@@ -762,6 +764,70 @@ fn mixed_checkout_empty_nested_and_nonempty_files_end_clean() {
         vec!["empty.txt"]
     );
     assert_eq!(overlay.read("empty.txt").unwrap().as_deref(), Some(&b""[..]));
+}
+
+/// B100100 R2 回归：create→write→delete-on-close 不得残留 create 当场留下的
+/// 状态——NotFound 占位连带 stat/dedupe 删除（幽灵空文件会让后续 CREATE_NEW
+/// collision）；whiteout 已撤销的模板路径重新记 whiteout，lower 内容不复活。
+#[test]
+fn staged_delete_on_close_cleans_state_left_by_create() {
+    let fx = fixture_with_empty();
+    let overlay = fx.registry.get("wt-1").unwrap();
+
+    // NotFound 变体（模板外新路径）：占位删除 + 后续 CREATE_NEW 不 collision
+    let fctx = create_file(&fx, "\\wt-1\\brand-new.txt");
+    write(&fx, &fctx, b"temp");
+    let path = "\\wt-1\\brand-new.txt";
+    fx.ctx.set_delete(&fctx, &p(path), true).unwrap();
+    cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    assert_eq!(
+        overlay.resolve("brand-new.txt").unwrap(),
+        Resolution::NotFound,
+        "delete-on-close 后不得残留幽灵占位"
+    );
+    assert!(!fx.upper_dir.join("brand-new.txt").exists());
+    let recreated = create_file(&fx, path);
+    cleanup(&fx, recreated, 0);
+    assert!(matches!(
+        overlay.resolve("brand-new.txt").unwrap(),
+        Resolution::Upper { .. }
+    ));
+
+    // whiteout 变体（模板覆盖空 blob）：unlink → create 撤销 whiteout →
+    // 暂存写 → delete-on-close：重新记 whiteout，lower 内容不复活
+    let path = "\\wt-1\\empty.txt";
+    let unlink = open(&fx, path).unwrap();
+    fx.ctx.set_delete(&unlink, &p(path), true).unwrap();
+    cleanup(&fx, unlink, FspCleanupFlags::FspCleanupDelete as u32);
+    let fctx = create_file(&fx, path);
+    write(&fx, &fctx, b"temporary");
+    fx.ctx.set_delete(&fctx, &p(path), true).unwrap();
+    cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    assert_eq!(
+        overlay.resolve("empty.txt").unwrap(),
+        Resolution::Whiteout,
+        "已删除内容不得回落 lower 复活"
+    );
+    assert!(!fx.upper_dir.join("empty.txt").exists());
+
+    // whiteout 变体（非空模板 b.txt）：同序列同语义
+    let path = "\\wt-1\\b.txt";
+    let unlink = open(&fx, path).unwrap();
+    fx.ctx.set_delete(&unlink, &p(path), true).unwrap();
+    cleanup(&fx, unlink, FspCleanupFlags::FspCleanupDelete as u32);
+    let fctx = create_file(&fx, path);
+    write(&fx, &fctx, b"temporary");
+    fx.ctx.set_delete(&fctx, &p(path), true).unwrap();
+    cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
+    assert_eq!(overlay.resolve("b.txt").unwrap(), Resolution::Whiteout);
+    assert!(!fx.upper_dir.join("b.txt").exists());
+
+    // 对照：正常 checkout 序列（无 delete-on-close）不受影响
+    checkout_rewrite(&fx, "nested/empty.txt", None);
+    assert!(matches!(
+        overlay.resolve("nested/empty.txt").unwrap(),
+        Resolution::Lower { .. }
+    ));
 }
 
 #[test]

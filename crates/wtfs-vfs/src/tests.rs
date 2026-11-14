@@ -10,10 +10,12 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{DirInfo, FileSecurity, FileInfo, FileSystemContext, VolumeInfo};
+use winfsp::FspError;
 use winfsp::U16CString;
+use windows::Win32::Foundation::STATUS_NOT_SAME_DEVICE;
 use wtfs_core::{
-    Db, DedupeState, Overlay, OverlayConfig, OverlayStore, Resolution, SqliteOverlayStore,
-    TemplateFile, WorktreeId,
+    Db, DedupeState, MarkerStore, Overlay, OverlayConfig, OverlayStore, Resolution,
+    SqliteOverlayStore, TemplateFile, WorktreeId, marker_root_for_upper,
 };
 
 use crate::context::{
@@ -272,6 +274,11 @@ fn parse_entries(buffer: &[u8]) -> Vec<String> {
 
 fn drain_events(fx: &Fixture) -> Vec<crate::NotifyEvent> {
     std::iter::from_fn(|| fx.ctx.notify_hub().pop()).collect()
+}
+
+/// 该 fixture 的标记树根（upper 同根：`<dir>/meta`，M12）。
+fn marker_root(fx: &Fixture) -> PathBuf {
+    marker_root_for_upper(&fx.upper_dir)
 }
 
 #[test]
@@ -586,8 +593,10 @@ fn whiteout_delete_and_recreate() {
     cleanup(&fx, fctx, FspCleanupFlags::FspCleanupDelete as u32);
     assert!(sec(&fx, "\\wt-1\\b.txt").is_err());
     assert_eq!(overlay.resolve("b.txt").unwrap(), Resolution::Whiteout);
-    let whites = overlay.store().whiteouts(WorktreeId(1)).unwrap();
-    assert!(whites.contains("b.txt"));
+    assert!(
+        marker_root(&fx).join("whiteouts").join("b.txt").is_file(),
+        "删除 lower 文件必须落 whiteout 标记文件"
+    );
 
     // 目录非空不可删
     let dctx = open(&fx, "\\wt-1\\a").unwrap();
@@ -639,13 +648,13 @@ fn zero_write_create_clears_checkout_whiteout_for_template_empty_file() {
     assert_eq!(overlay.io_stats().fsyncs(), 0, "空 blob 回落 lower 零 fsync");
     assert_eq!(overlay.io_stats().upper_writes(), 0, "空 blob 零 upper 物化");
 
-    // whiteout 撤销后零残留（M11：决策不落库，视图回落 lower 即语义）。
+    // whiteout 撤销后零残留（视图回落 lower，标记文件已删）。
     overlay.mark_ready().unwrap();
     assert!(matches!(
         overlay.resolve("empty.txt").unwrap(),
         Resolution::Lower { .. }
     ));
-    assert!(overlay.store().whiteouts(WorktreeId(1)).unwrap().is_empty());
+    assert!(MarkerStore::new(marker_root(&fx)).load().unwrap().whites.is_empty());
 }
 
 /// 嵌套空文件（git 先 mkdir 子目录再写）：同样必须恢复可见。
@@ -879,9 +888,11 @@ fn set_delete_allows_empty_worktree_root_and_unregisters_on_cleanup() {
             .iter()
             .any(|e| e.name == "\\wt-1" && e.action == FILE_ACTION_REMOVED)
     );
-    // overlay DB 行已删（级联清子表），upper 物理目录保留为孤儿——由
-    // `wtfs gc` 回收（spec §6.6，与 daemon watcher 注销路径一致）
+    // overlay DB 行已删，标记树整树删除（M12：注销后无残留）；upper 物理
+    // 目录保留为孤儿——由 `wtfs gc` 回收（spec §6.6，与 daemon watcher
+    // 注销路径一致）
     assert_eq!(overlay.store().state(WorktreeId(1)).unwrap(), None);
+    assert!(!marker_root(&fx).exists(), "注销必须整树删除标记");
     assert!(fx.upper_dir.exists(), "upper 目录留给 gc");
 }
 
@@ -909,21 +920,30 @@ fn rename_file_and_directory() {
         .iter()
         .any(|e| e.action == FILE_ACTION_RENAMED_NEW_NAME && e.name == "\\wt-1\\c.txt"));
 
-    // 目录级：rename map
+    // 目录级（lower 有内容）：M12 起 EXDEV（NTSTATUS STATUS_NOT_SAME_DEVICE），
+    // 调用方按跨设备语义退化为递归复制+删除；源目录与标记树保持原样。
     let dctx = open(&fx, "\\wt-1\\a").unwrap();
-    fx.ctx
+    let err = fx
+        .ctx
         .rename(&dctx, &p("\\wt-1\\a"), &p("\\wt-1\\z"), false)
-        .unwrap();
-    assert!(sec(&fx, "\\wt-1\\a").is_err());
-    assert!(sec(&fx, "\\wt-1\\z").is_ok());
-    let fctx = open(&fx, "\\wt-1\\z\\1.txt").unwrap();
-    assert_eq!(read_via(&fx, &fctx, 16), ONE.to_vec());
+        .unwrap_err();
+    let FspError::NTSTATUS(code) = err else {
+        panic!("expected NTSTATUS error, got {err:?}");
+    };
+    assert_eq!(code, STATUS_NOT_SAME_DEVICE.0, "目录 rename 必须报 EXDEV");
+    assert!(sec(&fx, "\\wt-1\\a").is_ok(), "EXDEV 后源目录保持原样");
+    assert!(sec(&fx, "\\wt-1\\z").is_err());
+    assert!(
+        MarkerStore::new(marker_root(&fx)).load().unwrap().redirects.is_empty()
+            && MarkerStore::new(marker_root(&fx)).load().unwrap().opaques.is_empty(),
+        "EXDEV 不新增 redirect/opaque 标记（whiteout 仅来自前面的文件级 rename）"
+    );
 
-    // 目标已存在且不允许替换 → collision
+    // 目标已存在且不允许替换 → collision（lower 内容也计入存在）
     let fctx = open(&fx, "\\wt-1\\c.txt").unwrap();
     assert!(fx
         .ctx
-        .rename(&fctx, &p("\\wt-1\\c.txt"), &p("\\wt-1\\z\\2.txt"), false)
+        .rename(&fctx, &p("\\wt-1\\c.txt"), &p("\\wt-1\\a\\2.txt"), false)
         .is_err());
 }
 
@@ -1273,8 +1293,8 @@ fn clean_checkout_via_vfs_creates_zero_upper_files_and_zero_fsyncs() {
     );
     assert_eq!(count_files(&fx.upper_dir), 0, "upper 整棵零文件（含零临时副本）");
     overlay.mark_ready().unwrap();
-    // M11：决策不落库；mark_ready 后视图回落 lower、零 whiteout 行。
-    assert!(overlay.store().whiteouts(WorktreeId(1)).unwrap().is_empty());
+    // 干净 checkout 零删除标记（M12：标记树为空）。
+    assert!(MarkerStore::new(marker_root(&fx)).load().unwrap().blockers().is_empty());
     for rel in ["a/1.txt", "a/2.txt", "b.txt", "exec.sh"] {
         assert!(matches!(overlay.resolve(rel).unwrap(), Resolution::Lower { .. }));
     }

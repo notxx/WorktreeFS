@@ -192,6 +192,30 @@ impl MarkerStore {
         Ok(MarkerState { whites, redirects })
     }
 
+    /// 把 upper 内标记同步为 `whites` 集合（mark_ready 时一次性物化缓冲的
+    /// 删除标记）：补建缺失、删除多余；返回新建的标记数。空集 = 清空全部
+    /// 标记 = 零创建。
+    pub fn sync(&self, whites: &HashSet<String>) -> Result<usize> {
+        let on_disk = {
+            let mut whites_disk = HashSet::new();
+            walk_upper_markers(&self.upper_root, "", &mut whites_disk)?;
+            whites_disk
+        };
+        let mut created = 0usize;
+        for rel in whites {
+            if !on_disk.contains(rel) {
+                self.create_whiteout(rel)?;
+                created += 1;
+            }
+        }
+        for rel in &on_disk {
+            if !whites.contains(rel) {
+                self.remove_whiteout(rel)?;
+            }
+        }
+        Ok(created)
+    }
+
     /// 清扫全部标记（同 id 重新注册时防旧墓碑复活）：upper 内 `.wh.*`
     /// （只删空目录，不触碰真实内容）+ meta/redirect 整树。
     pub fn clear(&self) -> Result<()> {

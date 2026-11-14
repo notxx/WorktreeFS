@@ -290,12 +290,12 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// v3 → v4（M12/B120100）：`whiteouts` / `renames` 行转成 worktree 目录下
-/// 的镜像标记树，然后 DROP 两张表。
+/// v3 → v4（M12/B120100）：`whiteouts` / `renames` 行转成 upper 层内的
+/// OverlayFS 同款标记，然后 DROP 两张表。
 ///
 /// 转换规则：
-/// * `whiteouts(worktree_id, path)` → `<upper 父目录>/meta/whiteouts/<path>`
-///   0 字节标记文件；
+/// * `whiteouts(worktree_id, path)` → `upper/parent(path)/.wh.<basename(path)>`
+///   0 字节标记文件（in-parent，与运行期 [`crate::overlay_markers`] 一致）；
 /// * `renames(worktree_id, from_path, to_path)` → `<...>/meta/redirect/<to_path>`
 ///   标记文件（内容 = from_path）。旧 `from_path` 侧的"已搬走"不可见语义由
 ///   redirect 映射本身给出（解析时 [`crate::overlay::map_to_lower_with`] 的

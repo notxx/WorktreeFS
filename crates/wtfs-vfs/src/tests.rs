@@ -888,9 +888,9 @@ fn set_delete_allows_empty_worktree_root_and_unregisters_on_cleanup() {
             .iter()
             .any(|e| e.name == "\\wt-1" && e.action == FILE_ACTION_REMOVED)
     );
-    // overlay DB 行已删，标记树整树删除（M12：注销后无残留）；upper 物理
-    // 目录保留为孤儿——由 `wtfs gc` 回收（spec §6.6，与 daemon watcher
-    // 注销路径一致）
+    // overlay DB 行已删（unregister 只删行，M12 v4 无子表）；标记（upper 内
+    // `.wh.*`）与 upper 物理目录保留为孤儿——由 `wtfs gc` 整体回收
+    // （spec §6.6，与 daemon watcher 注销路径一致）
     assert_eq!(overlay.store().state(WorktreeId(1)).unwrap(), None);
     // 标记（upper 内 `.wh.*`）随 upper 目录留给 `wtfs gc` 整体回收；同 id
     // 重新注册时由 MarkerStore::clear 清扫（core 回归覆盖）。

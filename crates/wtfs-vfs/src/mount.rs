@@ -137,7 +137,7 @@ fn restore_mount_point_dir(dir: &Path) -> std::io::Result<()> {
 /// 卷参数：512B 扇区 / 8 扇区块、255 组件长度、保留大小写 + Unicode、
 /// 卷序列号来自 [`VfsRegistry`] 配置、`post_cleanup_when_modified_only`
 /// 减少冗余 Cleanup。`file_info_timeout` 1000ms（WinFSP 默认节拍），配合
-/// 固定 stat/逻辑 mtime 足够 git 正确性。
+/// 固定 stat/真实 mtime 足够 git 正确性。
 pub fn mount_directory(
     mount_point: &Path,
     registry: Arc<VfsRegistry>,

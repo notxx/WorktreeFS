@@ -16,7 +16,8 @@
 //! * `Initializing`（checkout 流）：内容先暂存（内存，>32MiB 溢写
 //!   `.wtfs-tmp-w-*` 隐藏文件），暂存期流式算好 blake3。Git 在 close 前
 //!   `fstat`，[`FileContext`] 投影最终 stat——内容与模板一致时报固定 stat
-//!   （与 ready 后 lower 一致，index 对齐），否则报逻辑 mtime。cleanup/flush
+//!   （与 ready 后 lower 一致，index 对齐），否则报当下时间（M11：终裁后
+//!   upper 以真实 mtime 呈现）。cleanup/flush
 //!   时经 [`wtfs_core::Overlay::finish_staged`] 直接终裁（M9/B090100 零拷贝：
 //!   一致 → 丢弃暂存回落 lower，零 upper 文件、零 fsync、零临时副本；不同 →
 //!   溢写同卷改名 / 内存经临时文件原子改名 upper，恰好一次 fsync）。判定
@@ -361,7 +362,9 @@ impl FileContext {
     }
 
     /// 投影 stat（暂存句柄的 get_file_info）：内容与模板一致 → 固定 lower
-    /// stat（与 ready 后 core 报告一致，index 对齐）；否则逻辑 mtime。
+    /// stat（与 ready 后 core 报告一致，index 对齐）；否则报当下时间
+    /// （真实物化后的 upper mtime ≈ 此刻；只读投影不持久，不一致场景 git
+    /// 在 status 时回退全量哈希，正确性不受影响）。
     fn projected_stat(&self, overlay: &Overlay, staged: &StagedWrite) -> Result<Stat, FspError> {
         let rel = self.rel.as_str();
         let vs = u64::from(overlay.config().volume_serial);
@@ -376,25 +379,27 @@ impl FileContext {
                 .is_some_and(|(t, h)| h == t.hash);
         if matches_template {
             let t = template.as_ref().expect("checked above");
-            return Ok(Stat::fixed_lower(vs, ino, t.mode, t.size));
+            let epoch = overlay.config().fixed_stat_epoch_ns;
+            return Ok(Stat {
+                dev: vs,
+                ino,
+                mode: t.mode,
+                size: t.size,
+                mtime_ns: epoch,
+                ctime_ns: epoch,
+            });
         }
-        // 与模板不一致：报逻辑 mtime（与 core 的发放时钟对齐；只读投影不持久，
-        // 不一致场景 git 在 status 时回退全量哈希，正确性不受影响）。
+        // 与模板不一致：报当下时间（与 core 的真实 mtime 语义对齐）。
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as i64);
-        let last = overlay
-            .store()
-            .max_stat_mtime(overlay.worktree_id())
-            .map_err(fsp_err)?;
-        let mtime = now.max(last.unwrap_or(0) + 1);
         Ok(Stat {
             dev: vs,
             ino,
             mode: template.map_or(0o100644, |t| t.mode),
             size: staged.size,
-            mtime_ns: mtime,
-            ctime_ns: mtime,
+            mtime_ns: now,
+            ctime_ns: now,
         })
     }
 
@@ -1151,17 +1156,22 @@ impl FileSystemContext for WtfsContext {
         let _ = file_attributes; // M0：READONLY 等属性位不落 overlay
         let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
         // 句柄级操作，不做 initializing 门控（git checkout 的 utime 走这里）。
-        // upper 文件的逻辑 mtime 更新（git 回写 index mtime 走这里；
-        // lower 文件固定 stat 不变）。
+        // upper 文件的真实 mtime 更新（git 回写 index mtime 走这里）：直接
+        // 落到 upper 物理文件（M11：无 stat_cache；stat 推导自真实 mtime，
+        // index 与后续 FS stat 天然一致）。lower/whiteout 路径不动——模板树
+        // 跨 worktree 共享，绝不修改；固定 epoch 保持不变（git 不一致时
+        // 重哈希自愈，正确性不受影响）。
         if last_write_time != 0 && !context.is_dir {
             let mtime_ns = unix_ns_from_filetime(last_write_time);
-            let existing = overlay.store().stat_entry(overlay.worktree_id(), &context.rel);
-            if let Ok(Some(entry)) = existing {
-                let _ = overlay.store().set_stat_entry(
-                    overlay.worktree_id(),
-                    &context.rel,
-                    wtfs_core::StatCacheEntry { mtime_ns, ..entry },
-                );
+            let upper = overlay.upper_abs(&context.rel);
+            if upper.symlink_metadata().map(|m| !m.is_dir()).unwrap_or(false) {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&upper)
+                    .and_then(|f| {
+                        f.set_modified(SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_nanos(mtime_ns.max(0) as u64))
+                    });
             }
         }
         let st = context.handle_stat()?;

@@ -3,43 +3,45 @@
 //! * 解析顺序：upper > whiteout > lower；目录 = lower ∪ upper 再剔除 whiteout。
 //! * 目录级重命名走 rename map（lower 侧路径改写），文件级 = whiteout + upper 搬移。
 //! * 写入路径 dedupe：流式写临时文件并同步 blake3，与模板一致则丢弃副本回落
-//!   lower（[`crate::DedupeState::Lower`]），不同则落 upper；模板缺失时全部
-//!   upper（全量 copy 兜底），绝不丢数据。
-//! * stat：lower 文件固定 dev/ino/mtime/ctime（size/mode 来自模板），upper 文件
-//!   用单调递增的逻辑 mtime，目录按 `0o040755` 报告。VFS（M3）经
-//!   [`Overlay::stat`]/[`Overlay::attributes_for`] 拿到 WinFSP 需要的稳定值。
+//!   lower，不同则落 upper；模板缺失时全部 upper（全量 copy 兜底），绝不丢数据。
+//! * stat 纯推导（M11/B110100，OverlayFS 三态口径）：lower 文件固定
+//!   dev/ino/mtime/ctime（size/mode 来自模板，mtime = per-worktree epoch）；
+//!   upper 文件/目录 = 真实文件系统 mtime；ino = 路径稳定哈希（根目录固定值）；
+//!   whiteout/not-found → None。**零写副作用、零 DB 读**：whiteouts/renames
+//!   打开时一次性缓存进内存（写路径同步镜像 DB，M12 前表保留），模板清单在
+//!   打开时构建成目录索引（目录集合 + 每目录子项），status/list 热路径不再
+//!   逐 entry 查库。
 //! * M8/B080100 批量元数据：`initializing` 阶段（对 readdir 隐藏的安全批量窗口）
-//!   把 `file_ids` / `dedupe` / `stat_cache` / `whiteouts` / `renames` 全部累积在
-//!   内存（[`InitBatch`]），**每文件零事务、零 DB 读**；[`Overlay::mark_ready`]
-//!   在单个 SQLite 事务内整批落库并切 ready（崩溃安全：提交前崩溃保持
-//!   initializing、upper 文件完整，缓冲丢失可接受，spec §6.3.6）。ready 后的
-//!   编辑回到逐操作持久化（spec 允许）。initializing 标志缓存在内存，per-file
-//!   操作不再查询 `worktrees.status`；fresh checkout 的 renames/whiteouts 读
-//!   全程不触 DB。
-//! * 逻辑 mtime 用进程内原子时钟（[`Overlay::mtime_clock`]）：打开时从
-//!   `MAX(mtime_ns)` 初始化一次，原子推进（同进程严格单调），随 stat_cache
-//!   落库持久化；逐 upper 写的 `SELECT MAX(mtime_ns)` 已移除。
+//!   把 whiteouts / renames 累积在内存（[`InitBatch`]），**每文件零事务、零 DB
+//!   读**；[`Overlay::mark_ready`] 在单个 SQLite 事务内整批落库并切 ready
+//!   （崩溃安全：提交前崩溃保持 initializing、upper 文件完整，缓冲丢失可接受，
+//!   spec §6.3.6）。ready 后的编辑回到逐操作持久化（spec 允许）。initializing
+//!   标志缓存在内存，per-file 操作不再查询 `worktrees.status`。
 //! * M9/B090100 暂存写零拷贝终裁：[`Overlay::finish_staged`] 接收暂存期已
 //!   流式算好的哈希/长度/内容（内存或溢写路径），一致 → 丢弃回落 lower
 //!   （零 upper 文件、零 fsync、零临时副本）；否则溢写同卷改名 / 内存经
 //!   TEMP_PREFIX 临时文件原子改名，恰好一次 fsync。[`Overlay::write_from`]
 //!   保留给 ready 就地与通用写；[`OverlayIoStats`] 插桩 upper 物化与 fsync
 //!   次数（测试/诊断）。
+//! * M11：`dedupe` / `file_ids` / `stat_cache` 三张派生表删除（schema v3）。
+//!   写入决策仍然当场计算（决定内容回落 lower 还是留 upper），只是不再落库
+//!   ——upper 物理文件存在即 Upper、缺失即 Lower，状态天然可推导；copy-up /
+//!   lower 经 rename 落 upper 的内容与模板一致，mtime 归一到 per-worktree
+//!   epoch，index 对齐不因 copy-up 破坏。
 //!
 //! 约定：upper 根下以 `.wtfs-tmp` 开头的名字是写入临时文件，对视图不可见；
 //! 写入请求若使用该前缀名会被拒绝。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::overlay_batch::InitBatch;
-use crate::overlay_store::{SqliteOverlayStore, StatCacheEntry};
+use crate::overlay_store::{SqliteOverlayStore, derive_ino};
 use crate::{
     DedupeState, Error, FileAttributes, FileHash, FileHashMap, OverlayConfig, OverlayStore,
     Result, Stat, TemplateFile, WorktreeId, validate_relative_path,
@@ -97,7 +99,7 @@ impl OverlayIoStats {
     }
 }
 
-/// overlay 根目录的稳定 ino（`""` 不入 `file_ids` 表）。
+/// overlay 根目录的固定 ino（路径哈希前的特例值）。
 pub const ROOT_FILE_ID: u64 = 1;
 
 /// 解析结果（spec §6.5）。
@@ -199,46 +201,106 @@ fn join_rel(dir: &str, name: &str) -> String {
     }
 }
 
-fn now_unix_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64)
-}
-
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// overlay 视图：config + lower 模板清单 + 元数据存储 + initializing 内存批量缓冲。
+/// lower（模板清单）的内存索引：文件表 + 目录集合 + 每目录直接子项。
+/// Overlay 打开时一次构建（O(模板文件数)）；解析/枚举/stat 全部内存查询——
+/// 旧的"list 全表前缀过滤"与"has_lower_dir 逐 key starts_with"分别被
+/// O(子项数) 与 O(1) 取代。
+#[derive(Debug)]
+struct LowerIndex {
+    files: FileHashMap,
+    /// 全部目录路径（不含根 `""`）；`a/b.txt` 注册 `a`。
+    dirs: HashSet<String>,
+    /// 目录 → 直接子项（name → kind）；根目录键 `""`。
+    children: HashMap<String, BTreeMap<String, EntryKind>>,
+}
+
+impl LowerIndex {
+    fn build(files: FileHashMap) -> Self {
+        let mut dirs = HashSet::new();
+        let mut children: HashMap<String, BTreeMap<String, EntryKind>> = HashMap::new();
+        for path in files.keys() {
+            let comps: Vec<&str> = path.split('/').collect();
+            let mut parent = String::new();
+            for (i, comp) in comps.iter().enumerate() {
+                let is_last = i + 1 == comps.len();
+                children
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(
+                        (*comp).to_string(),
+                        if is_last { EntryKind::File } else { EntryKind::Directory },
+                    );
+                if !is_last {
+                    parent = if parent.is_empty() {
+                        (*comp).to_string()
+                    } else {
+                        format!("{parent}/{comp}")
+                    };
+                    dirs.insert(parent.clone());
+                }
+            }
+        }
+        Self { files, dirs, children }
+    }
+
+    fn file(&self, mapped: &str) -> Option<&TemplateFile> {
+        self.files.get(mapped)
+    }
+
+    fn has_dir(&self, mapped: &str) -> bool {
+        self.dirs.contains(mapped)
+    }
+
+    fn has_file_or_dir(&self, mapped: &str) -> bool {
+        self.files.contains_key(mapped) || self.dirs.contains(mapped)
+    }
+
+    fn children_of(&self, mapped: &str) -> Option<&BTreeMap<String, EntryKind>> {
+        self.children.get(mapped)
+    }
+}
+
+/// overlay 视图：config + lower 模板索引 + 元数据存储 + whiteout/rename 内存缓存。
 pub struct Overlay {
     config: OverlayConfig,
-    lower: Option<Arc<FileHashMap>>,
+    /// lower 模板索引；`None` = 无模板（全量 copy 模式）。
+    lower: Option<LowerIndex>,
     store: Arc<SqliteOverlayStore>,
-    /// initializing 标志与元数据缓冲（同锁）：标志缓存自 worktrees.status，
-    /// per-file 操作不再查库；batch 为 `Some` 当且仅当 initializing。
+    /// initializing 标志 + whiteout/rename 内存缓存（同锁）：标志缓存自
+    /// worktrees.status；initializing 期 whiteouts/renames 累积在 batch，
+    /// ready 后读缓存、写路径同步镜像 DB。per-file 操作不再查库。
     init_meta: Mutex<InitMeta>,
-    /// 逻辑 mtime 时钟（Unix 纳秒）：打开时从 `MAX(mtime_ns)` 初始化一次，
-    /// 此后 `max(now, prev+1)` 原子推进；随 stat_cache 落库持久化。
-    mtime_clock: AtomicI64,
     /// I/O 插桩计数（upper 物化 / fsync；测试与诊断用）。
     io: OverlayIoStats,
 }
 
-/// [`Overlay::init_meta` 的守卫状态]：initializing 标志 + 可缺省的批量缓冲。
+/// [`Overlay::init_meta` 的守卫状态]：initializing 标志 + whiteout/rename 视图。
+///
+/// * initializing：权威视图在 `batch`（mark_ready 整批落库）。
+/// * ready：`whites`/`renames` 为打开时从 DB 一次性装载的缓存；写路径
+///   先更新缓存再镜像 DB（缓存与表保持一致）。
 #[derive(Debug, Default)]
 struct InitMeta {
     initializing: bool,
-    /// initializing 期的权威元数据视图；ready/failed 后为 `None`
-    ///（该阶段回逐操作持久化，直接读写 store）。
+    /// initializing 期的权威元数据视图；ready/failed 后为 `None`。
     batch: Option<InitBatch>,
+    /// whiteout 集合（lower 命名空间路径）。
+    whites: HashSet<String>,
+    /// 目录重命名映射 (from → to)，保持插入序（与 store 读取序一致）。
+    renames: Vec<(String, String)>,
 }
 
-/// 元数据操作的二选一上下文：initializing = 持锁内存缓冲（零 DB）；
-/// ready = 直连 store（逐操作持久化）。由 [`Overlay::meta_ctx`] 在锁内判定，
-/// 不存在"初始化中但缓冲缺席"的中间态。
+/// 元数据操作的上下文：initializing = 持锁内存缓冲（零 DB）；
+/// ready = 持锁缓存 + 直连 store 镜像（逐操作持久化）。由
+/// [`Overlay::meta_ctx`] 在锁内判定，不存在"初始化中但缓冲缺席"的中间态。
 enum MetaCtx<'a> {
     Init {
         guard: MutexGuard<'a, InitMeta>,
     },
     Ready {
+        guard: MutexGuard<'a, InitMeta>,
         id: WorktreeId,
         store: &'a SqliteOverlayStore,
     },
@@ -265,76 +327,19 @@ impl<'a> MetaCtx<'a> {
         }
     }
 
-    /// 全部目录重命名映射 (from → to)。
-    fn renames(&self) -> Result<Vec<(String, String)>> {
+    /// 全部目录重命名映射 (from → to)；内存视图，零 DB。
+    fn renames(&self) -> &[(String, String)] {
         match self {
-            MetaCtx::Init { .. } => Ok(self.batch().renames()),
-            MetaCtx::Ready { store, id } => store.renames(*id),
+            MetaCtx::Init { .. } => self.batch().renames(),
+            MetaCtx::Ready { guard, .. } => &guard.renames,
         }
     }
 
-    /// 全部 whiteout（lower 命名空间路径）。fresh checkout 下为空集合、零 DB 读。
-    fn whiteouts(&self) -> Result<HashSet<String>> {
+    /// 全部 whiteout（lower 命名空间路径）；内存视图，零 DB。
+    fn whites(&self) -> &HashSet<String> {
         match self {
-            MetaCtx::Init { .. } => Ok(self.batch().whiteouts()),
-            MetaCtx::Ready { store, id } => store.whiteouts(*id),
-        }
-    }
-
-    /// 稳定 file id：initializing 期纯内存派生 + 探测；ready 后持久映射落库。
-    fn file_id(&mut self, path: &str) -> Result<u64> {
-        validate_relative_path(path)?;
-        match self {
-            MetaCtx::Init { .. } => Ok(self.batch_mut().file_id(path)),
-            MetaCtx::Ready { store, id } => store.file_id(*id, path),
-        }
-    }
-
-    fn stat_entry(&self, path: &str) -> Result<Option<StatCacheEntry>> {
-        match self {
-            MetaCtx::Init { .. } => Ok(self.batch().stat_entry(path)),
-            MetaCtx::Ready { store, id } => store.stat_entry(*id, path),
-        }
-    }
-
-    fn set_stat_entry(&mut self, path: &str, entry: StatCacheEntry) -> Result<()> {
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().set_stat_entry(path, entry);
-                Ok(())
-            }
-            MetaCtx::Ready { store, id } => store.set_stat_entry(*id, path, entry),
-        }
-    }
-
-    /// 删除一条 stat 缓存；缓冲无条目时为 no-op（M8：per-file 无用功短路）。
-    fn remove_stat_entry(&mut self, path: &str) -> Result<()> {
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().remove_stat_entry(path);
-                Ok(())
-            }
-            MetaCtx::Ready { store, id } => store.remove_stat_entry(*id, path),
-        }
-    }
-
-    fn record_dedupe_state(&mut self, path: &str, state: DedupeState) -> Result<()> {
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().record_dedupe(path, state);
-                Ok(())
-            }
-            MetaCtx::Ready { store, id } => store.record_dedupe_state(*id, path, state),
-        }
-    }
-
-    fn remove_dedupe(&mut self, path: &str) -> Result<()> {
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().remove_dedupe(path);
-                Ok(())
-            }
-            MetaCtx::Ready { store, id } => store.remove_dedupe(*id, path),
+            MetaCtx::Init { .. } => self.batch().whiteouts(),
+            MetaCtx::Ready { guard, .. } => &guard.whites,
         }
     }
 
@@ -345,11 +350,18 @@ impl<'a> MetaCtx<'a> {
                 self.batch_mut().add_whiteout(path);
                 Ok(())
             }
-            MetaCtx::Ready { store, id } => store.add_whiteout(*id, path),
+            MetaCtx::Ready { guard, id, store } => {
+                // 缓存未命中 = DB 也没有（缓存是打开时装载 + 写路径镜像）：
+                // 跳过事务（M8 无用功短路的延伸）。
+                if guard.whites.insert(path.to_string()) {
+                    store.add_whiteout(*id, path)?;
+                }
+                Ok(())
+            }
         }
     }
 
-    /// 撤销 whiteout；缓冲无条目时为 no-op（M8：per-file 无用功短路）。
+    /// 撤销 whiteout；缓存无条目时零事务（M8：per-file 无用功短路）。
     fn remove_whiteout(&mut self, path: &str) -> Result<()> {
         validate_relative_path(path)?;
         match self {
@@ -357,54 +369,37 @@ impl<'a> MetaCtx<'a> {
                 self.batch_mut().remove_whiteout(path);
                 Ok(())
             }
-            MetaCtx::Ready { store, id } => store.remove_whiteout(*id, path),
+            MetaCtx::Ready { guard, id, store } => {
+                if guard.whites.remove(path) {
+                    store.remove_whiteout(*id, path)?;
+                }
+                Ok(())
+            }
         }
     }
 
     fn record_rename(&mut self, from: &str, to: &str) -> Result<()> {
         validate_relative_path(from)?;
         validate_relative_path(to)?;
+        if from == to {
+            return Err(Error::Overlay(format!(
+                "rename source and target are identical: {from}"
+            )));
+        }
         match self {
             MetaCtx::Init { .. } => {
-                if from == to {
-                    return Err(Error::Overlay(format!(
-                        "rename source and target are identical: {from}"
-                    )));
-                }
                 self.batch_mut().record_rename(from, to);
                 Ok(())
             }
-            MetaCtx::Ready { store, id } => store.record_rename(*id, from, to),
-        }
-    }
-
-    /// 删除 `dir` 及其子树的 dedupe / stat_cache 行。
-    fn remove_meta_subtree(&mut self, dir: &str) -> Result<()> {
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().remove_meta_subtree(dir);
-                Ok(())
+            MetaCtx::Ready { guard, id, store } => {
+                match guard.renames.iter_mut().find(|(f, _)| f == from) {
+                    Some(pair) => pair.1 = to.to_string(),
+                    None => guard.renames.push((from.to_string(), to.to_string())),
+                }
+                store.record_rename(*id, from, to)
             }
-            MetaCtx::Ready { store, id } => store.remove_meta_subtree(*id, dir),
         }
     }
-
-    /// 把 from（含子树）的 dedupe / stat_cache 键改写为 to。
-    fn rewrite_meta_prefix(&mut self, from: &str, to: &str) -> Result<()> {
-        match self {
-            MetaCtx::Init { .. } => {
-                self.batch_mut().rewrite_meta_prefix(from, to);
-                Ok(())
-            }
-            MetaCtx::Ready { store, id } => store.rewrite_meta_prefix(*id, from, to),
-        }
-    }
-}
-
-/// 打开时初始化一次逻辑 mtime 时钟：max(系统 now, DB 已发放最大值)。
-fn init_mtime_clock(store: &SqliteOverlayStore, id: WorktreeId) -> Result<i64> {
-    let db_max = store.max_stat_mtime(id)?.unwrap_or(0);
-    Ok(now_unix_ns().max(db_max))
 }
 
 impl Overlay {
@@ -416,23 +411,24 @@ impl Overlay {
         store: Arc<SqliteOverlayStore>,
     ) -> Result<Self> {
         store.register(&config)?;
-        let mtime_clock = init_mtime_clock(&store, config.worktree_id)?;
         Ok(Self {
-            config,
-            lower: lower_files.map(Arc::new),
+            lower: lower_files.map(LowerIndex::build),
             store,
             init_meta: Mutex::new(InitMeta {
                 initializing: true,
                 batch: Some(InitBatch::empty()),
+                whites: HashSet::new(),
+                renames: Vec::new(),
             }),
-            mtime_clock: AtomicI64::new(mtime_clock),
+            config,
             io: OverlayIoStats::default(),
         })
     }
 
     /// 重新挂到已注册的 worktree（崩溃恢复/重开视图）；未注册报 [`Error::NotFound`]。
-    /// initializing 行（崩溃于 ready 前）：一次性从 DB 装载既有元数据行为缓冲，
-    /// 之后继续零事务累积，mark_ready 时整批落库。
+    /// initializing 行（崩溃于 ready 前）：一次性从 DB 装载既有 whiteouts/
+    /// renames 为缓冲，之后继续零事务累积，mark_ready 时整批落库。
+    /// ready 行：whiteouts/renames 一次性装载进内存缓存（此后读路径零 DB）。
     pub fn reopen(
         config: OverlayConfig,
         lower_files: Option<FileHashMap>,
@@ -442,18 +438,19 @@ impl Overlay {
             .state(config.worktree_id)?
             .ok_or_else(|| Error::NotFound(format!("worktree {} not registered", config.worktree_id)))?;
         let initializing = state.hides_entries();
-        let batch = if initializing {
-            Some(InitBatch::load(&store, config.worktree_id)?)
+        let (batch, whites, renames) = if initializing {
+            let batch = InitBatch::load(&store, config.worktree_id)?;
+            let whites = batch.whiteouts().clone();
+            let renames = batch.renames().to_vec();
+            (Some(batch), whites, renames)
         } else {
-            None
+            (None, store.whiteouts(config.worktree_id)?, store.renames(config.worktree_id)?)
         };
-        let mtime_clock = init_mtime_clock(&store, config.worktree_id)?;
         Ok(Self {
-            config,
-            lower: lower_files.map(Arc::new),
+            lower: lower_files.map(LowerIndex::build),
             store,
-            init_meta: Mutex::new(InitMeta { initializing, batch }),
-            mtime_clock: AtomicI64::new(mtime_clock),
+            init_meta: Mutex::new(InitMeta { initializing, batch, whites, renames }),
+            config,
             io: OverlayIoStats::default(),
         })
     }
@@ -468,7 +465,7 @@ impl Overlay {
 
     /// lower 模板清单快照；`None` = 无模板（全量 copy 模式）。
     pub fn lower(&self) -> Option<&FileHashMap> {
-        self.lower.as_deref()
+        self.lower.as_ref().map(|idx| &idx.files)
     }
 
     pub fn worktree_id(&self) -> WorktreeId {
@@ -501,6 +498,10 @@ impl Overlay {
                 crate::WorktreeState::Ready,
             ) {
                 Ok(()) => {
+                    // 批量内容（whiteouts/renames）平移为 ready 缓存，
+                    // 之后读路径零 DB、写路径镜像 DB。
+                    guard.whites = batch.whiteouts().clone();
+                    guard.renames = batch.renames().to_vec();
                     guard.initializing = false;
                     Ok(())
                 }
@@ -531,14 +532,14 @@ impl Overlay {
         Ok(())
     }
 
-    /// 元数据操作上下文：initializing → 持锁缓冲；ready → 直连 store。
+    /// 元数据操作上下文：initializing → 持锁缓冲；ready → 持锁缓存 + store 镜像。
     fn meta_ctx(&self) -> MetaCtx<'_> {
         let guard = self.init_meta.lock();
         if guard.initializing {
             MetaCtx::Init { guard }
         } else {
-            drop(guard);
             MetaCtx::Ready {
+                guard,
                 id: self.config.worktree_id,
                 store: &self.store,
             }
@@ -568,25 +569,22 @@ impl Overlay {
     /// lower 命名空间改写；`MovedAway` 时写入场景退回原路径（upper 物理位置）。
     /// `ctx` 由调用方持有（勿经 [`Overlay::meta_ctx`] 重复加锁）。
     fn mapped_or_same(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<String> {
-        match map_to_lower_with(&ctx.renames()?, rel) {
+        match map_to_lower_with(ctx.renames(), rel) {
             LowerLookup::Same(s) | LowerLookup::Mapped(s) => Ok(s),
             LowerLookup::MovedAway => Ok(rel.to_string()),
         }
     }
 
     fn lookup_lower(&self, mapped: &str) -> Option<TemplateFile> {
-        self.lower.as_ref().and_then(|m| m.get(mapped)).cloned()
+        self.lower.as_ref().and_then(|m| m.file(mapped)).cloned()
     }
 
     fn has_lower_dir(&self, mapped: &str) -> bool {
-        match self.lower.as_ref() {
-            None => false,
-            Some(m) => m.keys().any(|k| k.starts_with(&format!("{mapped}/"))),
-        }
+        self.lower.as_ref().is_some_and(|m| m.has_dir(mapped))
     }
 
     fn lower_has_file_or_dir(&self, mapped: &str) -> bool {
-        self.lookup_lower(&mapped).is_some() || self.has_lower_dir(&mapped)
+        self.lower.as_ref().is_some_and(|m| m.has_file_or_dir(mapped))
     }
 
     /// lower（模板树）物理路径。
@@ -609,7 +607,8 @@ impl Overlay {
     // ---- 解析与枚举 ----
 
     /// 解析顺序：upper > whiteout > lower（spec §6.5）。`ctx` 由调用方持有，
-    /// 同一逻辑操作的元数据视图一致（initializing 期 = 内存缓冲，零 DB 读）。
+    /// 同一逻辑操作的元数据视图一致（initializing 期 = 内存缓冲，零 DB 读；
+    /// ready = 内存缓存，同样零 DB 读）。
     fn resolve_with(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<Resolution> {
         self.validate_rel_or_root(rel)?;
         if !rel.is_empty() && is_temp_name(basename(rel)) {
@@ -627,12 +626,12 @@ impl Overlay {
                 has_upper: true,
             });
         }
-        let mapped = match map_to_lower_with(&ctx.renames()?, rel) {
+        let mapped = match map_to_lower_with(ctx.renames(), rel) {
             LowerLookup::Same(s) | LowerLookup::Mapped(s) => s,
             LowerLookup::MovedAway => return Ok(Resolution::NotFound),
         };
-        let whites = ctx.whiteouts()?;
-        let blocked = whiteout_blocks(&mapped, &whites);
+        let whites = ctx.whites();
+        let blocked = whiteout_blocks(&mapped, whites);
         let lower_file = self.lookup_lower(&mapped);
         let has_lower_dir = !blocked && lower_file.is_none() && self.has_lower_dir(&mapped);
         let upper_is_dir = upper_path.is_dir();
@@ -668,44 +667,35 @@ impl Overlay {
     }
 
     /// 目录合并枚举；`initializing` 状态返回空（让 Git 通过"目录必须为空"检查），
-    /// 只读内存标志、零 DB。
+    /// 只读内存标志 + 内存 lower 索引 + 真实 upper 目录，零 DB。
     pub fn list(&self, dir_rel: &str) -> Result<Vec<OverlayDirEntry>> {
         self.validate_rel_or_root(dir_rel)?;
         if self.is_initializing()? {
             return Ok(Vec::new());
         }
         let ctx = self.meta_ctx();
-        let whites = ctx.whiteouts()?;
-        let renames = ctx.renames()?;
+        let whites = ctx.whites();
+        let renames = ctx.renames();
         let mut names: BTreeMap<String, EntryKind> = BTreeMap::new();
 
-        // lower 侧：模板清单按 dir 前缀取直接子项，逐名应用 whiteout。
-        match map_to_lower_with(&renames, dir_rel) {
+        // lower 侧：内存索引按目录取直接子项，逐名应用 whiteout。
+        match map_to_lower_with(renames, dir_rel) {
             LowerLookup::MovedAway => {}
             LowerLookup::Same(m) | LowerLookup::Mapped(m) => {
-                if !whiteout_blocks(&m, &whites) {
-                    let prefix = if m.is_empty() { String::new() } else { format!("{m}/") };
-                    if let Some(map) = self.lower.as_ref() {
-                        for path in map.keys() {
-                            let Some(rest) = path.strip_prefix(&prefix) else {
-                                continue;
-                            };
-                            if rest.is_empty() {
-                                continue;
+                if !whiteout_blocks(&m, whites) {
+                    if let Some(idx) = self.lower.as_ref() {
+                        if let Some(entries) = idx.children_of(&m) {
+                            for (name, kind) in entries {
+                                let mapped_name = if m.is_empty() {
+                                    name.clone()
+                                } else {
+                                    format!("{m}/{name}")
+                                };
+                                if whiteout_blocks(&mapped_name, whites) {
+                                    continue;
+                                }
+                                names.insert(name.clone(), *kind);
                             }
-                            let (name, kind) = match rest.split_once('/') {
-                                Some((seg, _)) => (seg, EntryKind::Directory),
-                                None => (rest, EntryKind::File),
-                            };
-                            let mapped_name = if m.is_empty() {
-                                name.to_string()
-                            } else {
-                                format!("{m}/{name}")
-                            };
-                            if whiteout_blocks(&mapped_name, &whites) {
-                                continue;
-                            }
-                            names.insert(name.to_string(), kind);
                         }
                     }
                 }
@@ -824,8 +814,7 @@ impl Overlay {
         if self.config.dedupe_enabled {
             if let Some(t) = &template_entry {
                 if t.hash == hash {
-                    let whites = ctx.whiteouts()?;
-                    if !ancestor_whiteout_blocks(&mapped, &whites) {
+                    if !ancestor_whiteout_blocks(&mapped, ctx.whites()) {
                         // 与模板一致且 lower 视图可见（路径自身的 whiteout 会被
                         // remove_whiteout 撤销）：丢弃副本回落 lower。
                         // copy-up 后改回模板内容同样回收。
@@ -833,9 +822,7 @@ impl Overlay {
                         if final_path.symlink_metadata().is_ok() {
                             std::fs::remove_file(&final_path)?;
                         }
-                        // 缓冲无条目时两者均为 no-op（M8：per-file 无用功短路）。
-                        ctx.remove_stat_entry(rel)?;
-                        ctx.record_dedupe_state(rel, DedupeState::Lower)?;
+                        // 缓存无条目时零事务（M8：per-file 无用功短路）。
                         ctx.remove_whiteout(&mapped)?;
                         return Ok((DedupeState::Lower, size));
                     }
@@ -844,7 +831,8 @@ impl Overlay {
                 }
             }
         }
-        // 落 upper（模板缺失 → 全量 copy 兜底，一样正确）。
+        // 落 upper（模板缺失 → 全量 copy 兜底，一样正确）；mtime = 真实文件
+        // mtime（rename 保留写入时刻），无需发放/落库。
         std::fs::rename(&tmp, &final_path)?;
         self.io.record_upper_write();
         let state = if template_entry.is_some() {
@@ -852,10 +840,7 @@ impl Overlay {
         } else {
             DedupeState::New
         };
-        ctx.record_dedupe_state(rel, state)?;
         ctx.remove_whiteout(&mapped)?;
-        let mtime = self.issue_logical_mtime();
-        ctx.set_stat_entry(rel, StatCacheEntry { mtime_ns: mtime, size, flags: 0 })?;
         Ok((state, size))
     }
 
@@ -872,9 +857,9 @@ impl Overlay {
     ///   最终 upper 路径，[`StagedContent::Memory`] 写 upper 内 TEMP_PREFIX
     ///   隐藏临时文件后原子改名（P2-1：两条路径的最终 upper 路径都零半截
     ///   文件），随后**恰好一次 fsync**（溢写先 fsync 再 rename：数据先于
-    ///   可见性落盘，崩溃不留半截可见文件）。记 `Upper`/`New`、撤销
-    ///   whiteout、发放逻辑 mtime（initializing 期进 InitBatch 内存缓冲，
-    ///   ready 后逐操作落库）。
+    ///   可见性落盘，崩溃不留半截可见文件）。记 `Upper`/`New` 决策、撤销
+    ///   whiteout（initializing 期进 InitBatch 内存缓冲，ready 后镜像落库）；
+    ///   mtime = 真实文件 mtime。
     ///
     /// `Spill` 的句柄必须已由调用方关闭。返回 (决策, 字节数)；失败时溢写
     /// 文件保留（调用方 best-effort 清理），upper 既有内容不受影响。
@@ -896,8 +881,7 @@ impl Overlay {
         let mapped = self.mapped_or_same(&ctx, rel)?;
         let template_entry = self.lookup_lower(&mapped);
         if self.config.dedupe_enabled && template_entry.as_ref().is_some_and(|t| t.hash == hash) {
-            let whites = ctx.whiteouts()?;
-            if !ancestor_whiteout_blocks(&mapped, &whites) {
+            if !ancestor_whiteout_blocks(&mapped, ctx.whites()) {
                 // 与模板一致且 lower 视图可见（路径自身的 whiteout 会被
                 // remove_whiteout 撤销）：丢弃暂存内容回落 lower。
                 if let StagedContent::Spill(spill) = &content {
@@ -906,9 +890,7 @@ impl Overlay {
                 if final_path.symlink_metadata().is_ok() {
                     std::fs::remove_file(&final_path)?;
                 }
-                // 缓冲无条目时两者均为 no-op（M8：per-file 无用功短路）。
-                ctx.remove_stat_entry(rel)?;
-                ctx.record_dedupe_state(rel, DedupeState::Lower)?;
+                // 缓存无条目时零事务（M8：per-file 无用功短路）。
                 ctx.remove_whiteout(&mapped)?;
                 return Ok((DedupeState::Lower, size));
             }
@@ -968,10 +950,7 @@ impl Overlay {
         } else {
             DedupeState::New
         };
-        ctx.record_dedupe_state(rel, state)?;
         ctx.remove_whiteout(&mapped)?;
-        let mtime = self.issue_logical_mtime();
-        ctx.set_stat_entry(rel, StatCacheEntry { mtime_ns: mtime, size, flags: 0 })?;
         Ok((state, size))
     }
 
@@ -987,7 +966,7 @@ impl Overlay {
     ///   staged 终裁落地），不物化空 upper。
     /// * NotFound（无模板覆盖，含全量 copy 兜底）：物化空 upper 占位文件
     ///   （plain create，无 fsync；持久性由后续写入的 staged 终裁或
-    ///   cleanup 的零写入终裁保证），记 `New` + 逻辑 mtime。
+    ///   cleanup 的零写入终裁保证）。
     /// * 其余（Upper/Lower/Directory）：已可解析，no-op。
     pub fn prepare_created_file(&self, rel: &str) -> Result<()> {
         self.validate_rel(rel)?;
@@ -1015,9 +994,6 @@ impl Overlay {
                 }
                 std::fs::File::create(&path)?;
                 self.io.record_upper_write();
-                let mtime = self.issue_logical_mtime();
-                ctx.set_stat_entry(rel, StatCacheEntry { mtime_ns: mtime, size: 0, flags: 0 })?;
-                ctx.record_dedupe_state(rel, DedupeState::New)?;
                 Ok(())
             }
             _ => Ok(()),
@@ -1025,6 +1001,9 @@ impl Overlay {
     }
 
     /// copy-up：lower 内容复制到 upper 以便就地修改；已在 upper 则返回其路径。
+    /// 刚复制的副本与模板内容一致，mtime 归一到 per-worktree epoch
+    /// （best-effort）——stat 在 copy-up 前后保持 lower 固定值，git index
+    /// 对齐不被 copy-up 打破；真实修改会自然刷新真实 mtime。
     pub fn copy_up(&self, rel: &str) -> Result<Option<PathBuf>> {
         self.validate_rel(rel)?;
         let final_path = self.upper_abs(rel);
@@ -1036,12 +1015,9 @@ impl Overlay {
                 }
                 std::fs::copy(&path, &final_path)?;
                 self.io.record_upper_write();
-                let size = std::fs::metadata(&final_path)?.len();
                 let mapped = self.mapped_or_same(&ctx, rel)?;
                 ctx.remove_whiteout(&mapped)?;
-                ctx.record_dedupe_state(rel, DedupeState::Upper)?;
-                let mtime = self.issue_logical_mtime();
-                ctx.set_stat_entry(rel, StatCacheEntry { mtime_ns: mtime, size, flags: 0 })?;
+                normalize_template_identical_mtime(&final_path, self.config.fixed_stat_epoch_ns);
                 Ok(Some(final_path))
             }
             Resolution::Upper { path } => Ok(Some(path)),
@@ -1057,8 +1033,6 @@ impl Overlay {
         match self.resolve_with(&ctx, rel)? {
             Resolution::Upper { .. } => {
                 std::fs::remove_file(&upper_path)?;
-                ctx.remove_stat_entry(rel)?;
-                ctx.remove_dedupe(rel)?;
                 let mapped = self.mapped_or_same(&ctx, rel)?;
                 if self.lower_has_file_or_dir(&mapped) {
                     ctx.add_whiteout(&mapped)?;
@@ -1069,7 +1043,6 @@ impl Overlay {
                 if has_upper {
                     std::fs::remove_dir_all(&upper_path)?;
                 }
-                ctx.remove_meta_subtree(rel)?;
                 let mapped = self.mapped_or_same(&ctx, rel)?;
                 if has_lower || self.lower_has_file_or_dir(&mapped) {
                     ctx.add_whiteout(&mapped)?;
@@ -1134,19 +1107,14 @@ impl Overlay {
                     std::fs::rename(&path, &to_upper)?;
                 } else {
                     std::fs::copy(&path, &to_upper)?;
+                    // lower 经 rename 落 upper：内容与模板一致，mtime 归一到
+                    // epoch（best-effort），index 对齐不因改名破坏。
+                    normalize_template_identical_mtime(&to_upper, self.config.fixed_stat_epoch_ns);
                 }
                 if self.lower_has_file_or_dir(&mapped_from) {
                     ctx.add_whiteout(&mapped_from)?;
                 }
                 ctx.remove_whiteout(&mapped_to)?;
-                ctx.rewrite_meta_prefix(from, to)?;
-                ctx.record_dedupe_state(to, DedupeState::Upper)?;
-                if !is_upper_src {
-                    // lower copy-up：新 upper 路径需要逻辑 mtime。
-                    let size = std::fs::metadata(&to_upper)?.len();
-                    let mtime = self.issue_logical_mtime();
-                    ctx.set_stat_entry(to, StatCacheEntry { mtime_ns: mtime, size, flags: 0 })?;
-                }
             }
             Resolution::Directory { has_lower, has_upper } => {
                 if has_upper {
@@ -1159,9 +1127,7 @@ impl Overlay {
                 if has_lower || self.lower_has_file_or_dir(&mapped_from) {
                     ctx.record_rename(&mapped_from, &mapped_to)?;
                 }
-                // upper 内容物理随迁：dedupe/stat_cache 键改写；
                 // whiteout 保留在 lower 命名空间（改写后的 lower 查询仍能命中）。
-                ctx.rewrite_meta_prefix(from, to)?;
             }
             Resolution::Whiteout | Resolution::NotFound => unreachable!("checked above"),
         }
@@ -1170,9 +1136,10 @@ impl Overlay {
 
     // ---- stat（暴露给 VFS 的稳定值） ----
 
-    /// 逻辑 stat：lower 固定（dev/ino/mtime/ctime 恒定，size/mode 来自模板），
-    /// upper 用逻辑 mtime；目录 `0o040755`。whiteout/not-found → None。
-    /// 单一 [`MetaCtx`] 贯穿解析/file_id/mtime，initializing 期零 DB 读。
+    /// 推导 stat（M11/B110100）：lower 固定（dev/ino/mtime/ctime 恒定，
+    /// size/mode 来自模板，mtime = per-worktree epoch）；upper 用真实文件
+    /// mtime；ino = 路径稳定哈希（根目录固定值）；目录 `0o040755`。
+    /// whiteout/not-found → None。纯读：零 DB、零写副作用、零内存发放。
     pub fn stat(&self, rel: &str) -> Result<Option<Stat>> {
         self.validate_rel_or_root(rel)?;
         if !rel.is_empty() && is_temp_name(basename(rel)) {
@@ -1180,7 +1147,7 @@ impl Overlay {
         }
         let vs = u64::from(self.config.volume_serial);
         let epoch = self.config.fixed_stat_epoch_ns;
-        let mut ctx = self.meta_ctx();
+        let ctx = self.meta_ctx();
         let resolution = self.resolve_with(&ctx, rel)?;
         let out = match resolution {
             Resolution::Whiteout | Resolution::NotFound => return Ok(None),
@@ -1191,10 +1158,10 @@ impl Overlay {
                 } else {
                     0o100644
                 };
-                let mtime = self.cached_mtime(&mut ctx, rel, md.len(), false)?;
+                let mtime = metadata_mtime_ns(&md);
                 Stat {
                     dev: vs,
-                    ino: ctx.file_id(rel)?,
+                    ino: file_id_for(rel),
                     mode,
                     size: md.len(),
                     mtime_ns: mtime,
@@ -1203,22 +1170,22 @@ impl Overlay {
             }
             Resolution::Lower { file, .. } => Stat {
                 dev: vs,
-                ino: ctx.file_id(rel)?,
+                ino: file_id_for(rel),
                 mode: file.mode,
                 size: file.size,
                 mtime_ns: epoch,
                 ctime_ns: epoch,
             },
             Resolution::Directory { has_upper, .. } => {
-                let ino = if rel.is_empty() { ROOT_FILE_ID } else { ctx.file_id(rel)? };
                 let mtime = if has_upper {
-                    self.cached_mtime(&mut ctx, rel, 0, true)?
+                    let md = std::fs::metadata(self.upper_abs(rel))?;
+                    metadata_mtime_ns(&md)
                 } else {
                     epoch
                 };
                 Stat {
                     dev: vs,
-                    ino,
+                    ino: file_id_for(rel),
                     mode: 0o040755,
                     size: 0,
                     mtime_ns: mtime,
@@ -1229,11 +1196,12 @@ impl Overlay {
         Ok(Some(out))
     }
 
-    /// 稳定 file id（Windows FILE_ID 与 index ino；持久映射）。
-    /// initializing 期为内存派生（批量缓冲），ready 后落库持久化。
+    /// 稳定 file id（Windows FILE_ID 与 index ino 用）：blake3(小写路径)
+    /// 直接派生，路径不变则不变，跨进程/跨重开天然一致；无持久映射、无
+    /// 冲突探测（62 位哈希，冲突概率对仓库规模可忽略）。空路径非法。
     pub fn file_id(&self, rel: &str) -> Result<u64> {
-        let mut ctx = self.meta_ctx();
-        ctx.file_id(rel)
+        validate_relative_path(rel)?;
+        Ok(file_id_for(rel))
     }
 
     fn lower_mode_is_exec(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<bool> {
@@ -1241,44 +1209,40 @@ impl Overlay {
         Ok(self
             .lower
             .as_ref()
-            .and_then(|m| m.get(&mapped))
+            .and_then(|m| m.file(&mapped))
             .map(|f| f.mode & 0o111 != 0)
             .unwrap_or(false))
     }
+}
 
-    /// 单调递增逻辑时钟：`max(系统 now, 已发放最大值 + 1)`，原子推进。
-    /// 打开时已从 `MAX(mtime_ns)` 初始化一次（[`init_mtime_clock`]），
-    /// 逐 upper 写的 `SELECT MAX(mtime_ns)` 已移除（M8/B080100）。
-    fn issue_logical_mtime(&self) -> i64 {
-        let now = now_unix_ns();
-        match self.mtime_clock.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
-            Some(now.max(prev.saturating_add(1)))
-        }) {
-            Ok(next) => next,
-            Err(_) => unreachable!("mtime clock closure always returns Some"),
-        }
+/// 路径 → 稳定 ino；根目录（`""`）用固定值（[`ROOT_FILE_ID`]）。
+fn file_id_for(rel: &str) -> u64 {
+    if rel.is_empty() {
+        ROOT_FILE_ID
+    } else {
+        derive_ino(rel) as u64
     }
+}
 
-    /// 读取或发放并缓存逻辑 mtime（同一 upper 路径的 stat 在两次写之间稳定）。
-    fn cached_mtime(&self, ctx: &mut MetaCtx<'_>, rel: &str, size: u64, is_dir: bool) -> Result<i64> {
-        if let Some(entry) = ctx.stat_entry(rel)? {
-            return Ok(entry.mtime_ns);
-        }
-        let mtime = self.issue_logical_mtime();
-        ctx.set_stat_entry(
-            rel,
-            StatCacheEntry {
-                mtime_ns: mtime,
-                size,
-                flags: if is_dir {
-                    StatCacheEntry::FLAG_DIRECTORY
-                } else {
-                    0
-                },
-            },
-        )?;
-        Ok(mtime)
-    }
+/// 文件系统真实 mtime → Unix 纳秒（早于 Unix 纪元截为 0）。
+fn metadata_mtime_ns(md: &std::fs::Metadata) -> i64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as i64)
+}
+
+/// 把与模板内容一致的 upper 副本 mtime 归一到 per-worktree epoch
+/// （best-effort：失败只影响 git 一次额外 rehash，正确性不受影响）。
+fn normalize_template_identical_mtime(path: &Path, epoch_ns: i64) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| {
+            f.set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_nanos(epoch_ns.max(0) as u64),
+            )
+        });
 }
 
 /// [`Stat`] → Win32 文件属性位（VFS 回填 `get_file_info` 用）。
@@ -1580,14 +1544,15 @@ mod tests {
         assert_eq!(of.resolve("b.txt").unwrap(), Resolution::Whiteout);
         assert!(matches!(of.resolve("c.txt").unwrap(), Resolution::Upper { .. }));
         assert_eq!(of.read("c.txt").unwrap().as_deref(), Some(BEE));
-        // c.txt 的 stat 有逻辑 mtime（upper 文件）
+        // c.txt 内容与模板一致（rename 即 copy-up）：mtime 归一到 per-worktree
+        // epoch，stat 在改名前后保持 lower 固定值（index 对齐不破坏）。
         let st = of.stat("c.txt").unwrap().unwrap();
-        assert!(st.mtime_ns > crate::FIXED_STAT_EPOCH_UNIX_NS);
+        assert_eq!(st.mtime_ns, crate::FIXED_STAT_EPOCH_UNIX_NS);
         assert_eq!(st.mode, 0o100644);
     }
 
     #[test]
-    fn stat_fixed_lower_logical_upper_and_monotonic_mtime() {
+    fn stat_fixed_lower_real_upper_mtime_and_stable_across_stats() {
         let fx = fixture(true);
         let of = make(&fx, true);
         let epoch = crate::FIXED_STAT_EPOCH_UNIX_NS;
@@ -1603,32 +1568,42 @@ mod tests {
             mtime_ns: epoch,
             ctime_ns: epoch,
         });
-        // 目录
+        // 目录（lower-only → epoch；有 upper → 真实 mtime）
         let dir_st = of.stat("a").unwrap().unwrap();
         assert_eq!(dir_st.mode, 0o040755);
         assert_eq!(dir_st.size, 0);
+        assert_eq!(dir_st.mtime_ns, epoch, "lower-only 目录用 epoch");
         assert_eq!(attributes_for(&dir_st), FileAttributes::DIRECTORY);
         assert_eq!(attributes_for(&st), FileAttributes::ARCHIVE);
 
-        // upper：逻辑 mtime，且保留模板可执行位
+        // upper：真实文件 mtime，保留模板可执行位
         of.write("exec.sh", b"modified").unwrap();
         let st1 = of.stat("exec.sh").unwrap().unwrap();
         assert_eq!(st1.mode, 0o100755, "exec bit survives copy-up");
         assert!(st1.mtime_ns > epoch);
         assert_eq!(st1.size, 8);
         assert_eq!(st1.ino, of.file_id("exec.sh").unwrap());
-        // 同一路径重复 stat 稳定
+        // mtime = upper 物理文件的真实 mtime
+        let real = std::fs::metadata(fx.upper_dir.join("exec.sh"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        assert_eq!(st1.mtime_ns, real);
+        // 同一路径重复 stat 稳定（真实 mtime，无发放时钟）
         assert_eq!(of.stat("exec.sh").unwrap().unwrap().mtime_ns, st1.mtime_ns);
 
-        // 多次写：严格单调递增
+        // upper 目录的真实 mtime
+        std::fs::create_dir_all(fx.upper_dir.join("u")).unwrap();
+        let upper_dir_st = of.stat("u").unwrap().unwrap();
+        assert!(upper_dir_st.mtime_ns > epoch, "有 upper 的目录报真实 mtime");
+
+        // 模板一致重写回落 lower → stat 回到固定 epoch
         let (state, _) = of.write("a/1.txt", ONE).unwrap();
         assert_eq!(state, DedupeState::Lower, "模板一致内容回落 lower");
-        let (state, _) = of.write("a/1.txt", b"ONE!").unwrap();
-        assert_eq!(state, DedupeState::Upper);
-        let t1 = of.stat("a/1.txt").unwrap().unwrap().mtime_ns;
-        of.write("a/1.txt", b"ONE!!").unwrap();
-        let t2 = of.stat("a/1.txt").unwrap().unwrap().mtime_ns;
-        assert!(t2 > t1, "logical mtime must advance: {t1} -> {t2}");
+        assert_eq!(of.stat("a/1.txt").unwrap().unwrap().mtime_ns, epoch);
         assert!(of.stat("gone").unwrap().is_none());
     }
 
@@ -1714,7 +1689,7 @@ mod tests {
         assert!(of2.config().dedupe_enabled);
         // whiteout 持久
         assert_eq!(of2.resolve("b.txt").unwrap(), Resolution::Whiteout);
-        // file id 与逻辑 mtime 持久（不重发放）
+        // file id（路径哈希）与真实 mtime 持久（不重发放）
         assert_eq!(of2.file_id("a/1.txt").unwrap(), ino);
         assert_eq!(of2.stat("a/1.txt").unwrap().unwrap().mtime_ns, mtime);
         // 状态机持久
@@ -1776,14 +1751,18 @@ mod tests {
         assert_eq!(of.io_stats().fsyncs(), 0, "干净 checkout 零 fsync");
         assert_eq!(of.io_stats().upper_writes(), 0, "干净 checkout 零 upper 物化");
         assert_eq!(count_files(&fx.upper_dir), 0, "upper 整棵零文件（零临时副本）");
-        // 视图回落 lower，决策在批量缓冲
+        // 视图回落 lower；决策不再落库（M11：dedupe 表已删除），upper 空 +
+        // 视图可见即语义。
         assert_eq!(of.read("b.txt").unwrap().as_deref(), Some(BEE));
         of.mark_ready().unwrap();
-        let states = fx.store.dedupe_states(WorktreeId(1)).unwrap();
+        assert_eq!(fx.store.state(WorktreeId(1)).unwrap(), Some(crate::WorktreeState::Ready));
         for p in ["a/1.txt", "a/2.txt", "b.txt", "exec.sh"] {
-            assert_eq!(states.get(p), Some(&DedupeState::Lower));
+            assert!(
+                matches!(of.resolve(p).unwrap(), Resolution::Lower { .. }),
+                "{p} must resolve to lower after clean checkout"
+            );
         }
-        assert!(fx.store.stat_entries(WorktreeId(1)).unwrap().is_empty(), "lower 无 stat 行");
+        assert!(fx.store.whiteouts(WorktreeId(1)).unwrap().is_empty(), "lower 无 whiteout");
     }
 
     /// 改动文件恰好一次物化 + 一次 fsync；再写回模板内容回收 upper
@@ -1926,10 +1905,9 @@ mod tests {
         assert_eq!(of2.io_stats().fsyncs(), 0);
         assert_eq!(of2.io_stats().upper_writes(), 0);
         of2.mark_ready().unwrap();
-        assert_eq!(
-            fx.store.dedupe_states(WorktreeId(2)).unwrap().get("empty.txt"),
-            Some(&DedupeState::Lower)
-        );
+        // 撤销后的 whiteout 不落库（回落 lower 视图）。
+        assert!(fx.store.whiteouts(WorktreeId(2)).unwrap().is_empty());
+        assert!(matches!(of2.resolve("empty.txt").unwrap(), Resolution::Lower { .. }));
     }
 
     /// B100100：NotFound（无模板覆盖）上 prepare_created_file 物化空 upper
@@ -1958,10 +1936,11 @@ mod tests {
         of.prepare_created_file("brand-new.txt").unwrap();
         assert_eq!(of.io_stats().upper_writes(), 1);
         of.mark_ready().unwrap();
-        assert_eq!(
-            fx.store.dedupe_states(WorktreeId(1)).unwrap().get("brand-new.txt"),
-            Some(&DedupeState::New)
-        );
+        // 占位 upper 是数据真相（无 dedupe 行落库，M11）。
+        assert!(matches!(
+            of.resolve("brand-new.txt").unwrap(),
+            Resolution::Upper { .. }
+        ));
     }
 
     /// 崩溃于 mark_ready 前：finish_staged 物化的 upper 文件完整保留
@@ -2000,9 +1979,9 @@ mod tests {
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Ready)
         );
-        // M8 语义：崩溃丢缓冲——b.txt 的 Lower 决策行不落库（无 upper 文件，
-        // 视图天然回落 lower）；late.txt 的新决策已落库。
-        assert!(fx.store.stat_entries(WorktreeId(1)).unwrap().contains_key("late.txt"));
+        // M8 语义：崩溃丢缓冲——b.txt 的回收决策不落库（无 upper 文件，
+        // 视图天然回落 lower）；late.txt 的 upper 是数据真相，重开即见。
+        assert!(fx.upper_dir.join("late.txt").is_file(), "late.txt 物化已保留");
         assert_eq!(of2.read("b.txt").unwrap().as_deref(), Some(BEE), "一致内容零残留 → 回落 lower");
     }
 
@@ -2063,9 +2042,7 @@ mod tests {
     const N_FILES: usize = 48;
 
     /// N 文件 checkout（initializing 期全内存批量）→ 写事务 O(1)：
-    /// register + mark_ready flush 共 2 个事务、0 次 autocommit 写
-    /// （旧实现 ~4N：file_id 插入 + remove_stat_entry + record_dedupe +
-    /// remove_whiteout 各一个事务/文件）。
+    /// register + mark_ready flush 共 2 个事务（M11 后 per-file 零 DB 读写）。
     #[test]
     fn batched_checkout_uses_constant_transactions_and_flushes_rows() {
         let fx = fixture(true);
@@ -2080,34 +2057,30 @@ mod tests {
             };
             let (state, _) = of.write(&path, content).unwrap();
             assert_eq!(state, expect_state);
-            // checkout 的 stat：file_id / 逻辑 mtime 全内存发放。
+            // checkout 的 stat：file_id（路径哈希）/ mtime（真实值）纯推导。
             of.stat(&path).unwrap();
         }
-        // 批量窗口内：仅 register 的 1 个事务，零 autocommit 写。
+        // 批量窗口内：仅 register 的 1 个事务。
         let during = fx.store.db().tx_stats();
         assert_eq!(during.committed - base.committed, 1, "仅 register");
-        assert_eq!(during.autocommit_writes - base.autocommit_writes, 0);
         assert_eq!(during.rolled_back - base.rolled_back, 0);
 
         of.mark_ready().unwrap();
         let after = fx.store.db().tx_stats();
-        let total = (after.committed - base.committed)
-            + (after.autocommit_writes - base.autocommit_writes)
-            + (after.rolled_back - base.rolled_back);
-        assert_eq!(total, 2, "O(1)：register + flush；旧实现约 4N={}", 4 * N_FILES);
+        let total = (after.committed - base.committed) + (after.rolled_back - base.rolled_back);
+        assert_eq!(total, 2, "O(1)：register + flush");
 
-        // 状态与批量行都已落库：Lower 文件回落 lower（无 stat 行），
-        // Upper/New 文件有 stat 行；file_ids 覆盖全部 stat 过的路径。
+        // 状态落库；本批无删除 → 无 whiteout 行；ino = 路径哈希纯推导。
         assert_eq!(
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Ready)
         );
-        let per_class = N_FILES / 3;
-        assert_eq!(fx.store.stat_entries(WorktreeId(1)).unwrap().len(), 1 + per_class);
-        assert_eq!(fx.store.dedupe_states(WorktreeId(1)).unwrap().len(), 2 + per_class);
-        let inos = fx.store.file_id_rows(WorktreeId(1)).unwrap();
-        assert_eq!(inos.len(), 2 + per_class, "a/1.txt + a/2.txt + new/f*");
-        assert_eq!(inos["a/1.txt"], of.file_id("a/1.txt").unwrap(), "ino 持久不重发放");
+        assert!(fx.store.whiteouts(WorktreeId(1)).unwrap().is_empty());
+        assert_eq!(
+            of.file_id("a/1.txt").unwrap(),
+            crate::overlay_store::derive_ino("a/1.txt") as u64,
+            "ino 由路径稳定哈希派生"
+        );
     }
 
     /// 崩溃于 mark_ready 前：worktree 保持 initializing、upper 文件完整
@@ -2125,7 +2098,7 @@ mod tests {
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Initializing)
         );
-        assert!(fx.store.stat_entries(WorktreeId(1)).unwrap().is_empty());
+        assert!(fx.store.whiteouts(WorktreeId(1)).unwrap().is_empty());
         assert!(fx.upper_dir.join("new.txt").is_file(), "upper 文件是数据真相");
         assert!(fx.upper_dir.join("a/1.txt").is_file());
 
@@ -2142,14 +2115,14 @@ mod tests {
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Ready)
         );
-        assert!(fx.store.stat_entries(WorktreeId(1)).unwrap().contains_key("late.txt"));
+        assert!(fx.upper_dir.join("late.txt").is_file());
         assert_eq!(of2.read("new.txt").unwrap().as_deref(), Some(b"fresh".as_slice()));
     }
 
-    /// 逻辑 mtime：同会话严格单调；flush 持久化最大值；重开时钟从 MAX 初始化、
-    /// 新发放严格大于既有值（不倒退、不重发放）。
+    /// upper mtime = 真实文件 mtime：同会话稳定、跨重开一致（M11 后无逻辑
+    /// 时钟；mtime 随真实修改自然前进，lower 恒为 per-worktree epoch）。
     #[test]
-    fn logical_mtime_monotonic_within_session_and_across_reopen() {
+    fn upper_mtime_is_real_file_mtime_stable_across_reopen() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("meta.db");
         let lower_dir = dir.path().join("lower");
@@ -2159,34 +2132,46 @@ mod tests {
         let mut cfg = OverlayConfig::new(WorktreeId(5), &upper_dir);
         cfg.lower_root = Some(lower_dir.clone());
         cfg.dedupe_enabled = true;
-        let mut max_seen = 0i64;
-        {
+        let seen: Vec<i64> = {
             let of = Overlay::new(cfg.clone(), Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
-            for i in 0..32 {
+            let mut seen = Vec::new();
+            for i in 0..8 {
                 let path = format!("n{i}.txt");
                 of.write(&path, b"x").unwrap();
-                let t = of.stat(&path).unwrap().unwrap().mtime_ns;
-                assert!(t > max_seen, "同会话严格单调: {max_seen} -> {t}");
-                assert!(t > crate::FIXED_STAT_EPOCH_UNIX_NS);
-                max_seen = t;
+                let st = of.stat(&path).unwrap().unwrap();
+                let real = std::fs::metadata(upper_dir.join(&path))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64;
+                assert_eq!(st.mtime_ns, real, "{path} 的 stat mtime 必须等于真实文件 mtime");
+                assert!(st.mtime_ns > crate::FIXED_STAT_EPOCH_UNIX_NS);
+                seen.push(st.mtime_ns);
             }
-            // 同路径重写也严格前进
-            of.write("n0.txt", b"xx").unwrap();
-            let t = of.stat("n0.txt").unwrap().unwrap().mtime_ns;
-            assert!(t > max_seen);
-            max_seen = t;
             of.mark_ready().unwrap();
-            let flushed = store.max_stat_mtime(WorktreeId(5)).unwrap().unwrap();
-            assert!(flushed >= max_seen, "flush 持久化最大逻辑 mtime");
-            max_seen = max_seen.max(flushed);
-        }
+            seen
+        };
         let of2 = Overlay::reopen(cfg, Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
-        of2.write("after.txt", b"y").unwrap();
-        let t = of2.stat("after.txt").unwrap().unwrap().mtime_ns;
-        assert!(t > max_seen, "重开后时钟从 MAX 初始化、不倒退: {max_seen} -> {t}");
+        for (i, t) in seen.iter().enumerate() {
+            let path = format!("n{i}.txt");
+            assert_eq!(
+                of2.stat(&path).unwrap().unwrap().mtime_ns,
+                *t,
+                "{path} 重开后 mtime 一致（真实文件 mtime，无重发放）"
+            );
+        }
+        // 同一路径真实修改后 mtime 前进（由文件系统保证，无需时钟）。
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        of2.write("n0.txt", b"xx").unwrap();
+        assert!(
+            of2.stat("n0.txt").unwrap().unwrap().mtime_ns > seen[0],
+            "真实修改后 mtime 前进"
+        );
     }
 
-    /// 并发 VFS 回调线程安全：多线程同写 initializing 缓冲，flush 后行完整。
+    /// 并发 VFS 回调线程安全：多线程同写 initializing 缓冲，flush 后视图完整。
     #[test]
     fn concurrent_init_writes_are_thread_safe_and_fully_flushed() {
         let fx = fixture(true);
@@ -2211,9 +2196,17 @@ mod tests {
         of.mark_ready().unwrap();
         let id = WorktreeId(1);
         let total = threads * per_thread;
-        assert_eq!(fx.store.dedupe_states(id).unwrap().len() as u64, total);
-        assert_eq!(fx.store.stat_entries(id).unwrap().len() as u64, total);
-        assert_eq!(fx.store.file_id_rows(id).unwrap().len() as u64, total);
+        assert_eq!(fx.store.state(id).unwrap(), Some(crate::WorktreeState::Ready));
+        assert!(fx.store.whiteouts(id).unwrap().is_empty());
+        // flush 后全部路径可解析 upper、内容正确；ino 纯推导一致。
+        for t in 0..threads {
+            for i in 0..per_thread {
+                let p = format!("t{t}/f{i}.txt");
+                assert!(matches!(of.resolve(&p).unwrap(), Resolution::Upper { .. }));
+                assert_eq!(of.read(&p).unwrap().as_deref(), Some(b"payload".as_slice()));
+                assert_eq!(of.file_id(&p).unwrap(), crate::overlay_store::derive_ino(&p) as u64);
+            }
+        }
     }
 
     /// 幂等 mark_ready：已 ready 的重开实例二次 mark_ready 只切状态，
@@ -2223,8 +2216,9 @@ mod tests {
         let fx = fixture(true);
         let of = make(&fx, true);
         of.write("a/2.txt", b"changed!").unwrap();
+        assert!(of.remove("b.txt").unwrap(), "制造一条 whiteout");
         of.mark_ready().unwrap();
-        let before = fx.store.stat_entries(WorktreeId(1)).unwrap();
+        let before = fx.store.whiteouts(WorktreeId(1)).unwrap();
         assert_eq!(before.len(), 1);
         // 模拟 watcher 二次 mark_ready（无缓冲的实例走仅状态分支）
         of.mark_ready().unwrap();
@@ -2232,7 +2226,84 @@ mod tests {
             fx.store.state(WorktreeId(1)).unwrap(),
             Some(crate::WorktreeState::Ready)
         );
-        assert_eq!(fx.store.stat_entries(WorktreeId(1)).unwrap(), before);
+        assert_eq!(fx.store.whiteouts(WorktreeId(1)).unwrap(), before);
         // 结构性保证：无缓冲分支只 UPDATE worktrees，不触碰任何子表行。
+    }
+
+    // ---- M11/B110100 回归：派生元数据（哈希 ino / 内存索引 / 真实 mtime）----
+
+    /// 同一路径重开 Overlay 后 file_id 稳定（路径哈希派生，无持久映射依赖）、
+    /// list 内存合并正确（lower 索引 ∪ upper − whiteout）、whiteout 删除的
+    /// 文件重开后不可见。
+    #[test]
+    fn derived_metadata_survives_reopen_file_id_list_whiteout() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("meta.db");
+        let lower_dir = dir.path().join("lower");
+        let upper_dir = dir.path().join("upper");
+        let db = Db::open(&db_path).unwrap();
+        let store = Arc::new(SqliteOverlayStore::new(db));
+        let mut cfg = OverlayConfig::new(WorktreeId(6), &upper_dir);
+        cfg.lower_root = Some(lower_dir.clone());
+        cfg.dedupe_enabled = true;
+
+        let ino_map: std::collections::HashMap<String, u64> = {
+            let of = Overlay::new(cfg.clone(), Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+            of.write("a/1.txt", b"ONE!").unwrap(); // upper 覆盖
+            of.write("fresh.txt", b"fresh").unwrap(); // upper 新增
+            of.remove("b.txt").unwrap(); // whiteout
+            of.remove("a").unwrap(); // 目录 whiteout
+            of.write("a/9.txt", b"nine").unwrap(); // whiteout 目录内重建 upper
+            of.mark_ready().unwrap();
+            ["a/1.txt", "a/9.txt", "fresh.txt", "b.txt", "exec.sh", ""]
+                .into_iter()
+                .map(|p| (p.to_string(), of.file_id(p).unwrap_or(ROOT_FILE_ID)))
+                .collect()
+        };
+
+        // 重开（新实例 + 新 lower 索引 + 从 DB 装载 whiteouts）。
+        let of2 = Overlay::reopen(cfg, Some(lower_fixture(&lower_dir)), store.clone()).unwrap();
+        assert!(!of2.is_initializing().unwrap());
+
+        // 1) file_id 稳定：路径哈希派生与实例/映射表无关。
+        for (p, ino) in &ino_map {
+            assert_eq!(
+                of2.file_id(p).unwrap_or(ROOT_FILE_ID),
+                *ino,
+                "file_id must be stable across reopen for {p:?}"
+            );
+            if p.is_empty() {
+                assert_eq!(*ino, ROOT_FILE_ID, "根目录固定 ino");
+            } else {
+                assert_eq!(*ino, crate::overlay_store::derive_ino(p) as u64);
+            }
+        }
+
+        // 2) whiteout 删除后不可见（含目录子树）；重建的 upper 例外可见。
+        assert_eq!(of2.resolve("b.txt").unwrap(), Resolution::Whiteout);
+        assert!(!names(&of2, "").contains(&"b.txt".to_string()));
+        assert!(matches!(of2.resolve("a").unwrap(), Resolution::Directory { has_lower: false, has_upper: true }));
+        assert_eq!(names(&of2, "a"), vec!["9.txt"], "whiteout 子树隐藏，upper 重建可见");
+
+        // 3) list 合并正确：lower（内存索引）∪ upper − whiteout，kind 正确。
+        let root = of2.list("").unwrap();
+        let get = |name: &str| root.iter().find(|e| e.name == name).map(|e| e.kind);
+        assert_eq!(get("a"), Some(EntryKind::Directory));
+        assert_eq!(get("exec.sh"), Some(EntryKind::File));
+        assert_eq!(get("fresh.txt"), Some(EntryKind::File));
+        assert_eq!(get("b.txt"), None, "whiteout 必须从合并视图剔除");
+        let sub = of2.list("a").unwrap();
+        assert_eq!(
+            sub.iter().map(|e| (e.name.as_str(), e.kind)).collect::<Vec<_>>(),
+            vec![("9.txt", EntryKind::File)]
+        );
+
+        // mark_ready 幂等（无缓冲分支）：whiteout 行不被清空。
+        of2.mark_ready().unwrap();
+        assert!(
+            !store.whiteouts(WorktreeId(6)).unwrap().is_empty(),
+            "幂等 mark_ready 不得清空既有 whiteout 行"
+        );
+        assert_eq!(of2.resolve("b.txt").unwrap(), Resolution::Whiteout);
     }
 }

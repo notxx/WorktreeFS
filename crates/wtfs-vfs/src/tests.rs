@@ -324,24 +324,18 @@ fn staged_write_dedupe_discards_template_identical_content() {
 
     cleanup(&fx, fctx, 0);
 
-    // 与模板一致 → upper 空、视图回落 lower
-    assert!(!fx.upper_dir.join("b.txt").exists());
+    // 与模板一致 → upper 空、视图回落 lower；M11 起 dedupe 决策不再落库
+    // （可推导状态），upper 空 + 视图可见即语义。
     assert_eq!(overlay.read("b.txt").unwrap().as_deref(), Some(BEE));
-    // M8/B080100：initializing 期 dedupe 决策进内存批量缓冲，mark_ready
-    // 单事务落库——先切 ready 再断言 store 行。
     overlay.mark_ready().unwrap();
-    assert_eq!(
-        overlay
-            .store()
-            .dedupe_states(WorktreeId(1))
-            .unwrap()
-            .get("b.txt"),
-        Some(&DedupeState::Lower)
-    );
+    assert!(matches!(
+        overlay.resolve("b.txt").unwrap(),
+        Resolution::Lower { .. }
+    ));
 }
 
 #[test]
-fn staged_write_modified_content_lands_upper_with_logical_mtime() {
+fn staged_write_modified_content_lands_upper_with_real_mtime() {
     let fx = fixture();
     let overlay = fx.registry.get("wt-1").unwrap();
 
@@ -349,7 +343,7 @@ fn staged_write_modified_content_lands_upper_with_logical_mtime() {
     write(&fx, &fctx, b"changed");
     let info = file_info(&fx, &fctx);
     assert_eq!(info.file_size, 7);
-    // 投影：与模板不一致 → 逻辑 mtime（≠ 固定纪元）
+    // 投影：与模板不一致 → 非固定纪元的 mtime
     assert_ne!(
         info.last_write_time,
         filetime_from_unix_ns(wtfs_core::FIXED_STAT_EPOCH_UNIX_NS)
@@ -361,18 +355,22 @@ fn staged_write_modified_content_lands_upper_with_logical_mtime() {
         overlay.read("b.txt").unwrap().as_deref(),
         Some(b"changed".as_slice())
     );
-    // M8/B080100：initializing 期 dedupe/stat 行在批量缓冲，mark_ready 落库。
+    // M11：决策不落库；stat 推导自 upper 物理文件的真实 mtime。
     overlay.mark_ready().unwrap();
-    assert_eq!(
-        overlay
-            .store()
-            .dedupe_states(WorktreeId(1))
-            .unwrap()
-            .get("b.txt"),
-        Some(&DedupeState::Upper)
-    );
+    assert!(matches!(
+        overlay.resolve("b.txt").unwrap(),
+        Resolution::Upper { .. }
+    ));
     let st = overlay.stat("b.txt").unwrap().unwrap();
     assert!(st.mtime_ns > wtfs_core::FIXED_STAT_EPOCH_UNIX_NS);
+    let real = std::fs::metadata(fx.upper_dir.join("b.txt"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    assert_eq!(st.mtime_ns, real);
 
     // 通知：MODIFIED + 父目录
     let events = drain_events(&fx);
@@ -641,16 +639,13 @@ fn zero_write_create_clears_checkout_whiteout_for_template_empty_file() {
     assert_eq!(overlay.io_stats().fsyncs(), 0, "空 blob 回落 lower 零 fsync");
     assert_eq!(overlay.io_stats().upper_writes(), 0, "空 blob 零 upper 物化");
 
-    // 决策落批量缓冲，mark_ready 单事务落库（M8 语义不变）。
+    // whiteout 撤销后零残留（M11：决策不落库，视图回落 lower 即语义）。
     overlay.mark_ready().unwrap();
-    assert_eq!(
-        overlay
-            .store()
-            .dedupe_states(WorktreeId(1))
-            .unwrap()
-            .get("empty.txt"),
-        Some(&DedupeState::Lower)
-    );
+    assert!(matches!(
+        overlay.resolve("empty.txt").unwrap(),
+        Resolution::Lower { .. }
+    ));
+    assert!(overlay.store().whiteouts(WorktreeId(1)).unwrap().is_empty());
 }
 
 /// 嵌套空文件（git 先 mkdir 子目录再写）：同样必须恢复可见。
@@ -697,14 +692,11 @@ fn zero_write_create_materializes_new_empty_file() {
     assert_eq!(overlay.io_stats().fsyncs(), 1);
     assert_eq!(overlay.io_stats().upper_writes(), 2);
     overlay.mark_ready().unwrap();
-    assert_eq!(
-        overlay
-            .store()
-            .dedupe_states(WorktreeId(1))
-            .unwrap()
-            .get("brand-new.txt"),
-        Some(&DedupeState::New)
-    );
+    // 占位 upper 是数据真相（M11：无 dedupe 行）。
+    assert!(matches!(
+        overlay.resolve("brand-new.txt").unwrap(),
+        Resolution::Upper { .. }
+    ));
 }
 
 /// ready 态的 `git checkout <空文件>`（lstat→unlink→create→零写 close）：
@@ -1085,7 +1077,7 @@ fn staged_truncate_and_set_file_size() {
 }
 
 #[test]
-fn set_basic_info_updates_upper_logical_mtime() {
+fn set_basic_info_updates_upper_real_mtime() {
     let fx = fixture();
     let overlay = fx.registry.get("wt-1").unwrap();
     fx.registry.mark_ready("wt-1").unwrap();
@@ -1248,8 +1240,7 @@ fn count_files(dir: &std::path::Path) -> usize {
     files
 }
 
-/// 干净 N 文件 checkout 走 VFS 回调：零 upper 文件、零 fsync；决策进批量
-/// 缓冲，mark_ready 落库后视图回落 lower。
+/// 干净 N 文件 checkout 走 VFS 回调：零 upper 文件、零 fsync；视图回落 lower。
 #[test]
 fn clean_checkout_via_vfs_creates_zero_upper_files_and_zero_fsyncs() {
     let fx = fixture();
@@ -1282,9 +1273,10 @@ fn clean_checkout_via_vfs_creates_zero_upper_files_and_zero_fsyncs() {
     );
     assert_eq!(count_files(&fx.upper_dir), 0, "upper 整棵零文件（含零临时副本）");
     overlay.mark_ready().unwrap();
-    let states = overlay.store().dedupe_states(WorktreeId(1)).unwrap();
+    // M11：决策不落库；mark_ready 后视图回落 lower、零 whiteout 行。
+    assert!(overlay.store().whiteouts(WorktreeId(1)).unwrap().is_empty());
     for rel in ["a/1.txt", "a/2.txt", "b.txt", "exec.sh"] {
-        assert_eq!(states.get(rel), Some(&DedupeState::Lower));
+        assert!(matches!(overlay.resolve(rel).unwrap(), Resolution::Lower { .. }));
     }
     assert_eq!(overlay.read("b.txt").unwrap().as_deref(), Some(BEE));
 }

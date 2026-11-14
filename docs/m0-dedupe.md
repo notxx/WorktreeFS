@@ -66,35 +66,39 @@ wtfs unmount [--pipe <name>]
 - `git worktree remove` 在挂载中直接成功（B060100 修复：worktree 根目录删除
   已放开，空视图校验后放行）；注销 worktree 时标记树整树删除，无残留。
 
-## whiteout / rename 语义（M12/B120100，OverlayFS 式标记树）
+## whiteout / rename 语义（M12/B120100，OverlayFS 式标记）
 
 删除与改名的状态不再存 SQLite 表（schema v4 起 `whiteouts` / `renames` 两张表
-已删除，v3 及更早的库打开时自动迁移），而是落在每个 worktree 私有的镜像标记
-树里：
+已删除，v3 及更早的库打开时自动迁移），而是落在每个 worktree 私有的 upper 层
+内（OverlayFS 同款约定）：
 
 ```
 <store>/worktrees/<id>/
-├─ upper/                  # 改动文件（数据真相）
-└─ meta/                   # 标记树（与 upper 同根）
-   ├─ whiteouts/<rel>      # 0 字节标记：删除的 lower 文件
-   ├─ opaque/<rel>         # 0 字节标记：删除的 lower 目录（整棵 lower 子树隐藏）
+├─ upper/                  # 改动文件 + 删除标记（同一棵树）
+│  ├─ .wh.<name>           # 0 字节标记：删除的文件/目录（相对其父目录）
+│  └─ D/.wh.f              # "删除 D/f" 的标记
+└─ meta/
    └─ redirect/<view-rel>  # 内容 = 原路径：v3 目录改名映射的迁移形态（只读）
 ```
 
 - unlink/rmdir 每文件只写/删一个 O(1) 标记文件，**零 SQLite 写事务**——大仓库
-  逐文件删除不再产生逐文件事务（M11 实测 remove ~76s 的根因）。
-- 解析顺序：upper > whiteout/opaque > lower；删除标记命中自身或任一祖先目录
-  时 lower 内容隐藏；opaque 目录若在 upper 重建，则只显示 upper 内容（lower
-  子树继续隐藏）。删除标记写在 lower 命名空间路径上，重建文件（写回）即撤销
-  whiteout。
+  逐文件删除不再产生逐文件事务（M11 实测 remove ~76s 的根因）。标记文件与
+  兄弟真实条目同层、以 `.wh.` 前缀区分；删除目录 `D` 的标记在 `parent(D)`
+  层，子内容标记在 `D/` 内随目录一并消失——不存在文件/目录路径冲突。
+- 解析顺序：upper > whiteout > lower；删除标记命中自身或任一祖先目录时
+  lower 内容隐藏（目录删除与文件删除共用一种标记，阻塞语义同构：目录若在
+  upper 重建则只显示 upper 内容）。重建文件（写回）即撤销标记。
 - 文件 rename = 源 whiteout + 目标 upper（搬移或 copy-up）。
 - 目录 rename：lower 有内容 → `STATUS_NOT_SAME_DEVICE`（OverlayFS 默认 EXDEV，
   调用方按跨设备语义退化为递归复制+删除）；仅 upper 新建的目录（lower 无内容）
   → 纯物理改名，零标记。
 - redirect 标记只由 v3→v4 迁移产生（旧 `renames` 行：`redirect/<to>` 内容为
   `from`），迁移后的改名子树 readdir/stat/read 正确；运行期不再新增。
-- 注销 worktree（`git worktree remove` / watcher 元数据消失路径 / gc）：DB 行
-  删除 + `meta/` 标记树整树删除，upper 目录由 `wtfs gc` 回收孤儿。
+- 注销 worktree（`git worktree remove` / watcher 元数据消失路径）：DB 行删除；
+  标记随 upper 目录作为孤儿由 `wtfs gc` 整树回收——注销路径零逐项工作。同 id
+  重新注册时清扫残留标记，旧墓碑不复活。
+- 命名限制（与 OverlayFS 相同）：仓库内以 `.wh.` 开头的路径跳过 upper
+  （回落 lower/不存在），无法在 upper 中物化。
 
 ## 限制（M0 已知）
 

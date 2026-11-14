@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection};
 
-use crate::overlay_markers::{marker_root_for_upper, MarkerStore};
+use crate::overlay_markers::MarkerStore;
 use crate::{Error, Result};
 
 /// 当前 schema 版本。
@@ -327,7 +327,7 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<()> {
     let marker_store = |id: i64| -> Option<MarkerStore> {
         uppers
             .get(&id)
-            .map(|upper| MarkerStore::new(marker_root_for_upper(Path::new(upper))))
+            .map(|upper| MarkerStore::new(Path::new(upper).to_path_buf()))
     };
 
     if table_exists(conn, "whiteouts") {
@@ -528,11 +528,12 @@ mod tests {
                 .unwrap();
             assert_eq!(wts, 1);
         }
-        // 标记树：whiteout 行 → 0 字节标记文件；rename 行 → redirect 标记。
-        let meta = crate::overlay_markers::marker_root_for_upper(&upper);
-        assert!(meta.join("whiteouts").join("gone.txt").is_file());
-        assert!(meta.join("whiteouts").join("sub").join("deep").join("x.txt").is_file());
-        let redirect = meta.join("redirect").join("dst");
+        // 标记：whiteout 行 → upper 内 `.wh.<name>`；rename 行 → redirect 标记。
+        assert!(upper.join(".wh.gone.txt").is_file());
+        assert!(upper.join("sub").join("deep").join(".wh.x.txt").is_file());
+        let redirect = crate::overlay_markers::marker_root_for_upper(&upper)
+            .join("redirect")
+            .join("dst");
         assert!(redirect.is_file());
         assert_eq!(std::fs::read_to_string(redirect).unwrap(), "src");
         // 重开幂等：无第二次转换副作用，版本稳定。
@@ -543,7 +544,9 @@ mod tests {
             .query_row("PRAGMA user_version", params![], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 4);
-        let state = crate::overlay_markers::MarkerStore::new(meta).load().unwrap();
+        let state = crate::overlay_markers::MarkerStore::new(upper.clone())
+            .load()
+            .unwrap();
         assert!(state.whites.contains("gone.txt"));
         assert_eq!(state.redirects, vec![("src".to_string(), "dst".to_string())]);
     }
@@ -596,11 +599,9 @@ mod tests {
             assert_eq!(exists, 0, "table {table} must be dropped");
         }
         drop(conn);
-        let state = crate::overlay_markers::MarkerStore::new(
-            crate::overlay_markers::marker_root_for_upper(&upper),
-        )
-        .load()
-        .unwrap();
+        let state = crate::overlay_markers::MarkerStore::new(upper.clone())
+            .load()
+            .unwrap();
         assert!(state.whites.contains("gone.txt"), "whiteout 行无损转成标记");
     }
 
@@ -628,8 +629,7 @@ mod tests {
             ))
             .unwrap();
             // 模拟中途失败：只有 gone.txt 的标记写成功。
-            let meta = crate::overlay_markers::marker_root_for_upper(&upper);
-            crate::overlay_markers::MarkerStore::new(meta)
+            crate::overlay_markers::MarkerStore::new(upper.clone())
                 .create_whiteout("gone.txt")
                 .unwrap();
         }
@@ -640,11 +640,9 @@ mod tests {
             .query_row("PRAGMA user_version", params![], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 4);
-        let state = crate::overlay_markers::MarkerStore::new(
-            crate::overlay_markers::marker_root_for_upper(&upper),
-        )
-        .load()
-        .unwrap();
+        let state = crate::overlay_markers::MarkerStore::new(upper.clone())
+            .load()
+            .unwrap();
         assert!(state.whites.contains("gone.txt"));
         assert!(state.whites.contains("late.txt"), "重跑补齐未写完的标记");
         assert_eq!(state.redirects, vec![("src".to_string(), "dst".to_string())]);
@@ -786,7 +784,7 @@ mod tests {
         // 删除：lower 文件（dst/f.txt）→ whiteout 标记（映射路径 src/f.txt）。
         assert!(of.remove("dst/f.txt").unwrap());
         assert_eq!(of.resolve("dst/f.txt").unwrap(), crate::Resolution::Whiteout);
-        let markers = crate::MarkerStore::new(crate::marker_root_for_upper(&upper_dir));
+        let markers = crate::MarkerStore::new(upper_dir.clone());
         assert!(markers.load().unwrap().whites.contains("src/f.txt"));
 
         // 重建：写回模板一致内容 → 标记撤销、回落 lower、可见。
@@ -806,8 +804,8 @@ mod tests {
         let err = of.rename("dst", "elsewhere").unwrap_err();
         assert!(matches!(err, crate::Error::CrossDevice(_)), "got {err:?}");
 
-        // 注销：标记树整树删除。
+        // 注销：删行；标记随 upper 由 gc 回收。
         store.unregister(crate::WorktreeId(7)).unwrap();
-        assert!(!crate::marker_root_for_upper(&upper_dir).exists());
+        assert!(store.state(crate::WorktreeId(7)).unwrap().is_none());
     }
 }

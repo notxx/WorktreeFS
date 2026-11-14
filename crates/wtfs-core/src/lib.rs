@@ -48,7 +48,7 @@ pub use dedupe::{DedupeState, decide_for_path, hash_bytes, hash_file, hash_reade
 pub use overlay::{
     EntryKind, Overlay, OverlayDirEntry, OverlayIoStats, Resolution, StagedContent, attributes_for,
 };
-pub use overlay_markers::{MarkerState, MarkerStore, marker_root_for_upper};
+pub use overlay_markers::{MarkerState, MarkerStore, is_marker_name, marker_root_for_upper};
 pub use overlay_store::{SqliteOverlayStore, WorktreeRegistration};
 pub use template_store::SqliteTemplateStore;
 pub use tower_state::{

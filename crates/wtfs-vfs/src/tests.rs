@@ -276,9 +276,9 @@ fn drain_events(fx: &Fixture) -> Vec<crate::NotifyEvent> {
     std::iter::from_fn(|| fx.ctx.notify_hub().pop()).collect()
 }
 
-/// 该 fixture 的标记树根（upper 同根：`<dir>/meta`，M12）。
-fn marker_root(fx: &Fixture) -> PathBuf {
-    marker_root_for_upper(&fx.upper_dir)
+/// 该 fixture 的标记存储（标记在 upper 内：`.wh.<name>`，M12）。
+fn marker_root(fx: &Fixture) -> MarkerStore {
+    MarkerStore::new(fx.upper_dir.clone())
 }
 
 #[test]
@@ -594,7 +594,7 @@ fn whiteout_delete_and_recreate() {
     assert!(sec(&fx, "\\wt-1\\b.txt").is_err());
     assert_eq!(overlay.resolve("b.txt").unwrap(), Resolution::Whiteout);
     assert!(
-        marker_root(&fx).join("whiteouts").join("b.txt").is_file(),
+        fx.upper_dir.join(".wh.b.txt").is_file(),
         "删除 lower 文件必须落 whiteout 标记文件"
     );
 
@@ -654,7 +654,7 @@ fn zero_write_create_clears_checkout_whiteout_for_template_empty_file() {
         overlay.resolve("empty.txt").unwrap(),
         Resolution::Lower { .. }
     ));
-    assert!(MarkerStore::new(marker_root(&fx)).load().unwrap().whites.is_empty());
+    assert!(marker_root(&fx).load().unwrap().whites.is_empty());
 }
 
 /// 嵌套空文件（git 先 mkdir 子目录再写）：同样必须恢复可见。
@@ -892,7 +892,8 @@ fn set_delete_allows_empty_worktree_root_and_unregisters_on_cleanup() {
     // 目录保留为孤儿——由 `wtfs gc` 回收（spec §6.6，与 daemon watcher
     // 注销路径一致）
     assert_eq!(overlay.store().state(WorktreeId(1)).unwrap(), None);
-    assert!(!marker_root(&fx).exists(), "注销必须整树删除标记");
+    // 标记（upper 内 `.wh.*`）随 upper 目录留给 `wtfs gc` 整体回收；同 id
+    // 重新注册时由 MarkerStore::clear 清扫（core 回归覆盖）。
     assert!(fx.upper_dir.exists(), "upper 目录留给 gc");
 }
 
@@ -933,10 +934,10 @@ fn rename_file_and_directory() {
     assert_eq!(code, STATUS_NOT_SAME_DEVICE.0, "目录 rename 必须报 EXDEV");
     assert!(sec(&fx, "\\wt-1\\a").is_ok(), "EXDEV 后源目录保持原样");
     assert!(sec(&fx, "\\wt-1\\z").is_err());
+    let mstate = marker_root(&fx).load().unwrap();
     assert!(
-        MarkerStore::new(marker_root(&fx)).load().unwrap().redirects.is_empty()
-            && MarkerStore::new(marker_root(&fx)).load().unwrap().opaques.is_empty(),
-        "EXDEV 不新增 redirect/opaque 标记（whiteout 仅来自前面的文件级 rename）"
+        mstate.redirects.is_empty() && mstate.whites == ["b.txt".to_string()].into_iter().collect(),
+        "EXDEV 不新增 redirect（whiteout 仅来自前面的文件级 rename）"
     );
 
     // 目标已存在且不允许替换 → collision（lower 内容也计入存在）
@@ -1294,7 +1295,7 @@ fn clean_checkout_via_vfs_creates_zero_upper_files_and_zero_fsyncs() {
     assert_eq!(count_files(&fx.upper_dir), 0, "upper 整棵零文件（含零临时副本）");
     overlay.mark_ready().unwrap();
     // 干净 checkout 零删除标记（M12：标记树为空）。
-    assert!(MarkerStore::new(marker_root(&fx)).load().unwrap().blockers().is_empty());
+    assert!(marker_root(&fx).load().unwrap().blockers().is_empty());
     for rel in ["a/1.txt", "a/2.txt", "b.txt", "exec.sh"] {
         assert!(matches!(overlay.resolve(rel).unwrap(), Resolution::Lower { .. }));
     }

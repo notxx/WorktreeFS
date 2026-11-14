@@ -1,10 +1,10 @@
 //! overlay 元数据的 SQLite 实现（spec §8.2/§8.3：[`OverlayStore`] 契约）。
 //!
 //! M12/B120100 起 overlay 元数据只保留 `worktrees`（注册/状态机/config JSON）。
-//! `whiteouts` / `renames` 两张表随 schema v4 删除：删除墓碑、目录 opaque、
-//! rename 映射全部改为 worktree 目录下的镜像标记树
-//! （[`crate::overlay_markers`]）——unlink/rmdir 只写一个 O(1) 标记文件，
-//! 不再开 SQLite 写事务；注销 worktree 直接整树删除标记。M11 已删除的
+//! `whiteouts` / `renames` 两张表随 schema v4 删除：删除墓碑改为 upper 层内的
+//! OverlayFS 同款 `.wh.<name>` 标记文件，rename 映射改为 `meta/redirect/`
+//! 标记（[`crate::overlay_markers`]）——unlink/rmdir 只写一个 O(1) 标记文件，
+//! 不再开 SQLite 写事务；标记随 upper 目录由 gc 整体回收。M11 已删除的
 //! `dedupe` / `file_ids` / `stat_cache` 派生表保持删除：upper 物理文件 +
 //! 模板清单本身即权威状态——upper 存在即 Upper、缺失即 Lower；ino =
 //! 路径稳定哈希（[`derive_ino`]）；upper mtime = 真实文件 mtime。
@@ -12,21 +12,16 @@
 //! * `register` 落 `state='initializing'` 行；整份 [`OverlayConfig`] 以 JSON
 //!   持久化在 `worktrees.config_json`，`config()` 原样往返（volume_serial、
 //!   dedupe 开关等）。
-//! * `unregister`：先按 `worktrees.upper_path` 推导标记树根并整树删除
-//!   （[`MarkerStore::wipe`]），再删 `worktrees` 行——标记先于行删除保证
-//!   失败可重试（行在即可重新推导路径）。
+//! * `unregister`：删 `worktrees` 行（幂等）；标记随 upper 目录由 gc 回收。
 //! * `file_id` 不再持久化：blake3(小写路径) 直接派生 62 位稳定值，跨进程
 //!   天然一致（见 [`crate::overlay::Overlay::file_id`]）。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rusqlite::{params, OptionalExtension};
 
 use crate::db::{db_err, now_ms};
-use crate::overlay_markers::{marker_root_for_upper, MarkerStore};
-use crate::{
-    Error, OverlayConfig, OverlayStore, Result, WorktreeId, WorktreeState,
-};
+use crate::{Error, OverlayConfig, OverlayStore, Result, WorktreeId, WorktreeState};
 
 /// overlay 元数据存储；与模板存储共享同一 [`Db`]（一个仓库一份 meta.db）。
 pub struct SqliteOverlayStore {
@@ -67,19 +62,6 @@ pub(crate) fn derive_ino(path: &str) -> i64 {
     } else {
         v as i64
     }
-}
-
-/// 按 `worktrees.upper_path` 推导该 worktree 的标记树（unregister 用）。
-fn marker_store_for(id: WorktreeId, conn: &rusqlite::Connection) -> Result<Option<MarkerStore>> {
-    let upper: Option<String> = conn
-        .query_row(
-            "SELECT upper_path FROM worktrees WHERE id = ?1",
-            params![id.0],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(db_err)?;
-    Ok(upper.map(|p| MarkerStore::new(marker_root_for_upper(Path::new(&p)))))
 }
 
 impl SqliteOverlayStore {
@@ -208,15 +190,10 @@ impl OverlayStore for SqliteOverlayStore {
     }
 
     fn unregister(&self, id: WorktreeId) -> Result<()> {
-        // M12：标记树（whiteout/opaque/redirect）整树删除，不再逐行 DELETE
-        // 子表（v4 起子表已不存在）。先删标记、后删行：标记删除失败时行仍在，
-        // 可重新推导路径重试；删除动作本身幂等。
-        {
-            let conn = self.db.lock();
-            if let Some(markers) = marker_store_for(id, &conn)? {
-                markers.wipe()?;
-            }
-        }
+        // M12：v4 起无子表可级联（whiteouts/renames 已删）。删除标记为 upper
+        // 内的 `.wh.*` 文件，随 upper 目录由 `wtfs gc` 整树回收（spec §6.6）——
+        // 注销路径保持零逐项工作；同 id 重新注册时 [`MarkerStore::clear`]
+        // 会清扫残留标记。
         self.db
             .with_tx(|tx| {
                 tx.execute("DELETE FROM worktrees WHERE id = ?1", params![id.0])
@@ -299,19 +276,16 @@ mod tests {
         );
     }
 
-    /// unregister 直接整树删除标记树（M12）：whiteout/opaque/redirect 残留
-    /// 为零；重复注销幂等。
+    /// unregister 幂等删行；标记（upper 内 `.wh.*` 与 meta/redirect）随 upper
+    /// 目录由 gc 回收——同 id 重新注册时 `MarkerStore::clear` 清扫残留。
     #[test]
-    fn unregister_wipes_marker_tree_idempotently() {
+    fn unregister_is_idempotent_and_markers_follow_upper() {
         let dir = TempDir::new().unwrap();
         let upper = dir.path().join("worktrees").join("wt-1").join("upper");
         std::fs::create_dir_all(&upper).unwrap();
-        let meta_root = crate::overlay_markers::marker_root_for_upper(&upper);
-        let markers = MarkerStore::new(meta_root.clone());
+        let markers = crate::overlay_markers::MarkerStore::new(upper.clone());
         markers.create_whiteout("gone.txt").unwrap();
-        markers.create_opaque("gone-dir").unwrap();
         markers.create_redirect("z", "a").unwrap();
-        assert!(meta_root.is_dir());
 
         let store = SqliteOverlayStore::new(Db::open_in_memory().unwrap());
         seed_template(&store, 1);
@@ -319,9 +293,12 @@ mod tests {
         assert_eq!(store.state(WorktreeId(1)).unwrap(), Some(WorktreeState::Initializing));
         store.unregister(WorktreeId(1)).unwrap();
         assert!(store.state(WorktreeId(1)).unwrap().is_none());
-        assert!(!meta_root.exists(), "注销必须整树删除标记");
         // 幂等。
         store.unregister(WorktreeId(1)).unwrap();
+        // 标记随 upper 保留（gc 回收）；重新注册前清扫。
+        assert!(upper.join(".wh.gone.txt").is_file(), "标记随 upper 保留给 gc");
+        markers.clear().unwrap();
+        assert!(markers.load().unwrap().whites.is_empty());
     }
 
     #[test]

@@ -112,6 +112,9 @@ wtfs unmount [--pipe <name>]
 - index stat 对不上时（兜底路径），git 首次 `status` 做一次全量哈希，慢但正确。
 - 不支持（检出/挂载前检测，spec §11.2）：submodule、ADS、reparse point、
   sparse/split index、大小写冲突、Windows 保留名、非 UTF-8 路径。
+- 仓库内以 `.wh.` 开头的路径为 upper 删除标记保留命名空间：此类路径跳过
+  upper（回落 lower/不存在），无法在 upper 中物化（写入会被拒绝）；
+  与 OverlayFS 同款限制。
 - 构建产物（`target/`、`CMakeCache` 等）不跨 worktree 共享；路径敏感产物仍会
   重建。
 - dead 目录与孤儿 upper 的回收要跑 `wtfs gc`（合并/teardown 后手动执行或由

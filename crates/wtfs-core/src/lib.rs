@@ -9,9 +9,11 @@
 //! * 路径校验：[`validate_relative_path`]（Windows 保留名/保留尾字符，spec §11.2）。
 //! * M2 实现：[`Db`](db::Db)（schema/迁移）、[`SqliteTemplateStore`](template_store::SqliteTemplateStore)
 //!   （checkout + index 快照 + blake3 清单）、[`SqliteOverlayStore`](overlay_store::SqliteOverlayStore)
-//!   （worktrees/whiteouts/renames/file_ids/stat_cache）、[`Overlay`](overlay::Overlay)
-//!   （upper>whiteout>lower 解析、目录合并、rename map、写路径 dedupe、固定 stat/
-//!   逻辑 mtime）、[`dedupe`]（三态决策）、[`tower_state`]（state.json → 模板 base，
+//!   （worktrees/whiteouts/renames；M11/B110100 起 dedupe/file_ids/stat_cache
+//!   三张派生表已删除，schema v3）、[`Overlay`](overlay::Overlay)
+//!   （upper>whiteout>lower 解析、目录合并、rename map、写路径 dedupe、
+//!   推导 stat：lower=固定 epoch、upper=真实 mtime、ino=路径哈希）、
+//!   [`dedupe`]（三态决策）、[`tower_state`]（state.json → 模板 base，
 //!   缺失则全量 copy 兜底）。
 //! * M8/B080100：initializing 期内存元数据批量（`overlay_batch`），mark_ready
 //!   单事务整批落库 + 状态切换原子生效；全量 checkout 事务数 O(1)。
@@ -45,7 +47,7 @@ pub use dedupe::{DedupeState, decide_for_path, hash_bytes, hash_file, hash_reade
 pub use overlay::{
     EntryKind, Overlay, OverlayDirEntry, OverlayIoStats, Resolution, StagedContent, attributes_for,
 };
-pub use overlay_store::{SqliteOverlayStore, StatCacheEntry, WorktreeRegistration};
+pub use overlay_store::{SqliteOverlayStore, WorktreeRegistration};
 pub use template_store::SqliteTemplateStore;
 pub use tower_state::{
     TowerMissionEntry, TowerStateFile, read_state_file, template_spec_for_worktree,
@@ -249,7 +251,7 @@ pub struct Stat {
     /// Git 模式：`0o100644` / `0o100755`。
     pub mode: u32,
     pub size: u64,
-    /// 固定纪元纳秒（lower）；upper 为真实/逻辑 mtime，单调前进。
+    /// 固定纪元纳秒（lower）；upper 为真实文件 mtime（随修改自然前进）。
     pub mtime_ns: i64,
     pub ctime_ns: i64,
 }
@@ -418,7 +420,9 @@ pub trait TemplateStore: Send + Sync {
 pub type FileHashMap = HashMap<String, TemplateFile>;
 
 /// overlay 元数据契约（spec §8.2）：
-/// `worktrees` / `dedupe` / `whiteouts` / `renames` / `file_ids` / `stat_cache`。
+/// `worktrees` / `whiteouts` / `renames`（M11/B110100 起 schema v3——
+/// `dedupe` / `file_ids` / `stat_cache` 三张派生表已删除；写路径决策只在
+/// 返回值中表达，状态由 upper 物理文件 + 模板清单推导）。
 ///
 /// 实现要求：`Send + Sync`；SQLite WAL、写操作事务化；upper 文件是数据真相，
 /// 元数据丢失只允许“被删 lower 文件重新出现”，不允许静默丢数据。
@@ -435,10 +439,6 @@ pub trait OverlayStore: Send + Sync {
     /// 状态切换（`initializing → ready` 等）。
     fn set_state(&self, id: WorktreeId, state: WorktreeState) -> Result<()>;
 
-    /// 记录一次写入路径 dedupe 决策（SQLite `dedupe` 表）。
-    fn record_dedupe(&self, id: WorktreeId, path: &str, decision: DedupeDecision)
-        -> Result<()>;
-
     /// lower 存在而 upper 删除 → whiteout（否则被删文件会在合并视图中重现）。
     fn add_whiteout(&self, id: WorktreeId, path: &str) -> Result<()>;
     /// upper 重建了被 whiteout 的路径 → 撤销 whiteout。
@@ -446,9 +446,6 @@ pub trait OverlayStore: Send + Sync {
 
     /// 目录级重命名映射（SQLite `renames` 表；文件级重命名 = whiteout + copy-up）。
     fn record_rename(&self, id: WorktreeId, from: &str, to: &str) -> Result<()>;
-
-    /// 稳定 file id（Windows FILE_ID 与 index `ino` 用；持久映射，路径不变则不变）。
-    fn file_id(&self, id: WorktreeId, path: &str) -> Result<u64>;
 
     /// 注销并清空该 worktree 的全部元数据（merge/abandon/gc）；
     /// upper 文件目录由调用方删除。

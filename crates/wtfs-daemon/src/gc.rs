@@ -213,7 +213,7 @@ pub fn apply(ctx: &GcContext<'_>, gc_plan: &GcPlan) -> anyhow::Result<GcReport> 
                 }
             }
         }
-        // 3. DB 行（级联清 dedupe/whiteouts/renames/file_ids/stat_cache）。
+        // 3. DB 行（级联清 whiteouts/renames；M11 起 schema v3 无派生子表）。
         if let Some(conn) = &conn {
             if let Err(e) = conn.execute("DELETE FROM worktrees WHERE id = ?1", params![dead.worktree_id]) {
                 report

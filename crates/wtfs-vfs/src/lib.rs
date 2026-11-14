@@ -16,7 +16,7 @@
 //!   upper 全量内容（正确性优先）。I/O 计数器见
 //!   [`wtfs_core::Overlay::io_stats`]。
 //! * stat：lower 报 [`wtfs_core::Stat::fixed_lower`] 固定值（与 index 对
-//!   齐），upper 报逻辑 mtime；稳定 file id；卷序列号固定。
+//!   齐），upper 报真实 mtime（M11 起无逻辑时钟）；稳定 file id；卷序列号固定。
 //! * 通知：变更事件经 notify timer 发 `FspFileSystemNotify`。
 //!
 //! 模块：

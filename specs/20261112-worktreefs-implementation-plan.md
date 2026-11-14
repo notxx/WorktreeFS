@@ -379,24 +379,35 @@ git worktree add <path> <branch>
 
 ### 8.2 SQLite 表
 
+M11/B110100 起（schema v3）只保留**不可推导**的状态；`dedupe` /
+`file_ids` / `stat_cache` 三张派生表已删除——overlay 三态就是
+lower/upper/whiteout，全部可由 upper 物理文件 + 模板清单 + whiteouts
+推导（upper 存在即 upper；ino = blake3(小写路径) 稳定哈希，根目录固定值；
+upper mtime = 真实文件 mtime），与常见 OverlayFS 的做法一致（状态放在
+upper 层自身，不做每文件数据库行）：
+
 ```sql
 repos(id, root, common_git_dir, created_at);
 templates(id, repo_id, base_commit, tree_path, index_path, state, created_at);
 template_files(template_id, path, hash, size, mode, PRIMARY KEY(template_id, path));
 worktrees(id, repo_id, path, branch, base_commit, template_id, upper_path, status, created_at);
-dedupe(worktree_id, path, state, PRIMARY KEY(worktree_id, path));
 whiteouts(worktree_id, path, PRIMARY KEY(worktree_id, path));
 renames(worktree_id, from_path, to_path, PRIMARY KEY(worktree_id, from_path));
-file_ids(worktree_id, path, id, PRIMARY KEY(worktree_id, path));
-stat_cache(worktree_id, path, mtime_ns, size, flags);
 ```
+
+迁移：`PRAGMA user_version` 驱动，v1 = 原始九张表，v2 = stat_cache 兜底
+索引，v3 = DROP 派生三表及其索引；已有库打开时逐级无损升级，控制表与
+whiteouts/renames 数据保留（M12 计划把 whiteouts/renames 替换为 upper
+标记树，届时连这两张表也一并移除）。
 
 ### 8.3 一致性
 
 - SQLite WAL；写操作事务化。
 - upper 文件是数据真相；启动时扫描 upper 与 DB 对账。
 - whiteout/rename 丢失会导致被删 lower 文件重新出现；可接受，不静默丢数据。
-- 逻辑 mtime 单调前进，避免构建工具因 mtime 倒退漏重建。
+- lower 文件 mtime/ctime 恒为固定 epoch（per-worktree config）；upper 文件
+  用真实 mtime（mtime 随真实修改自然前进，不回退）；构建工具不会因 mtime
+  倒退漏重建。
 - M0 dedupe 失败时保留 upper 文件；正确性优先。
 
 ## 9. Git shim 细节

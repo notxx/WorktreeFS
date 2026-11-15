@@ -301,6 +301,17 @@ pub struct Overlay {
     /// worktrees.status；镜像在打开时从标记树一次装载，写路径同步更新镜像
     /// 与标记文件。per-file 操作不再查库、不再扫标记树。
     meta: Mutex<MetaState>,
+    /// upper 负存在缓存（M14/B140100）：探得"upper 无此视图路径"的 rel 集合。
+    /// 只缓存负结果——"存在"永不缓存（正结果一律真探测，脏 worktree 的
+    /// stat/读取语义与无缓存时逐字节一致）。upper 任何物理变更
+    /// （create/copy_up/staged 物化/写/删/改名）经 [`MetaCtx::touch_upper`] /
+    /// [`Overlay::note_upper_mutation`] 整体清空——git worktree remove 这类
+    /// "只删 lower"的窗口里零 upper 变更，整窗缓存存活，每 unlink ~10 次
+    /// NT 探测收敛为每路径首次一次。独立于 `meta` 锁；加锁次序恒为
+    /// meta → upper_neg（probe_upper 在持 meta 时获取本锁），无反向路径。
+    /// 旁路直写 upper（绕过 FS 的外部编辑）在下一次 FS 侧 upper 变更前
+    /// 不可见；upper 目录是 daemon 私有存储，不在受支持语义内（docs §限制）。
+    upper_neg: Mutex<HashSet<String>>,
     /// I/O 插桩计数（upper 物化 / fsync；测试与诊断用）。
     io: OverlayIoStats,
 }
@@ -323,6 +334,8 @@ struct MetaState {
 struct MetaCtx<'a> {
     guard: MutexGuard<'a, MetaState>,
     markers: &'a MarkerStore,
+    /// upper 负存在缓存（[`Overlay::upper_neg`] 文档）；加锁次序 meta → 本锁。
+    upper_neg: &'a Mutex<HashSet<String>>,
 }
 
 impl<'a> MetaCtx<'a> {
@@ -366,6 +379,11 @@ impl<'a> MetaCtx<'a> {
         Ok(())
     }
 
+    /// upper 物理变更：负存在缓存整体失效（调用方已持镜像锁）。
+    fn touch_upper(&mut self) {
+        self.upper_neg.lock().clear();
+    }
+
 }
 
 impl Overlay {
@@ -388,6 +406,7 @@ impl Overlay {
                 initializing: true,
                 ..MetaState::default()
             }),
+            upper_neg: Mutex::new(HashSet::new()),
             config,
             io: OverlayIoStats::default(),
         })
@@ -417,6 +436,7 @@ impl Overlay {
                 whites: loaded.whites,
                 redirects: loaded.redirects,
             }),
+            upper_neg: Mutex::new(HashSet::new()),
             config,
             io: OverlayIoStats::default(),
         })
@@ -499,6 +519,42 @@ impl Overlay {
         MetaCtx {
             guard: self.meta.lock(),
             markers: &self.markers,
+            upper_neg: &self.upper_neg,
+        }
+    }
+
+    /// upper 物理变更（VFS 侧入口）：负存在缓存整体失效。create_inner /
+    /// open_fresh_upper 等不经 wtfs-core 写路径的 upper 变更点调用；持锁
+    /// 镜像的 core 内部路径用 [`MetaCtx::touch_upper`]（勿与本方法在持
+    /// meta 锁时混用，次序见 [`Overlay::upper_neg`] 文档）。
+    pub fn note_upper_mutation(&self) {
+        self.upper_neg.lock().clear();
+    }
+
+    /// resolve 的 upper 探测（M14）：负存在缓存命中即跳过 NT 探测。
+    /// 仅限非根、非 temp 名的 rel（调用方保证）；正结果不缓存。
+    ///
+    /// 并发安全采用"先登记后探测再回收"的乐观序：探测前先写入登记，
+    /// 探得存在时撤销——探测-登记窗口内并发 touch（整体清空）只会丢掉
+    /// 本次登记（下次重新真探测），不会留下"已存在却缓存为不存在"的
+    /// 陈旧条目（缓存在并发下只会朝"更空"漂移）。
+    fn probe_upper(&self, rel: &str, upper_path: &std::path::Path) -> Option<std::fs::Metadata> {
+        {
+            let mut neg = self.upper_neg.lock();
+            if neg.contains(rel) {
+                return None;
+            }
+            neg.insert(rel.to_string());
+        }
+        let span = Span::start();
+        let md = std::fs::symlink_metadata(upper_path);
+        span.done_with_path(Metric::NtSymlinkMetadata, || rel.to_string());
+        match md {
+            Ok(md) => {
+                self.upper_neg.lock().remove(rel);
+                Some(md)
+            }
+            Err(_) => None,
         }
     }
 
@@ -586,11 +642,15 @@ impl Overlay {
             return Ok((Resolution::NotFound, None));
         }
         let upper_path = self.upper_abs(rel);
-        let upper_md = {
+        // M14：upper 探测走负存在缓存（命中"已探得不存在"时零 NT 调用）；
+        // 根路径维持原样（探测结果透传给 stat 的目录 mtime，无缓存意义）。
+        let upper_md = if rel.is_empty() {
             let span = Span::start();
             let md = std::fs::symlink_metadata(&upper_path);
             span.done_with_path(Metric::NtSymlinkMetadata, || rel.to_string());
             md.ok()
+        } else {
+            self.probe_upper(rel, &upper_path)
         };
         if let Some(md) = &upper_md {
             if !md.is_dir() {
@@ -970,6 +1030,7 @@ impl Overlay {
                         let _ = std::fs::remove_file(&tmp);
                         if final_path.symlink_metadata().is_ok() {
                             std::fs::remove_file(&final_path)?;
+                            ctx.touch_upper();
                         }
                         // 缓存无条目时零事务（M8：per-file 无用功短路）。
                         ctx.remove_whiteout(&mapped)?;
@@ -983,6 +1044,7 @@ impl Overlay {
         // 落 upper（模板缺失 → 全量 copy 兜底，一样正确）；mtime = 真实文件
         // mtime（rename 保留写入时刻），无需发放/落库。
         std::fs::rename(&tmp, &final_path)?;
+        ctx.touch_upper();
         self.io.record_upper_write();
         let state = if template_entry.is_some() {
             DedupeState::Upper
@@ -1038,6 +1100,7 @@ impl Overlay {
                 }
                 if final_path.symlink_metadata().is_ok() {
                     std::fs::remove_file(&final_path)?;
+                    ctx.touch_upper();
                 }
                 // 缓存无条目时零事务（M8：per-file 无用功短路）。
                 ctx.remove_whiteout(&mapped)?;
@@ -1064,6 +1127,7 @@ impl Overlay {
                 drop(f);
                 self.io.record_fsync();
                 std::fs::rename(&spill, &final_path)?;
+                ctx.touch_upper();
             }
             StagedContent::Memory(data) => {
                 debug_assert_eq!(data.len() as u64, size, "memory staged size mismatch");
@@ -1091,6 +1155,7 @@ impl Overlay {
                     let _ = std::fs::remove_file(&tmp);
                     return Err(e.into());
                 }
+                ctx.touch_upper();
             }
         }
         self.io.record_upper_write();
@@ -1142,6 +1207,7 @@ impl Overlay {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::File::create(&path)?;
+                ctx.touch_upper();
                 self.io.record_upper_write();
                 Ok(())
             }
@@ -1163,6 +1229,7 @@ impl Overlay {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::copy(&path, &final_path)?;
+                ctx.touch_upper();
                 self.io.record_upper_write();
                 let mapped = self.mapped_or_same(&ctx, rel)?;
                 ctx.remove_whiteout(&mapped)?;
@@ -1185,6 +1252,7 @@ impl Overlay {
         match self.resolve_with(&ctx, rel)? {
             Resolution::Upper { .. } => {
                 std::fs::remove_file(&upper_path)?;
+                ctx.touch_upper();
                 let mapped = self.mapped_or_same(&ctx, rel)?;
                 if self.lower_has_file_or_dir(&mapped) {
                     ctx.add_whiteout(&mapped)?;
@@ -1194,6 +1262,7 @@ impl Overlay {
             Resolution::Directory { has_lower, has_upper } => {
                 if has_upper {
                     std::fs::remove_dir_all(&upper_path)?;
+                    ctx.touch_upper();
                 }
                 let mapped = self.mapped_or_same(&ctx, rel)?;
                 if has_lower || self.lower_has_file_or_dir(&mapped) {
@@ -1260,6 +1329,7 @@ impl Overlay {
                 }
                 if to_upper.symlink_metadata().is_ok() {
                     std::fs::remove_file(&to_upper)?;
+                    ctx.touch_upper();
                 }
                 if is_upper_src {
                     std::fs::rename(&path, &to_upper)?;
@@ -1269,6 +1339,7 @@ impl Overlay {
                     // epoch（best-effort），index 对齐不因改名破坏。
                     normalize_template_identical_mtime(&to_upper, self.config.fixed_stat_epoch_ns);
                 }
+                ctx.touch_upper();
                 if self.lower_has_file_or_dir(&mapped_from) {
                     ctx.add_whiteout(&mapped_from)?;
                 }
@@ -1289,6 +1360,7 @@ impl Overlay {
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::rename(self.upper_abs(from), &to_upper)?;
+                    ctx.touch_upper();
                 }
                 ctx.remove_whiteout(&mapped_to)?;
             }

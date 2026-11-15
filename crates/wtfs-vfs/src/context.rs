@@ -260,6 +260,7 @@ impl FileContext {
             std::fs::create_dir_all(parent).map_err(FspError::from)?;
         }
         let file = open_rw_create(&path)?;
+        overlay.note_upper_mutation();
         overlay.io_stats().record_upper_write();
         Ok(WriteState::InPlace { file, size: 0 })
     }
@@ -971,6 +972,7 @@ impl WtfsContext {
                         return Err(err_collision());
                     }
                     std::fs::create_dir_all(overlay.upper_abs(&rel)).map_err(FspError::from)?;
+                    overlay.note_upper_mutation();
                     let st = overlay
                         .stat(&rel)
                         .map_err(fsp_err)?

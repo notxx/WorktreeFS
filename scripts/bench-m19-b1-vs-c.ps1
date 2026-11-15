@@ -30,7 +30,11 @@
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File scripts\bench-m19-b1-vs-c.ps1
 #       [-FixtureRepo <path>] [-CRoot <path>] [-B1Root <path>] [-B1Commit <sha>]
-#       [-Worktrees 10] [-Rounds 3] [-FirstReadFiles 200] [-OutFile <path>] [-Build]
+#       [-Worktrees 10] [-Rounds 3] [-FirstReadFiles 200] [-CargoTimeoutSec 1800]
+#       [-OutFile <path>] [-Build] [-KeepRounds]
+#   注意：-Worktrees 只作用于 B1 腿；C 腿是 harness（cas_mount_bench）固定
+#   10 wt。默认跑完清理 %TEMP%\wtfs-b19-r<N> 轮次目录，-KeepRounds 保留
+#   （内含 cas-stderr.log / cas-stdout.log 原始输出）。
 
 param(
     [string]$FixtureRepo = "C:/Users/notxx/AppData/Local/Temp/wtfs-bench-large-m12/repo",
@@ -40,8 +44,10 @@ param(
     [int]$Worktrees = 10,
     [int]$Rounds = 3,
     [int]$FirstReadFiles = 200,
+    [int]$CargoTimeoutSec = 1800,
     [string]$OutFile = "",
-    [switch]$Build
+    [switch]$Build,
+    [switch]$KeepRounds
 )
 
 $ErrorActionPreference = "Continue" # PS5.1: native stderr 不作终止错误；以 $LASTEXITCODE 判定
@@ -168,8 +174,8 @@ if ($Build) {
 }
 
 # 开局清理：残留的上一轮 wtfsd（崩溃遗留）按轮管道名 + 缺省管道尽力卸载。
-foreach ($p in (1..($Rounds + 1))) {
-    & $B1Exe --pipe "\\.\pipe\wtfs-b19-r$p" unmount *> $null
+foreach ($pn in (1..($Rounds + 1))) {
+    & $B1Exe --pipe "\\.\pipe\wtfs-b19-r$pn" unmount *> $null
 }
 & $B1Exe unmount *> $null
 
@@ -179,11 +185,11 @@ $results.Add("")
 $results.Add("- fixture: $FixtureRepo (fresh local clone per round)")
 $results.Add("- B1: commit $B1Commit @ $B1Root (release CLI: wtfs + wtfsd)")
 $results.Add("- C: ff4216f @ $CRoot (cargo test cas_mount_bench, in-process harness)")
-$results.Add("- rounds: $Rounds, worktrees/round: $Worktrees, first-read files: $FirstReadFiles")
+$results.Add("- rounds: $Rounds; worktrees: B1 = $Worktrees（-Worktrees 参数，只作用于 B1 腿）/ C = 10（harness 固定）; first-read files: $FirstReadFiles")
 $results.Add("")
 
 $summary = New-Object System.Collections.Generic.List[string]
-$summary.Add("## 轮次汇总（10 wt 中位数，ms）")
+$summary.Add("## 轮次汇总（每腿各自 wt 数的中位数，ms；B1 = $Worktrees wt / C = 10 wt harness 固定）")
 $summary.Add("")
 $summary.Add("| 轮 | 实现 | add | ready/seed | status 冷 | status 热 | diff | commit | remove | 首读合计 | 驱动峰值 WS MB |")
 $summary.Add("| -- | ---- | --- | ---------- | --------- | --------- | ---- | ------ | ------ | -------- | -------------- |")
@@ -261,8 +267,8 @@ for ($r = 1; $r -le $Rounds; $r++) {
             $sample = (Assert-Git $view @("ls-files", "*.c", "*.h") "ls-files sample") -split "`n" |
                 Where-Object { $_ } | Select-Object -First $FirstReadFiles
             $sw.Restart()
-            foreach ($p in $sample) {
-                $bytes = [IO.File]::ReadAllBytes((Join-Path $view $p))
+            foreach ($path in $sample) {
+                $bytes = [IO.File]::ReadAllBytes((Join-Path $view $path))
                 $firstReadKB += $bytes.Length / 1024.0
             }
             $sw.Stop()
@@ -287,18 +293,18 @@ for ($r = 1; $r -le $Rounds; $r++) {
     $b1Mem = Stop-MemSampler $b1Job "b1-r$r"
     & git -C $repo worktree prune *> $null
 
-    $results.Add("## Round $r — B1（CLI @ $B1Commit）")
+    $results.Add("## Round $r — B1（CLI @ $B1Commit，$Worktrees wt）")
     $results.Add("")
     $results.Add(("- template create（一次性）: {0:N1} ms；mount: {1:N1} ms" -f $templateMs, $mountMs))
-    $results.Add(("- add（plain worktree add，10 wt 中位）: {0:N1} ms；各 wt: {1}" -f (Median $add), (($add | ForEach-Object { [math]::Round($_, 1) }) -join ", ")))
-    $results.Add(("- ready（轮询至 ready，10 wt 中位）: {0:N1} ms；add+ready 中位: {1:N1} ms" -f (Median $ready), ((Median $add) + (Median $ready))))
+    $results.Add(("- add（plain worktree add，{0} wt 中位）: {1:N1} ms；各 wt: {2}" -f $Worktrees, (Median $add), (($add | ForEach-Object { [math]::Round($_, 1) }) -join ", ")))
+    $results.Add(("- ready（轮询至 ready，{0} wt 中位）: {1:N1} ms；add+ready 中位: {2:N1} ms" -f $Worktrees, (Median $ready), ((Median $add) + (Median $ready))))
     $results.Add(("- status 冷/热（中位）: {0:N1} / {1:N1} ms" -f (Median $cold), (Median $hot)))
     $results.Add(("- diff --stat（中位）: {0:N1} ms" -f (Median $diff)))
     $results.Add(("- commit -am 单文件（中位）: {0:N1} ms" -f (Median $commit)))
     $results.Add(("- remove --force（中位）: {0:N1} ms（首个 {1:N1} ms）" -f (Median $remove), $tRemoveFirst))
     $results.Add(("- 首读 {0} 个 .c/.h: {1:N1} ms 合计（{2:N3} ms/文件，{3:N0} KB）" -f $FirstReadFiles, $firstReadMs, ($firstReadMs / $FirstReadFiles), $firstReadKB))
-    $results.Add(("- upper 磁盘（10 wt 合计）: {0} 文件 / {1:N1} KB；templates: {2} 文件 / {3:N1} MB；store 总计: {4:N1} MB" -f `
-        (($upperFiles | Measure-Object -Sum).Sum), (($upperBytes | Measure-Object -Sum).Sum / 1024.0), $tplD.Files, ($tplD.Bytes / 1MB), ($storeTotals.Bytes / 1MB)))
+    $results.Add(("- upper 磁盘（{0} wt 合计）: {1} 文件 / {2:N1} KB；templates: {3} 文件 / {4:N1} MB；store 总计: {5:N1} MB" -f `
+        $Worktrees, (($upperFiles | Measure-Object -Sum).Sum), (($upperBytes | Measure-Object -Sum).Sum / 1024.0), $tplD.Files, ($tplD.Bytes / 1MB), ($storeTotals.Bytes / 1MB)))
     $results.Add(("- 驱动进程峰值 WS: {0} MB（{1}）" -f $b1Mem.PeakMB, $b1Mem.Who))
     $results.Add("")
 
@@ -306,21 +312,47 @@ for ($r = 1; $r -le $Rounds; $r++) {
         (Median $add), (Median $ready), (Median $cold), (Median $hot), (Median $diff), (Median $commit), (Median $remove), $firstReadMs, $b1Mem.PeakMB))
 
     # ================= C leg =================
-    Write-Host "--- C leg (harness cas_mount_bench @ ff4216f) ---"
+    Write-Host "--- C leg (harness cas_mount_bench @ ff4216f，固定 10 wt) ---"
     $env:WTFS_BENCH_REPO = $repo
     $casLog = Join-Path $roundDir "cas-stderr.log"
     $casOutLog = Join-Path $roundDir "cas-stdout.log"
     $memJob = Start-MemSampler "cas-r$r" (Join-Path $CRoot "target\release\deps")
-    # 经 Start-Process 直写文件，避免 PS5.1 把 stderr 包成 ErrorRecord（其
-    # ToString 会注入 "System.Management.Automation.RemoteException" 垃圾行，
-    # 破坏 harness 报告表）。harness 报告走 eprintln → stderr。
+    # 经 cmd /c 原生重定向直写文件（OS 级文件句柄，非 PS 管道）：避免
+    # PS5.1 把 stderr 包成 ErrorRecord（其 ToString 会注入
+    # "System.Management.Automation.RemoteException" 垃圾行，破坏 harness
+    # 报告表），也避免 PS 管道缓冲塞死子进程。harness 报告走 eprintln →
+    # stderr。
+    # 不用 -Wait：PS5.1 的 Start-Process -Wait 在子进程退出后仍可能挂起
+    # （评审 r1 P2-1 实测 15+ 分钟不退出）；改为 -PassThru +
+    # WaitForExit(超时)，超时杀进程树并报错。
+    # 退出码不经 .NET ExitCode 读（PS5.1 PassThru 惰性句柄下会拿到空值，
+    # 实测 exit 为空误报失败），由 cmd echo %errorlevel% 落文件再读。
     $cargo = Get-Command cargo
-    $p = Start-Process -FilePath $cargo.Source -NoNewWindow -Wait -PassThru `
-        -WorkingDirectory $CRoot `
-        -RedirectStandardOutput $casOutLog -RedirectStandardError $casLog `
-        -ArgumentList "test", "--release", "-p", "wtfs-vfs", "--test", "cas_mount_bench", "--", "--ignored", "--nocapture"
+    $exitCodeFile = Join-Path $roundDir "cas-exitcode.txt"
+    # cmd /c 对含特殊字符（& >）的命令行会剥离首尾引号（老规则），带引号
+    # 路径会被剥坏 → "找不到路径"。本脚本的四个路径约定不含空格，去掉
+    # 引号传裸路径；有任一路径含空格时直接报错而不是悄悄跑错。
+    foreach ($q in @($cargo.Source, $casOutLog, $casLog, $exitCodeFile)) {
+        if ($q -match "\s") { throw "bench 路径含空格，cmd 重定向无法安全处理: $q（请将 -CRoot/-OutFile/TEMP 设为无空格路径）" }
+    }
+    $cmdLine = '/v:on /c {0} test --release -p wtfs-vfs --test cas_mount_bench -- --ignored --nocapture > {1} 2> {2} & echo !errorlevel! > {3}' -f `
+        $cargo.Source, $casOutLog, $casLog, $exitCodeFile
+    $cargoProc = Start-Process -FilePath $env:ComSpec -ArgumentList $cmdLine -NoNewWindow -PassThru `
+        -WorkingDirectory $CRoot
+    $exited = $cargoProc.WaitForExit($CargoTimeoutSec * 1000)
     Remove-Item Env:WTFS_BENCH_REPO -ErrorAction SilentlyContinue
-    if ($p.ExitCode -ne 0) { throw "cas_mount_bench failed (exit $($p.ExitCode)); log: $casLog" }
+    if (-not $exited) {
+        & taskkill.exe /T /F /PID $cargoProc.Id *> $null
+        try { $cargoProc.Kill() } catch { }
+        throw "cas_mount_bench 未在 $CargoTimeoutSec s 内退出（已 kill 进程树 pid $($cargoProc.Id)）；log: $casLog"
+    }
+    $exitCodeLines = @(Get-Content -LiteralPath $exitCodeFile -ErrorAction SilentlyContinue)
+    $exitCodeText = ""
+    if ($exitCodeLines.Count -gt 0) { $exitCodeText = [string]$exitCodeLines[0] }
+    $casExit = $null
+    if ($exitCodeText -match "(-?\d+)") { $casExit = [int]$Matches[1] }
+    if ($null -eq $casExit) { throw "cas_mount_bench 退出码不可读（cas-exitcode.txt 缺失/为空: '$exitCodeText'）；log: $casLog" }
+    if ($casExit -ne 0) { throw "cas_mount_bench failed (exit $casExit); log: $casLog" }
     $casMem = Stop-MemSampler $memJob "cas-r$r"
     & git -C $repo worktree prune *> $null
 
@@ -339,7 +371,7 @@ for ($r = 1; $r -le $Rounds; $r++) {
     }
     if ($block.Count -lt 4) { throw "CAS report table rows missing in round $r log" }
 
-    $results.Add("## Round $r — C（harness @ ff4216f）")
+    $results.Add("## Round $r — C（harness @ ff4216f，固定 10 wt）")
     $results.Add("")
     $results.AddRange($block.ToArray())
     $results.Add(("- 驱动进程峰值 WS: {0} MB（{1}；进程内 harness，含 manifest/registry 内存，非纯 FS 层）" -f $casMem.PeakMB, $casMem.Who))
@@ -358,3 +390,10 @@ Write-Host ""
 Write-Host $resultsText
 Write-Host ""
 Write-Host "written: $OutFile"
+
+if (-not $KeepRounds) {
+    foreach ($rn in (1..$Rounds)) {
+        Remove-Item -LiteralPath (Join-Path $env:TEMP "wtfs-b19-r$rn") -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "round dirs cleaned (use -KeepRounds to retain cas-stderr.log / cas-stdout.log)"
+}

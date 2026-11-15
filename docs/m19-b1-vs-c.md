@@ -21,6 +21,8 @@ CAS 虚拟视图，Git 对象库 + manifest + 按需 hydrate + upper。两者挂
   自动流程**；B1 的 add 是 plain `git worktree add`（挂载点内
   auto_register）。
 * remove 两者都用 `--force`（C 的稀疏 upper 需要；B1 同口径）。
+* wt 数按腿不同：B1 腿由 `-Worktrees` 参数控制（默认 10）；C 腿是
+  harness（cas_mount_bench）**固定 10 wt**，不受参数影响。
 * 每轮 fresh 本地 clone 夹具，B1/C 交替，共 3 轮；轮间清理 store 与
   worktree。B1/C 各自独立 checkout + target dir 构建 release。
 * 指标：add（B1 含 ready 轮询；C 含 seed，注册/清位未单列计时）、
@@ -103,12 +105,15 @@ C 首读为 harness 内 Rust `fs::read`（含 cat-file 子进程 + fsync）—�
   于"冷读集"，且缓存跨 worktree 全局共享——第二个 worktree 读同一 blob
   不再付费。
 * **diff/commit 干净树零 hydrate（diff 1.96×、commit 1.24×）；成本在
-  git 自身与写终裁**。C 干净树 `diff --stat` 与 status 同路径（manifest
+  git 自身的工作量**。C 干净树 `diff --stat` 与 status 同路径（manifest
   stat，零对象读），慢近一倍的部分是每目录 list_stat 枚举 + git 自身
-  工作量（B1 模板树由 NTFS 原生枚举）；commit 时 README 编辑 copy-up
-  （cat-file 取 blob + 复制 upper + 固定纪元 mtime）+ 终裁恰好一次
-  fsync（B1 M9 后同为单 fsync 语义）+ commit + refresh_head 重载
-  manifest——故 commit 差距收窄到 1.24×。
+  工作量（B1 模板树由 NTFS 原生枚举）。commit 的计时区间只覆盖
+  `git commit -am` 本身：README 编辑的 copy-up（cat-file 取 blob + 复制
+  upper + 终裁 fsync）发生在计时前的写文件步骤，refresh_head 重载
+  manifest 在计时后调用，都不计入 286 ms；计时内主要是 commit 的全树
+  stat 扫描（等价一次 status 的 per-op VFS IPC，经挂载视图逐项探测）+
+  对象与 index 写直落挂载外的真实 .git。与 B1（230 ms，同一 git 流程但
+  stat 走 NTFS）的差距主要是 stat 单价差。
 * **remove 的 IPC 地板：B1 删可见树，C 删稀疏 upper（3,195 vs 34 ms，
   ~94×）**。B1 `remove --force` 要经 FS 逐项删掉 4,874 文件的可见树
   （set_delete/cleanup/rmdir 回调 = IPC 地板；M14 从 6,427 ms 优化到
@@ -187,6 +192,8 @@ powershell -ExecutionPolicy Bypass -File scripts\bench-m19-b1-vs-c.ps1 `
 
 脚本行为：每轮 fresh 本地 clone → B1 CLI 全流程（模板一次性计时）→ C
 harness（cargo test，WTFS_BENCH_REPO 指向轮 clone）→ 逐轮落原始结果 +
-轮次汇总表。残留 wtfsd 按轮管道名（`\\.\pipe\wtfs-b19-r<N>`）开局清理。
+轮次汇总表。残留 wtfsd 按轮管道名（`\\.\pipe\wtfs-b19-r<N>`）开局清理；
+C 腿经 `cmd /c` 超时兜底驱动（`-CargoTimeoutSec`，默认 1800 s），跑完
+默认清理 `%TEMP%\wtfs-b19-r<N>` 轮次目录（`-KeepRounds` 保留原始日志）。
 注意：脚本文件必须保存为 UTF-8 with BOM（PS5.1 无 BOM 会按 ANSI 误读
 中文注释与全角字符串）。

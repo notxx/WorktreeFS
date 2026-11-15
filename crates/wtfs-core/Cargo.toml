@@ -17,7 +17,8 @@ serde_json.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-windows.workspace = true
+# Win32_System_Threading：profiler 的 GetProcessTimes（user/kernel CPU 采样）。
+windows = { workspace = true, features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile.workspace = true

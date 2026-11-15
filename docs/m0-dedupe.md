@@ -205,6 +205,109 @@ powershell -ExecutionPolicy Bypass -File scripts\bench-m0.ps1 [-Repo <真实仓�
   同样逐文件走 FS；对 Tower teardown 场景可接受但值得后续优化。
 - 正确性不受影响：harness 每轮断言 `git status` 干净，三轮全绿。
 
+## 读路径 profiling 与优化（M13/B130100）
+
+### 回调级 profiler
+
+`WTFS_VFS_PROFILE=1`（或 `true`/`on`）启用进程内回调级 profiler
+（`wtfs-core::profiling`）；关闭时热路径只剩一次原子 load——零计时、零
+分配、零锁，生产路径零开销。计量点分三层，各含次数/累计/均值/最大耗时：
+
+- `cb.*`：16 个 WinFSP 回调（get_security_by_name/open/create/get_file_info/
+  read_directory/cleanup/close/…）的 handler 墙钟；
+- `ov.*`：overlay 逻辑入口（stat/resolve/list_stat/derive_ino/map_to_lower…）；
+- `nt.*`：NTFS 系统调用（symlink_metadata/is_dir 探测/read_dir/
+  dir_entry_meta/open/read…）。
+
+耗时 ≥200µs 的调用进 Top-32 慢调用列表（带路径；路径字符串仅慢调用才
+物化）。另含 `GetProcessTimes` 进程 user/kernel CPU 快照（基准取窗口差值：
+kernel 增量 ≈ NTFS 内核侧开销，user 增量 ≈ handler 逻辑）。
+
+```bat
+:: daemon 路径：停机时把累计报告 best-effort 写到 <log_dir>/vfs-profile.txt
+set WTFS_VFS_PROFILE=1
+wtfsd.exe ...
+
+:: 基准/测试路径：4,874 文件夹具 status 冷/热窗口归因（ignored 集成测试）
+set LIBCLANG_PATH=%LOCALAPPDATA%\wtfs\tools\llvm-23.1.5\bin
+set WTFS_VFS_PROFILE=1
+set WTFS_BENCH_REPO=<大仓库 clone>
+set WTFS_BENCH_WTS=2
+cargo test --release -p wtfs-daemon --test m13_profile -- --ignored --nocapture
+```
+
+### 归因口径
+
+同一窗口内（profiler `reset()` 前后）取差值，三分：
+
+1. **NTFS 元数据** = Σ`nt.*` 墙钟（次数 × 单次延迟，冷/热差异主要来源）；
+2. **overlay 逻辑** = Σ`cb.*` − Σ`nt.*`（锁/哈希/内存索引）；
+3. **WinFSP IPC/内核派发 + git 自身 CPU** = git status 墙钟 − Σ`cb.*`。
+
+注意 git 的并行 index preload（`core.preloadindex`）会让多个回调在
+dispatcher 线程上并发执行，Σ回调可能超过墙钟——比较占比时以次数与单次
+均值为准，墙钟差值仅作量级参考。
+
+### 实测：4,874 tracked files（git/git 夹具，status 窗口归因）
+
+优化前（本 mission 起点）：
+
+| 指标 | 数值 |
+|---|---|
+| git status 冷/热 | 2601 / 2564 ms（native 100-172 ms） |
+| Σ回调墙钟 | 7.3 s（read_directory 占 5.2 s） |
+| `ov.child_stat`（read_directory 逐子项 stat） | 22.6K 次 / 3.9 s，每子项 2 次 NTFS 探测 |
+| `nt.is_dir_probe`（resolve 无条件第二探测） | 23.3K 次 / 1.1 s |
+| NTFS 探测合计 | ~47K 次 / 2.4 s（并行下内核开销放大：daemon kernel +13 s） |
+| meta 锁持锁探测的争用放大 | get_security_by_name/open 均值 3-4 ms |
+| 实测噪音（不改） | `ov.map_to_lower` 11.5 ms、`ov.derive_ino` 8.2 ms（<0.5%） |
+
+改动（全部由上表数据决定）：
+
+- **resolve 元数据复用**（A+B）：`resolve_with_md` 一次 `symlink_metadata`
+  同时判定 upper 文件/目录并回传给 stat 复用——upper 臂第二次 metadata 与
+  `is_dir` 第二探测整体消失（M0 无 symlink，语义等价）；
+- **`Overlay::list_stat`**（C）：父目录解析一次 + readdir 的 file_type/
+  metadata 直接推导子项 stat，VFS `read_directory` 弃用逐子项
+  `overlay.stat`；lower-only 目录 upper 侧缺失照常跳过（与 `list` 一致）；
+- **`LowerLookup` 改 `Cow`**（D）：读路径 redirect 映射零堆分配
+  （`Mapped` 仅迁移产物才分配）；
+- `map_to_lower`/`derive_ino` 实测为噪音，仅做 Cow 卫生改造，不引入缓存
+  （file_id 本就每次 stat 只哈希一次）。
+
+优化后（同一夹具同一窗口）：
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| git status 冷 | 2601 ms | **139.7 ms** |
+| git status 热（5 轮中位） | 2564 ms | **140.9 ms** |
+| native 对照 | 100-172 ms | 100-172 ms（同轮 171/146 ms） |
+| `ov.child_stat` / `nt.is_dir_probe` | 22.6K / 23.3K 次 | **0 / 0** |
+| NTFS 探测合计 | ~47K 次 | ~1.1K 次 |
+| 目标 status <1s | — | **达成（~0.14 s，≈native）** |
+
+### 实测：10 worktree 全量基准（git/git 夹具 4,874 tracked files，10 轮中位）
+
+2026-11-15，release 构建，`m0_benchmark` harness，来源
+`wtfs-bench-large-m12/repo`（git/git @ `923ecfe`）：
+
+| metric | native worktree | WorktreeFS |
+|---|---|---|
+| worktree add (median) | 2790 ms | 5913 ms |
+| add + ready switch (median) | - | 5974 ms |
+| disk: worktree tree (mean) | 49.27 MB (4875 files) | 49.27 MB (4875 files) |
+| disk: private upper store (mean) | - | 89 B |
+| **git status cold (median)** | 211 ms | **135 ms** |
+| git status hot (median) | 54 ms | 137 ms |
+| worktree remove (median) | 1322 ms | 6147 ms |
+| one-off: template + mount | - | 3756 ms + 41 ms |
+
+status 冷热全部 <1s（目标达成）：冷态 135ms 已优于 native（211ms，本轮
+native 冷态方差大），热态 137ms（native 54ms 的 index 全热缓存更快，但绝对
+值仍远低于目标）。M13 只动读路径：add/remove 仍走写入/删除路径（写入路径
+优化与 remove/unlink 归 M14）；每 worktree 私有 upper 89 字节，M9 零
+fsync/M12 零标记写入性质保持。
+
 ## 集成测试
 
 - `cargo test --workspace`：单测 + 无挂载集成（无需 WinFSP 的 watcher 链路）。

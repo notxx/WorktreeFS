@@ -40,6 +40,7 @@ mod gitx;
 pub mod overlay;
 pub mod overlay_markers;
 pub mod overlay_store;
+pub mod profiling;
 pub mod template_store;
 pub mod tower_state;
 

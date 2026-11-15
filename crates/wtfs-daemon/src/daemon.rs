@@ -161,6 +161,26 @@ impl Daemon {
         if let Some(volume) = self.volume.lock().take() {
             volume.unmount();
         }
+        self.dump_profile_report();
+    }
+
+    /// profiler 启用时（`WTFS_VFS_PROFILE=1`）把累计报告 best-effort 落到
+    /// `log_dir/vfs-profile.txt` 并入日志（M13/B130100）。
+    fn dump_profile_report(&self) {
+        if !wtfs_core::profiling::enabled() {
+            return;
+        }
+        let report = wtfs_core::profiling::report();
+        tracing::info!(target: "vfs_profile", "\n{}", report);
+        let path = self.cfg.log_dir.join("vfs-profile.txt");
+        match (std::fs::create_dir_all(&self.cfg.log_dir), std::fs::write(&path, &report)) {
+            (Ok(()), Ok(())) => {
+                tracing::info!(target: "vfs_profile", path = %path.display(), "profile report written");
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(target: "vfs_profile", path = %path.display(), error = %e, "failed to write profile report");
+            }
+        }
     }
 
     pub fn config(&self) -> &DaemonConfig {

@@ -57,6 +57,7 @@ static DIAG_W_DEL: DiagAtomic = DiagAtomic::new(0);
 
 use crate::overlay_markers::MarkerStore;
 use crate::overlay_store::{SqliteOverlayStore, derive_ino};
+use crate::profiling::{Metric, Span};
 use crate::{
     DedupeState, Error, FileAttributes, FileHash, FileHashMap, OverlayConfig, OverlayStore,
     Result, Stat, TemplateFile, WorktreeId, validate_relative_path,
@@ -148,24 +149,33 @@ pub struct OverlayDirEntry {
 
 /// lower 侧查找时经过 redirect 映射改写的结果（映射来源 = redirect 标记，
 /// 仅 v3→v4 迁移会产生；M12 起目录级 rename 默认 EXDEV，不再新增映射）。
+/// `Same` 借用调用方路径（M13：读路径零分配；`Mapped` 仅迁移产物才会走
+/// 堆分配路径）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LowerLookup {
+pub(crate) enum LowerLookup<'a> {
     /// 无 redirect 命中，lower 路径即原路径。
-    Same(String),
+    Same(std::borrow::Cow<'a, str>),
     /// 命中 redirect：lower 侧应查改写后的路径。
-    Mapped(String),
+    Mapped(std::borrow::Cow<'a, str>),
     /// 位于某 redirect 的 from 子树下（目录改名前已搬走），lower 侧不可见。
     MovedAway,
 }
 
 /// rename/redirect 映射的纯改写（单层映射；链式 rename 不支持）。
-pub(crate) fn map_to_lower_with(renames: &[(String, String)], rel: &str) -> LowerLookup {
+pub(crate) fn map_to_lower_with<'a>(renames: &[(String, String)], rel: &'a str) -> LowerLookup<'a> {
+    let span = Span::start();
+    let out = map_to_lower_with_inner(renames, rel);
+    span.done(Metric::OvMapToLower);
+    out
+}
+
+fn map_to_lower_with_inner<'a>(renames: &[(String, String)], rel: &'a str) -> LowerLookup<'a> {
     for (from, to) in renames {
         if rel == to {
-            return LowerLookup::Mapped(from.clone());
+            return LowerLookup::Mapped(std::borrow::Cow::Owned(from.clone()));
         }
         if let Some(suffix) = rel.strip_prefix(&format!("{to}/")) {
-            return LowerLookup::Mapped(format!("{from}/{suffix}"));
+            return LowerLookup::Mapped(std::borrow::Cow::Owned(format!("{from}/{suffix}")));
         }
     }
     for (from, _) in renames {
@@ -173,7 +183,7 @@ pub(crate) fn map_to_lower_with(renames: &[(String, String)], rel: &str) -> Lowe
             return LowerLookup::MovedAway;
         }
     }
-    LowerLookup::Same(rel.to_string())
+    LowerLookup::Same(std::borrow::Cow::Borrowed(rel))
 }
 
 /// `mapped` 是否被删除标记挡住（自身或任一祖先目录命中）。
@@ -516,7 +526,7 @@ impl Overlay {
     /// `ctx` 由调用方持有（勿经 [`Overlay::meta_ctx`] 重复加锁）。
     fn mapped_or_same(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<String> {
         match map_to_lower_with(ctx.redirects(), rel) {
-            LowerLookup::Same(s) | LowerLookup::Mapped(s) => Ok(s),
+            LowerLookup::Same(s) | LowerLookup::Mapped(s) => Ok(s.into_owned()),
             LowerLookup::MovedAway => Ok(rel.to_string()),
         }
     }
@@ -556,55 +566,85 @@ impl Overlay {
     /// 持有，同一逻辑操作的元数据视图一致（initializing/ready 均为内存镜像，
     /// 零 DB 读、零标记 I/O）。
     fn resolve_with(&self, ctx: &MetaCtx<'_>, rel: &str) -> Result<Resolution> {
+        let span = Span::start();
+        let out = self.resolve_with_md(ctx, rel).map(|(r, _)| r);
+        span.done_with_path(Metric::OvResolve, || rel.to_string());
+        out
+    }
+
+    /// 解析 + upper 侧已取得的元数据（M13/B130100）：调用方（stat/list_stat）
+    /// 复用这次 `symlink_metadata`，消除 upper 臂的第二次 metadata 调用。
+    /// upper 目录判断从同一份元数据推导——M0 无 symlink，与 `Path::is_dir`
+    /// 等价，原先的第二次 NTFS 探测（`is_dir`）整体消失。
+    fn resolve_with_md(
+        &self,
+        ctx: &MetaCtx<'_>,
+        rel: &str,
+    ) -> Result<(Resolution, Option<std::fs::Metadata>)> {
         self.validate_rel_or_root(rel)?;
         if !rel.is_empty() && is_temp_name(basename(rel)) {
-            return Ok(Resolution::NotFound);
+            return Ok((Resolution::NotFound, None));
         }
         let upper_path = self.upper_abs(rel);
-        if let Ok(md) = std::fs::symlink_metadata(&upper_path) {
+        let upper_md = {
+            let span = Span::start();
+            let md = std::fs::symlink_metadata(&upper_path);
+            span.done_with_path(Metric::NtSymlinkMetadata, || rel.to_string());
+            md.ok()
+        };
+        if let Some(md) = &upper_md {
             if !md.is_dir() {
-                return Ok(Resolution::Upper { path: upper_path });
+                return Ok((Resolution::Upper { path: upper_path }, Some(md.clone())));
             }
         }
+        let upper_is_dir = upper_md.as_ref().is_some_and(|md| md.is_dir());
         if rel.is_empty() {
-            return Ok(Resolution::Directory {
-                has_lower: self.lower.is_some(),
-                has_upper: true,
-            });
+            return Ok((
+                Resolution::Directory {
+                    has_lower: self.lower.is_some(),
+                    has_upper: true,
+                },
+                upper_md,
+            ));
         }
         let mapped = match map_to_lower_with(ctx.redirects(), rel) {
             LowerLookup::Same(s) | LowerLookup::Mapped(s) => s,
             // 目录改名（迁移来的 redirect）前已搬走的旧路径：不可见。
-            LowerLookup::MovedAway => return Ok(Resolution::NotFound),
+            LowerLookup::MovedAway => return Ok((Resolution::NotFound, None)),
         };
         let blocked = whiteout_blocks(&mapped, &ctx.guard.whites);
         let lower_file = self.lookup_lower(&mapped);
         let has_lower_dir = !blocked && lower_file.is_none() && self.has_lower_dir(&mapped);
-        let upper_is_dir = upper_path.is_dir();
         if blocked {
             // upper 文件已查无；upper 目录可能已重建（opaque 语义：只显示
             // upper 内容，lower 子树继续隐藏）。
             if upper_is_dir {
-                return Ok(Resolution::Directory {
-                    has_lower: false,
-                    has_upper: true,
-                });
+                return Ok((
+                    Resolution::Directory {
+                        has_lower: false,
+                        has_upper: true,
+                    },
+                    upper_md,
+                ));
             }
-            return Ok(Resolution::Whiteout);
+            return Ok((Resolution::Whiteout, None));
         }
         if let Some(file) = lower_file {
             let path = self
                 .lower_abs(&mapped)
                 .ok_or_else(|| Error::Overlay("lower_root missing for template file".into()))?;
-            return Ok(Resolution::Lower { file, path });
+            return Ok((Resolution::Lower { file, path }, None));
         }
         if has_lower_dir || upper_is_dir {
-            return Ok(Resolution::Directory {
-                has_lower: has_lower_dir,
-                has_upper: upper_is_dir,
-            });
+            return Ok((
+                Resolution::Directory {
+                    has_lower: has_lower_dir,
+                    has_upper: upper_is_dir,
+                },
+                upper_md,
+            ));
         }
-        Ok(Resolution::NotFound)
+        Ok((Resolution::NotFound, None))
     }
 
     /// 解析顺序：upper > whiteout > lower（spec §6.5）。
@@ -618,6 +658,13 @@ impl Overlay {
     /// lower 子项逐名应用 redirect 映射与 whiteout/opaque 标记（对应标记目录
     /// 的子项过滤），不做全树扫描。
     pub fn list(&self, dir_rel: &str) -> Result<Vec<OverlayDirEntry>> {
+        let span = Span::start();
+        let out = self.list_inner(dir_rel);
+        span.done_with_path(Metric::OvList, || dir_rel.to_string());
+        out
+    }
+
+    fn list_inner(&self, dir_rel: &str) -> Result<Vec<OverlayDirEntry>> {
         self.validate_rel_or_root(dir_rel)?;
         if self.is_initializing()? {
             return Ok(Vec::new());
@@ -653,7 +700,13 @@ impl Overlay {
 
         // upper 侧：真实目录，覆盖/补充 lower；临时文件不可见。
         let upper_dir = self.upper_abs(dir_rel);
-        match std::fs::read_dir(&upper_dir) {
+        let read_dir = {
+            let span = Span::start();
+            let rd = std::fs::read_dir(&upper_dir);
+            span.done_with_path(Metric::NtReadDir, || dir_rel.to_string());
+            rd
+        };
+        match read_dir {
             Ok(read_dir) => {
                 for entry in read_dir.flatten() {
                     let os_name = entry.file_name();
@@ -684,6 +737,152 @@ impl Overlay {
                 kind,
             })
             .collect())
+    }
+
+    /// 目录合并枚举 + 逐项 stat（M13/B130100 读路径）：父目录解析一次，
+    /// 子项 stat 由模板清单/枚举元数据直接推导——不逐子项 [`Overlay::stat`]
+    /// 全量重解析（此前每子项 2 次 NTFS 探测 × 每目录全部子项，status 的
+    /// 头号开销）。子项语义与逐项 stat 完全一致：whiteout 只隐藏 lower
+    /// （upper 子项照常可见）、lower 文件固定 stat、upper 文件/目录真实
+    /// mtime、ino = 视图路径稳定哈希；initializing 返回空。
+    /// 返回按名字排序的 (name, stat)（挂载根场景不经此路径）。
+    pub fn list_stat(&self, dir_rel: &str) -> Result<Vec<(String, Stat)>> {
+        let span = Span::start();
+        let out = self.list_stat_inner(dir_rel);
+        span.done_with_path(Metric::OvListStat, || dir_rel.to_string());
+        out
+    }
+
+    fn list_stat_inner(&self, dir_rel: &str) -> Result<Vec<(String, Stat)>> {
+        self.validate_rel_or_root(dir_rel)?;
+        if self.is_initializing()? {
+            return Ok(Vec::new());
+        }
+        let ctx = self.meta_ctx();
+        let vs = u64::from(self.config.volume_serial);
+        let epoch = self.config.fixed_stat_epoch_ns;
+        // BTreeMap 保持与 list 相同的名字序；upper 覆盖 lower。
+        let mut stats: BTreeMap<String, Stat> = BTreeMap::new();
+
+        // lower 侧：内存索引按目录取直接子项，逐名应用 redirect + 删除标记
+        // （过滤逻辑与 [`Overlay::list`] 完全一致）；模板命中 → 固定 lower
+        // stat，lower 目录 → 固定 epoch 目录 stat。
+        match map_to_lower_with(ctx.redirects(), dir_rel) {
+            LowerLookup::MovedAway => {}
+            LowerLookup::Same(m) | LowerLookup::Mapped(m) => {
+                if !whiteout_blocks(&m, &ctx.guard.whites) {
+                    if let Some(entries) = self.lower.as_ref().and_then(|idx| idx.children_of(&m)) {
+                        for (name, kind) in entries {
+                            let view_child = join_rel(dir_rel, name);
+                            match map_to_lower_with(ctx.redirects(), &view_child) {
+                                LowerLookup::MovedAway => continue,
+                                LowerLookup::Same(n) | LowerLookup::Mapped(n) => {
+                                    if whiteout_blocks(&n, &ctx.guard.whites) {
+                                        continue;
+                                    }
+                                    let template = self.lower.as_ref().and_then(|idx| idx.file(&n));
+                                    let st = match kind {
+                                        EntryKind::File => {
+                                            let Some(t) = template else {
+                                                // children_of 由模板文件行构建，
+                                                // File 必有模板；防御分支与逐项
+                                                // stat 的 NotFound（跳过）一致。
+                                                continue;
+                                            };
+                                            Stat {
+                                                dev: vs,
+                                                ino: file_id_for(&view_child),
+                                                mode: t.mode,
+                                                size: t.size,
+                                                mtime_ns: epoch,
+                                                ctime_ns: epoch,
+                                            }
+                                        }
+                                        // lower 目录：模板目录无文件行，固定
+                                        // epoch（与逐项 stat 的 Directory 分支
+                                        // 一致）。
+                                        EntryKind::Directory => Stat {
+                                            dev: vs,
+                                            ino: file_id_for(&view_child),
+                                            mode: 0o040755,
+                                            size: 0,
+                                            mtime_ns: epoch,
+                                            ctime_ns: epoch,
+                                        },
+                                    };
+                                    stats.insert(name.clone(), st);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // upper 侧：一次真实 readdir（file_type 来自枚举，零额外探测），
+        // 仅对 upper 条目补一次 DirEntry::metadata；临时文件不可见。
+        // upper 目录不存在（lower-only 目录，干净检出的常态）与打开失败
+        // 都只跳过 upper 侧——与 [`Overlay::list`] 一致，不得整个失败。
+        let upper_dir = self.upper_abs(dir_rel);
+        let Ok(read_dir) = ({
+            let span = Span::start();
+            let rd = std::fs::read_dir(&upper_dir);
+            span.done_with_path(Metric::NtReadDir, || dir_rel.to_string());
+            rd
+        }) else {
+            return Ok(stats.into_iter().collect());
+        };
+        for entry in read_dir {
+            // 与 list 一致：单条目枚举失败跳过（不拖垮整个 readdir）。
+            let Ok(entry) = entry else { continue };
+            let os_name = entry.file_name();
+            let Some(name) = os_name.to_str() else {
+                tracing::warn!(name = ?os_name, "skip non-UTF-8 upper name");
+                continue;
+            };
+            if is_temp_name(name) {
+                continue;
+            }
+            let view_child = join_rel(dir_rel, name);
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            // 条目元数据失败按错误传播（与旧逐项 stat 的 fs::metadata 一致）。
+            let md = {
+                let span = Span::start();
+                let md = entry.metadata().map_err(Error::Io);
+                span.done_with_path(Metric::NtDirEntryMeta, || view_child.clone());
+                md?
+            };
+            let st = if is_dir {
+                let mtime = metadata_mtime_ns(&md);
+                Stat {
+                    dev: vs,
+                    ino: file_id_for(&view_child),
+                    mode: 0o040755,
+                    size: 0,
+                    mtime_ns: mtime,
+                    ctime_ns: mtime,
+                }
+            } else {
+                // 与逐项 stat 的 upper 臂一致：保留模板可执行位。
+                let mapped = self.mapped_or_same(&ctx, &view_child)?;
+                let exec = self
+                    .lower
+                    .as_ref()
+                    .and_then(|idx| idx.file(&mapped))
+                    .is_some_and(|t| t.mode & 0o111 != 0);
+                let mtime = metadata_mtime_ns(&md);
+                Stat {
+                    dev: vs,
+                    ino: file_id_for(&view_child),
+                    mode: if exec { 0o100755 } else { 0o100644 },
+                    size: md.len(),
+                    mtime_ns: mtime,
+                    ctime_ns: mtime,
+                }
+            };
+            stats.insert(name.to_string(), st);
+        }
+        Ok(stats.into_iter().collect())
     }
 
     // ---- 读 ----
@@ -1105,6 +1304,13 @@ impl Overlay {
     /// mtime；ino = 路径稳定哈希（根目录固定值）；目录 `0o040755`。
     /// whiteout/not-found → None。纯读：零 DB、零写副作用、零内存发放。
     pub fn stat(&self, rel: &str) -> Result<Option<Stat>> {
+        let span = Span::start();
+        let out = self.stat_inner(rel);
+        span.done_with_path(Metric::OvStat, || rel.to_string());
+        out
+    }
+
+    fn stat_inner(&self, rel: &str) -> Result<Option<Stat>> {
         self.validate_rel_or_root(rel)?;
         if !rel.is_empty() && is_temp_name(basename(rel)) {
             return Ok(None);
@@ -1112,11 +1318,20 @@ impl Overlay {
         let vs = u64::from(self.config.volume_serial);
         let epoch = self.config.fixed_stat_epoch_ns;
         let ctx = self.meta_ctx();
-        let resolution = self.resolve_with(&ctx, rel)?;
+        let (resolution, upper_md) = self.resolve_with_md(&ctx, rel)?;
         let out = match resolution {
             Resolution::Whiteout | Resolution::NotFound => return Ok(None),
             Resolution::Upper { path } => {
-                let md = std::fs::metadata(&path)?;
+                // resolve 已 stat（M13/B130100）：直接复用，零第二次 metadata。
+                let md = match upper_md {
+                    Some(md) => md,
+                    None => {
+                        let span = Span::start();
+                        let md = std::fs::metadata(&path)?;
+                        span.done_with_path(Metric::NtMetadata, || rel.to_string());
+                        md
+                    }
+                };
                 let mode = if self.lower_mode_is_exec(&ctx, rel)? {
                     0o100755
                 } else {
@@ -1142,7 +1357,17 @@ impl Overlay {
             },
             Resolution::Directory { has_upper, .. } => {
                 let mtime = if has_upper {
-                    let md = std::fs::metadata(self.upper_abs(rel))?;
+                    let md = match upper_md {
+                        Some(md) => md,
+                        // 防御：upper 目录元数据缺失（根目录被旁路移除等罕见
+                        // 场景）退回真实探测，保持既有错误语义。
+                        None => {
+                            let span = Span::start();
+                            let md = std::fs::metadata(self.upper_abs(rel))?;
+                            span.done_with_path(Metric::NtMetadata, || rel.to_string());
+                            md
+                        }
+                    };
                     metadata_mtime_ns(&md)
                 } else {
                     epoch
@@ -1184,7 +1409,10 @@ fn file_id_for(rel: &str) -> u64 {
     if rel.is_empty() {
         ROOT_FILE_ID
     } else {
-        derive_ino(rel) as u64
+        let span = Span::start();
+        let v = derive_ino(rel) as u64;
+        span.done(Metric::OvDeriveIno);
+        v
     }
 }
 
@@ -1662,6 +1890,69 @@ mod tests {
         assert_eq!(state, DedupeState::Lower, "模板一致内容回落 lower");
         assert_eq!(of.stat("a/1.txt").unwrap().unwrap().mtime_ns, epoch);
         assert!(of.stat("gone").unwrap().is_none());
+    }
+
+    /// M13/B130100 回归：`list_stat` 与逐项 `stat` 语义一致（名字集与
+    /// `list` 相同；每项 stat 值与逐项 stat 相等——lower 固定 / upper 真实
+    /// mtime / upper 覆盖 lower / whiteout 隐藏 / initializing 空）。
+    #[test]
+    fn list_stat_matches_per_item_stat() {
+        let fx = fixture(true);
+        let of = make_ready(&fx);
+        // upper 覆盖 + 新文件 + upper 目录 + whiteout 隐藏 lower 子项。
+        of.write("a/2.txt", b"changed").unwrap();
+        of.write("root-new.txt", b"new").unwrap();
+        std::fs::create_dir_all(fx.upper_dir.join("u")).unwrap();
+        std::fs::write(fx.upper_dir.join("u").join("f.txt"), b"uf").unwrap();
+        of.remove("b.txt").unwrap();
+
+        for dir in ["", "a", "u"] {
+            let got = of.list_stat(dir).unwrap();
+            let listed = of.list(dir).unwrap();
+            assert_eq!(
+                got.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                listed.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+                "list_stat 名字集必须与 list 一致（dir={dir:?}）"
+            );
+            for (name, st) in &got {
+                let rel = if dir.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{dir}/{name}")
+                };
+                let expect = of.stat(&rel).unwrap().expect("listed entry must stat");
+                if st.mode & 0o170000 == 0o040000 {
+                    // 目录：两路探测都是真实 upper mtime，但 NTFS 对目录
+                    // last-write 的更新是惰性落账的，先后两次探测可跨过一次
+                    // 落账（毫秒级步进）——mtime 允许不同，其余字段必须一致。
+                    let mut a = *st;
+                    let mut b = expect;
+                    a.mtime_ns = 0;
+                    a.ctime_ns = 0;
+                    b.mtime_ns = 0;
+                    b.ctime_ns = 0;
+                    assert_eq!(a, b, "stat mismatch (dir, mtime excluded) for {rel}");
+                    assert!(
+                        st.mtime_ns > crate::FIXED_STAT_EPOCH_UNIX_NS,
+                        "upper 目录必须报真实 mtime（> epoch）for {rel}"
+                    );
+                } else {
+                    assert_eq!(st, &expect, "stat mismatch for {rel}");
+                }
+            }
+        }
+
+        // whiteout 子项不可见；upper 覆盖项可见且为真实 mtime。
+        let root = of.list_stat("").unwrap();
+        assert!(root.iter().all(|(n, _)| n != "b.txt"));
+        assert!(root.iter().any(|(n, _)| n == "root-new.txt"));
+
+        // initializing 期列表为空（与 list 语义一致）。
+        let fx2 = fixture(true);
+        let of2 = make(&fx2, true);
+        assert!(of2.list_stat("").unwrap().is_empty());
+        of2.mark_ready().unwrap();
+        assert!(!of2.list_stat("").unwrap().is_empty());
     }
 
     #[test]

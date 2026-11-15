@@ -61,6 +61,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use wtfs_core::{
     FileAttributes, Overlay, OverlayStore, Resolution, StagedContent, Stat, TemplateFile,
+    profiling::{Metric, Span},
     validate_relative_path,
 };
 use winfsp::FspError;
@@ -594,26 +595,33 @@ impl FileSystemContext for WtfsContext {
         security_descriptor: Option<&mut [c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        let sd = fixed_security_descriptor().ok_or_else(err_invalid_parameter)?;
-        let sd_len = fixed_security_descriptor_len();
-        let attributes = match self.route(file_name)? {
-            Route::Root => FileAttributes::DIRECTORY,
-            Route::Unknown { .. } => return Err(err_not_found()),
-            Route::Worktree { overlay, rel, .. } => {
-                match overlay.stat(&rel).map_err(fsp_err)? {
-                    Some(st) => wtfs_core::attributes_for(&st),
-                    None => return Err(err_not_found()),
+        let span = Span::start();
+        let out = (|| {
+            let sd = fixed_security_descriptor().ok_or_else(err_invalid_parameter)?;
+            let sd_len = fixed_security_descriptor_len();
+            let attributes = match self.route(file_name)? {
+                Route::Root => FileAttributes::DIRECTORY,
+                Route::Unknown { .. } => return Err(err_not_found()),
+                Route::Worktree { overlay, rel, .. } => {
+                    match overlay.stat(&rel).map_err(fsp_err)? {
+                        Some(st) => wtfs_core::attributes_for(&st),
+                        None => return Err(err_not_found()),
+                    }
                 }
+            };
+            if let Some(buf) = security_descriptor {
+                copy_sd(sd, buf)?;
             }
-        };
-        if let Some(buf) = security_descriptor {
-            copy_sd(sd, buf)?;
-        }
-        Ok(FileSecurity {
-            reparse: false,
-            sz_security_descriptor: sd_len,
-            attributes: attributes.bits(),
-        })
+            Ok(FileSecurity {
+                reparse: false,
+                sz_security_descriptor: sd_len,
+                attributes: attributes.bits(),
+            })
+        })();
+        span.done_with_path(Metric::CbGetSecurityByName, || {
+            file_name.to_string().unwrap_or_default()
+        });
+        out
     }
 
     fn open(
@@ -623,6 +631,244 @@ impl FileSystemContext for WtfsContext {
         granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> Result<Self::FileContext, FspError> {
+        let span = Span::start();
+        let out = self.open_inner(file_name, create_options, granted_access, file_info);
+        span.done_with_path(Metric::CbOpen, || file_name.to_string().unwrap_or_default());
+        out
+    }
+
+    fn close(&self, context: Self::FileContext) {
+        let span = Span::start();
+        // Drop 负责 best-effort 清理；正常流程 cleanup 已终裁。
+        drop(context);
+        span.done(Metric::CbClose);
+    }
+
+    fn create(
+        &self,
+        file_name: &U16CStr,
+        create_options: u32,
+        _granted_access: u32,
+        _file_attributes: u32,
+        _security_descriptor: Option<&[c_void]>,
+        _allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        _extra_buffer_is_reparse_point: bool,
+        file_info: &mut OpenFileInfo,
+    ) -> Result<Self::FileContext, FspError> {
+        let span = Span::start();
+        let out = self.create_inner(file_name, create_options, file_info);
+        span.done_with_path(Metric::CbCreate, || file_name.to_string().unwrap_or_default());
+        out
+    }
+
+    fn overwrite(
+        &self,
+        context: &Self::FileContext,
+        _file_attributes: u32,
+        _replace_file_attributes: bool,
+        _allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        let span = Span::start();
+        let out = self.overwrite_inner(context, file_info);
+        span.done_with_path(Metric::CbOverwrite, || context.rel.clone());
+        out
+    }
+
+    fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
+        let span = Span::start();
+        self.cleanup_inner(context, flags);
+        span.done_with_path(Metric::CbCleanup, || context.rel.clone());
+    }
+
+    fn flush(
+        &self,
+        context: Option<&Self::FileContext>,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        let span = Span::start();
+        let out = self.flush_inner(context, file_info);
+        span.done(Metric::CbFlush);
+        out
+    }
+
+    fn get_file_info(
+        &self,
+        context: &Self::FileContext,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        let span = Span::start();
+        let out = (|| {
+            let st = if context.overlay.is_none() {
+                mount_root_stat()
+            } else {
+                context.handle_stat()?
+            };
+            fill_file_info(file_info, &st);
+            Ok(())
+        })();
+        span.done_with_path(Metric::CbGetFileInfo, || context.rel.clone());
+        out
+    }
+
+    fn get_security(
+        &self,
+        context: &Self::FileContext,
+        security_descriptor: Option<&mut [c_void]>,
+    ) -> Result<u64, FspError> {
+        let span = Span::start();
+        let out = (|| {
+            let sd = fixed_security_descriptor().ok_or_else(err_invalid_parameter)?;
+            if let Some(buf) = security_descriptor {
+                copy_sd(sd, buf)?;
+            }
+            Ok(fixed_security_descriptor_len())
+        })();
+        span.done_with_path(Metric::CbGetSecurity, || context.rel.clone());
+        out
+    }
+
+    fn read(
+        &self,
+        context: &Self::FileContext,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> Result<u32, FspError> {
+        let span = Span::start();
+        let out = context.read_into(buffer, offset);
+        span.done_with_path(Metric::CbRead, || context.rel.clone());
+        out
+    }
+
+    fn write(
+        &self,
+        context: &Self::FileContext,
+        buffer: &[u8],
+        offset: u64,
+        write_to_eof: bool,
+        constrained_io: bool,
+        file_info: &mut FileInfo,
+    ) -> Result<u32, FspError> {
+        let span = Span::start();
+        let out = self.write_inner(context, buffer, offset, write_to_eof, constrained_io, file_info);
+        span.done_with_path(Metric::CbWrite, || context.rel.clone());
+        out
+    }
+
+    fn read_directory(
+        &self,
+        context: &Self::FileContext,
+        pattern: Option<&U16CStr>,
+        marker: DirMarker<'_>,
+        buffer: &mut [u8],
+    ) -> Result<u32, FspError> {
+        let span = Span::start();
+        let out = self.read_directory_inner(context, pattern, marker, buffer);
+        span.done_with_path(Metric::CbReadDirectory, || context.rel.clone());
+        out
+    }
+
+    fn rename(
+        &self,
+        context: &Self::FileContext,
+        _file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
+    ) -> Result<(), FspError> {
+        let span = Span::start();
+        let out = self.rename_inner(context, new_file_name, replace_if_exists);
+        span.done_with_path(Metric::CbRename, || context.rel.clone());
+        out
+    }
+
+    fn set_basic_info(
+        &self,
+        context: &Self::FileContext,
+        file_attributes: u32,
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+        last_change_time: u64,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        let span = Span::start();
+        let out = self.set_basic_info_inner(
+            context,
+            file_attributes,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            last_change_time,
+            file_info,
+        );
+        span.done_with_path(Metric::CbSetBasicInfo, || context.rel.clone());
+        out
+    }
+
+    fn set_delete(
+        &self,
+        context: &Self::FileContext,
+        _file_name: &U16CStr,
+        delete_file: bool,
+    ) -> Result<(), FspError> {
+        let span = Span::start();
+        let out = self.set_delete_inner(context, delete_file);
+        span.done_with_path(Metric::CbSetDelete, || context.rel.clone());
+        out
+    }
+
+    fn set_file_size(
+        &self,
+        context: &Self::FileContext,
+        new_size: u64,
+        set_allocation_size: bool,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        let span = Span::start();
+        let out = self.set_file_size_inner(context, new_size, set_allocation_size, file_info);
+        span.done_with_path(Metric::CbSetFileSize, || context.rel.clone());
+        out
+    }
+
+    fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> Result<(), FspError> {
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let root = crate::win::to_path(&self.registry.config().store_root);
+        let (mut total, mut free) = (0u64, 0u64);
+        // SAFETY: HSTRING 以 NUL 结尾；输出均为合法指针。
+        let ok = unsafe { GetDiskFreeSpaceExW(&root, None, Some(&mut total), Some(&mut free)) };
+        match ok {
+            Ok(()) => {
+                out_volume_info.total_size = total;
+                out_volume_info.free_size = free;
+            }
+            Err(e) => return Err(FspError::HRESULT(e.code().0)),
+        }
+        out_volume_info.set_volume_label(&self.registry.config().volume_label);
+        Ok(())
+    }
+}
+
+fn copy_sd(sd: &[u8], buf: &mut [c_void]) -> Result<(), FspError> {
+    let bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len())
+    };
+    if bytes.len() < sd.len() {
+        return Err(err_invalid_parameter());
+    }
+    bytes[..sd.len()].copy_from_slice(sd);
+    Ok(())
+}
+
+impl WtfsContext {
+    fn open_inner(
+        &self,
+        file_name: &U16CStr,
+        create_options: u32,
+        granted_access: u32,
+        file_info: &mut OpenFileInfo,
+    ) -> Result<FileContext, FspError> {
         let _ = granted_access;
         let dir_requested = create_options & FILE_DIRECTORY_FILE != 0;
         let non_dir_requested = create_options & FILE_NON_DIRECTORY_FILE != 0;
@@ -677,22 +923,13 @@ impl FileSystemContext for WtfsContext {
         }
     }
 
-    fn close(&self, _context: Self::FileContext) {
-        // Drop 负责 best-effort 清理；正常流程 cleanup 已终裁。
-    }
-
-    fn create(
+    #[allow(clippy::too_many_arguments)]
+    fn create_inner(
         &self,
         file_name: &U16CStr,
         create_options: u32,
-        _granted_access: u32,
-        _file_attributes: u32,
-        _security_descriptor: Option<&[c_void]>,
-        _allocation_size: u64,
-        _extra_buffer: Option<&[u8]>,
-        _extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
-    ) -> Result<Self::FileContext, FspError> {
+    ) -> Result<FileContext, FspError> {
         let is_dir = create_options & FILE_DIRECTORY_FILE != 0;
         match self.route(file_name)? {
             Route::Root => return Err(err_access_denied()),
@@ -785,13 +1022,9 @@ impl FileSystemContext for WtfsContext {
         }
     }
 
-    fn overwrite(
+    fn overwrite_inner(
         &self,
-        context: &Self::FileContext,
-        _file_attributes: u32,
-        _replace_file_attributes: bool,
-        _allocation_size: u64,
-        _extra_buffer: Option<&[u8]>,
+        context: &FileContext,
         file_info: &mut FileInfo,
     ) -> Result<(), FspError> {
         if context.is_dir {
@@ -824,7 +1057,7 @@ impl FileSystemContext for WtfsContext {
         Ok(())
     }
 
-    fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
+    fn cleanup_inner(&self, context: &FileContext, flags: u32) {
         let delete = winfsp::constants::FspCleanupFlags::FspCleanupDelete.is_flagged(flags)
             || context.delete_pending.load(Ordering::SeqCst);
         // 挂载根：删除由 daemon/gc 负责。
@@ -943,9 +1176,9 @@ impl FileSystemContext for WtfsContext {
         }
     }
 
-    fn flush(
+    fn flush_inner(
         &self,
-        context: Option<&Self::FileContext>,
+        context: Option<&FileContext>,
         file_info: &mut FileInfo,
     ) -> Result<(), FspError> {
         let Some(context) = context else {
@@ -964,44 +1197,9 @@ impl FileSystemContext for WtfsContext {
         Ok(())
     }
 
-    fn get_file_info(
+    fn write_inner(
         &self,
-        context: &Self::FileContext,
-        file_info: &mut FileInfo,
-    ) -> Result<(), FspError> {
-        let st = if context.overlay.is_none() {
-            mount_root_stat()
-        } else {
-            context.handle_stat()?
-        };
-        fill_file_info(file_info, &st);
-        Ok(())
-    }
-
-    fn get_security(
-        &self,
-        _context: &Self::FileContext,
-        security_descriptor: Option<&mut [c_void]>,
-    ) -> Result<u64, FspError> {
-        let sd = fixed_security_descriptor().ok_or_else(err_invalid_parameter)?;
-        if let Some(buf) = security_descriptor {
-            copy_sd(sd, buf)?;
-        }
-        Ok(fixed_security_descriptor_len())
-    }
-
-    fn read(
-        &self,
-        context: &Self::FileContext,
-        buffer: &mut [u8],
-        offset: u64,
-    ) -> Result<u32, FspError> {
-        context.read_into(buffer, offset)
-    }
-
-    fn write(
-        &self,
-        context: &Self::FileContext,
+        context: &FileContext,
         buffer: &[u8],
         offset: u64,
         write_to_eof: bool,
@@ -1029,9 +1227,9 @@ impl FileSystemContext for WtfsContext {
         self.write_chunk(context, &name, buffer, offset, file_info)
     }
 
-    fn read_directory(
+    fn read_directory_inner(
         &self,
-        context: &Self::FileContext,
+        context: &FileContext,
         pattern: Option<&U16CStr>,
         marker: DirMarker<'_>,
         buffer: &mut [u8],
@@ -1062,11 +1260,11 @@ impl FileSystemContext for WtfsContext {
             let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
             let rel = context.rel.as_str();
             self_stat = overlay.stat(rel).map_err(fsp_err)?.ok_or_else(err_not_found)?;
-            for entry in overlay.list(rel).map_err(fsp_err)? {
-                let Some(st) = overlay.stat(&entry.rel).map_err(fsp_err)? else {
-                    continue;
-                };
-                entries.push((entry.name, st));
+            // M13/B130100：父目录解析一次 + 枚举元数据直接推导子项 stat
+            // （旧实现逐子项 overlay.stat 全量重解析，每子项 2 次 NTFS 探测，
+            // 是 status 的头号开销）。
+            for (name, st) in overlay.list_stat(rel).map_err(fsp_err)? {
+                entries.push((name, st));
             }
         }
         if let Some(pattern) = &pattern {
@@ -1098,10 +1296,9 @@ impl FileSystemContext for WtfsContext {
         Ok(read)
     }
 
-    fn rename(
+    fn rename_inner(
         &self,
-        context: &Self::FileContext,
-        _file_name: &U16CStr,
+        context: &FileContext,
         new_file_name: &U16CStr,
         replace_if_exists: bool,
     ) -> Result<(), FspError> {
@@ -1142,9 +1339,9 @@ impl FileSystemContext for WtfsContext {
         Ok(())
     }
 
-    fn set_basic_info(
+    fn set_basic_info_inner(
         &self,
-        context: &Self::FileContext,
+        context: &FileContext,
         file_attributes: u32,
         creation_time: u64,
         last_access_time: u64,
@@ -1179,10 +1376,9 @@ impl FileSystemContext for WtfsContext {
         Ok(())
     }
 
-    fn set_delete(
+    fn set_delete_inner(
         &self,
-        context: &Self::FileContext,
-        _file_name: &U16CStr,
+        context: &FileContext,
         delete_file: bool,
     ) -> Result<(), FspError> {
         let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
@@ -1214,9 +1410,9 @@ impl FileSystemContext for WtfsContext {
         Ok(())
     }
 
-    fn set_file_size(
+    fn set_file_size_inner(
         &self,
-        context: &Self::FileContext,
+        context: &FileContext,
         new_size: u64,
         set_allocation_size: bool,
         file_info: &mut FileInfo,
@@ -1269,36 +1465,6 @@ impl FileSystemContext for WtfsContext {
         Ok(())
     }
 
-    fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> Result<(), FspError> {
-        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let root = crate::win::to_path(&self.registry.config().store_root);
-        let (mut total, mut free) = (0u64, 0u64);
-        // SAFETY: HSTRING 以 NUL 结尾；输出均为合法指针。
-        let ok = unsafe { GetDiskFreeSpaceExW(&root, None, Some(&mut total), Some(&mut free)) };
-        match ok {
-            Ok(()) => {
-                out_volume_info.total_size = total;
-                out_volume_info.free_size = free;
-            }
-            Err(e) => return Err(FspError::HRESULT(e.code().0)),
-        }
-        out_volume_info.set_volume_label(&self.registry.config().volume_label);
-        Ok(())
-    }
-}
-
-fn copy_sd(sd: &[u8], buf: &mut [c_void]) -> Result<(), FspError> {
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len())
-    };
-    if bytes.len() < sd.len() {
-        return Err(err_invalid_parameter());
-    }
-    bytes[..sd.len()].copy_from_slice(sd);
-    Ok(())
-}
-
-impl WtfsContext {
     /// 单个 chunk 的写入（暂存或就地），返回写入字节数并回填 file_info。
     fn write_chunk(
         &self,
@@ -1371,7 +1537,6 @@ impl WtfsContext {
         Ok(buffer.len() as u32)
     }
 }
-
 
 #[cfg(test)]
 pub(crate) fn blank_open_file_info_for_test() -> OpenFileInfo {

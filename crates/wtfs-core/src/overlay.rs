@@ -301,7 +301,8 @@ pub struct Overlay {
     /// worktrees.status；镜像在打开时从标记树一次装载，写路径同步更新镜像
     /// 与标记文件。per-file 操作不再查库、不再扫标记树。
     meta: Mutex<MetaState>,
-    /// upper 负存在缓存（M14/B140100）：探得"upper 无此视图路径"的 rel 集合。
+    /// upper 负存在缓存（M14/B140100）：确证"upper 无此视图路径"的 rel 集合
+    /// （探测错误仅 raw_os_error 2/3 视为确证不存在，见 [`Overlay::probe_upper`]）。
     /// 只缓存负结果——"存在"永不缓存（正结果一律真探测，脏 worktree 的
     /// stat/读取语义与无缓存时逐字节一致）。upper 任何物理变更
     /// （create/copy_up/staged 物化/写/删/改名）经 [`MetaCtx::touch_upper`] /
@@ -538,6 +539,12 @@ impl Overlay {
     /// 探得存在时撤销——探测-登记窗口内并发 touch（整体清空）只会丢掉
     /// 本次登记（下次重新真探测），不会留下"已存在却缓存为不存在"的
     /// 陈旧条目（缓存在并发下只会朝"更空"漂移）。
+    ///
+    /// 已知边界（P2-4，不改并发设计）：从本线程乐观登记到探测返回之间
+    /// （一次 `symlink_metadata` 的 µs 级窗口），其他线程对同一 rel 的
+    /// resolve 可能读到该登记而得到一次假负——受支持的用法（每 worktree
+    /// 单写者的 git 流）不可达；且登记随本线程探测结果立即修正（正结果
+    /// 回收、整体清空兜底），无持久陈旧。
     fn probe_upper(&self, rel: &str, upper_path: &std::path::Path) -> Option<std::fs::Metadata> {
         {
             let mut neg = self.upper_neg.lock();
@@ -554,7 +561,17 @@ impl Overlay {
                 self.upper_neg.lock().remove(rel);
                 Some(md)
             }
-            Err(_) => None,
+            Err(e) => {
+                // P2-3：仅"确实不存在"（ERROR_FILE_NOT_FOUND /
+                // ERROR_PATH_NOT_FOUND）维持乐观登记（=负缓存）。sharing
+                // violation 等其他错误可能是瞬态，若登记会把"存在"钉成
+                // "不存在"，立即回收登记、下次重探。（错误本身仍按既有
+                // 语义视为无 upper，与 M14 前的 `md.ok()` 一致。）
+                if !matches!(e.raw_os_error(), Some(2) | Some(3)) {
+                    self.upper_neg.lock().remove(rel);
+                }
+                None
+            }
         }
     }
 
@@ -985,6 +1002,11 @@ impl Overlay {
             .parent()
             .ok_or_else(|| Error::Overlay(format!("bad upper path for {rel:?}")))?;
         std::fs::create_dir_all(parent)?;
+        // P2-2：create_dir_all 之后的所有出口（含 staged/rename 的错误提前
+        // return）都已物理建过 upper 祖先目录——此处失效一次覆盖全部出口
+        // （成功出口稍后的 touch_upper 双清无害）。note_upper_mutation 不依赖
+        // meta 锁：此时镜像锁尚未持有。
+        self.note_upper_mutation();
         let tmp = parent.join(format!(
             "{TEMP_PREFIX}-{}-{}",
             std::process::id(),
@@ -1113,6 +1135,9 @@ impl Overlay {
             .parent()
             .ok_or_else(|| Error::Overlay(format!("bad upper path for {rel:?}")))?;
         std::fs::create_dir_all(parent)?;
+        // P2-2：同 write_from——此后任何错误出口（Memory 臂 rename 失败等）
+        // 祖先目录已存在，先失效一次。
+        ctx.touch_upper();
         match content {
             StagedContent::Spill(spill) => {
                 // 先 fsync 溢写内容再同卷 rename：恰好一次 fsync，且数据先于
@@ -1206,6 +1231,8 @@ impl Overlay {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                // P2-2：create_dir_all 可能已建祖先，先失效再建文件。
+                ctx.touch_upper();
                 std::fs::File::create(&path)?;
                 ctx.touch_upper();
                 self.io.record_upper_write();
@@ -1228,6 +1255,8 @@ impl Overlay {
                 if let Some(parent) = final_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                // P2-2：create_dir_all 可能已建祖先，先失效再拷贝。
+                ctx.touch_upper();
                 std::fs::copy(&path, &final_path)?;
                 ctx.touch_upper();
                 self.io.record_upper_write();
@@ -1327,6 +1356,9 @@ impl Overlay {
                 if let Some(parent) = to_upper.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                // P2-2：create_dir_all 可能已建祖先；覆盖删除成功但
+                // rename/copy 失败的出口也由此失效覆盖。
+                ctx.touch_upper();
                 if to_upper.symlink_metadata().is_ok() {
                     std::fs::remove_file(&to_upper)?;
                     ctx.touch_upper();
@@ -1359,6 +1391,8 @@ impl Overlay {
                     if let Some(parent) = to_upper.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
+                    // P2-2：create_dir_all 可能已建祖先，先失效。
+                    ctx.touch_upper();
                     std::fs::rename(self.upper_abs(from), &to_upper)?;
                     ctx.touch_upper();
                 }
@@ -2854,5 +2888,69 @@ mod tests {
             assert!(!mstate.whites.contains("b.txt"));
             assert!(mstate.whites.contains("a"));
         }
+    }
+
+    // ---- M14 评审 R1 直测（upper 负存在缓存） ----
+
+    /// P2 评审附注 1：写后立即可解析——先让目标路径进负缓存，写成功失效
+    /// 后 stat 必须立刻真解析（无陈旧负条目）。
+    #[test]
+    fn negative_upper_cache_cleared_by_write_then_stat_resolves() {
+        let fx = fixture(true);
+        let of = make_ready(&fx);
+        assert!(of.stat("n.txt").unwrap().is_none());
+        of.write("n.txt", b"hello").unwrap();
+        assert!(
+            of.stat("n.txt").unwrap().is_some(),
+            "stale negative entry must not hide a just-written upper file"
+        );
+    }
+
+    /// P2-3：probe_upper 只把"确实不存在"（raw_os_error 2/3）登记为负；
+    /// 其他错误（如非法 NT 名的 ERROR_INVALID_NAME）回收登记不缓存；
+    /// 正结果同样不缓存。
+    #[test]
+    fn probe_upper_registers_only_not_found_errors() {
+        let fx = fixture(true);
+        let of = make_ready(&fx);
+        // 不存在 → os error 2 → 登记负缓存。
+        assert!(of.stat("missing.txt").unwrap().is_none());
+        assert!(of.upper_neg.lock().contains("missing.txt"));
+        // 非法 NT 名 → ERROR_INVALID_NAME（123，非 2/3）→ 登记被回收。
+        let bad = fx.upper_dir.join("bad<name");
+        assert!(of.probe_upper("bad<name", &bad).is_none());
+        assert!(!of.upper_neg.lock().contains("bad<name"));
+        // 已存在 → 正结果不登记。
+        std::fs::write(fx.upper_dir.join("exists.txt"), b"x").unwrap();
+        of.note_upper_mutation();
+        assert!(
+            of.probe_upper("exists.txt", &fx.upper_dir.join("exists.txt"))
+                .is_some()
+        );
+        assert!(!of.upper_neg.lock().contains("exists.txt"));
+    }
+
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("reader boom"))
+        }
+    }
+
+    /// P2-2：写路径错误出口（staged reader 失败）前 create_dir_all 已物理
+    /// 创建 upper 父目录——失效后父目录必须立即可见（stat 与物理状态一致）。
+    #[test]
+    fn write_error_keeps_upper_parent_visible() {
+        let fx = fixture(true);
+        let of = make_ready(&fx);
+        // "d" 先进负缓存。
+        assert!(of.stat("d").unwrap().is_none());
+        let mut r = FailingReader;
+        assert!(of.write_from("d/x.txt", &mut r).is_err());
+        // 错误出口已失效：upper/d 已被 create_dir_all 创建，必须真探测可见。
+        let st = of.stat("d").unwrap();
+        assert!(st.is_some(), "upper parent dir must be visible after failed write");
+        assert_eq!(st.unwrap().mode & 0o170000, 0o040000);
     }
 }

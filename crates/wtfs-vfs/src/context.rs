@@ -259,8 +259,10 @@ impl FileContext {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(FspError::from)?;
         }
-        let file = open_rw_create(&path)?;
+        // P2-2：create_dir_all 之后任何出口（含 open_rw_create 失败）都已
+        // 物理建过 upper 祖先目录——失效一次覆盖所有出口。
         overlay.note_upper_mutation();
+        let file = open_rw_create(&path)?;
         overlay.io_stats().record_upper_write();
         Ok(WriteState::InPlace { file, size: 0 })
     }
@@ -330,6 +332,11 @@ impl FileContext {
                             .map(|m| m.len())
                             .unwrap_or(0);
                         let file = open_rw_create(&path)?;
+                        // P2-1：copy_up 返回 None（copy_up 内二次 resolve 时并发
+                        // remove 已记 whiteout，不再触碰缓存）时，本次
+                        // open_rw_create 仍是 upper 物理创建——必须失效负缓存，
+                        // 防并发竞态留下持久陈旧负条目。重复失效无害。
+                        overlay.note_upper_mutation();
                         WriteState::InPlace { file, size }
                     }
                     Resolution::Whiteout | Resolution::NotFound => {

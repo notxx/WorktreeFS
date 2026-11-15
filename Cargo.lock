@@ -1719,6 +1719,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wtfs-cas"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "gix-index",
+ "parking_lot 0.13.0",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "wtfs-cli"
 version = "0.1.0"
 dependencies = [

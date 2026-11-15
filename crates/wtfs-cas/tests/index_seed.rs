@@ -61,7 +61,10 @@ fn route_a_seeds_clean_status_with_zero_hydration() {
     let before = cat.stats();
     assert_eq!(before.requests, 0, "种子阶段零对象读取（断言从零开始）");
     for (_p, f) in manifest.files() {
-        assert!(!cache.blob_path(&f.oid).exists(), "种子不应灌入任何缓存");
+        assert!(
+            !cache.blob_path(&f.oid).unwrap().exists(),
+            "种子不应灌入任何缓存"
+        );
     }
 
     // 清除位 → 未挂载必然报全量删除（route B 结论的回归护栏）
@@ -102,11 +105,15 @@ fn stat_aligned_seed_writes_manifest_stat_into_index() {
     // status 干净（skip-worktree 位在 stat 对齐路径同样置位）
     assert_eq!(common::status_lines(&wt), 0);
 
-    // index stat 逐位等于 manifest 值（`ls-files --debug` 解析 ctime/mtime/
-    // dev/ino/size；git 报告十进制，mtime=固定纪元 946684800）
+    // index stat 逐位等于 manifest 值（`ls-files --debug` 解析
+    // ctime/mtime/dev/inode/size；git 报告十进制）。ino/mtime 是 P2-3 补的
+    // 断言：ino = file_id 截 32 位、mtime = 固定纪元 946684800s。
     let debug = common::assert_git(&wt, &["ls-files", "--debug", "README.md"]);
     let readme = manifest.file("README.md").unwrap();
+    let expect_ino = i64::from(wtfs_cas::file_id("README.md") as u32);
     let mut found_ctime = false;
+    let mut found_mtime = false;
+    let mut found_ino = false;
     for line in debug.lines() {
         if line.starts_with("  ctime:") {
             let secs: i64 = line
@@ -118,14 +125,15 @@ fn stat_aligned_seed_writes_manifest_stat_into_index() {
             assert_eq!(secs, 946_684_800, "ctime = 固定纪元秒: {line}");
             found_ctime = true;
         }
-        if line.starts_with("  size:") {
-            let size: i64 = line
+        if line.starts_with("  mtime:") {
+            let secs: i64 = line
                 .split(':')
                 .nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(-1);
-            assert_eq!(size, readme.size as i64, "size = manifest 值: {line}");
+            assert_eq!(secs, 946_684_800, "mtime = 固定纪元秒: {line}");
+            found_mtime = true;
         }
         if line.starts_with("  dev:") {
             let dev: i64 = line
@@ -139,9 +147,30 @@ fn stat_aligned_seed_writes_manifest_stat_into_index() {
                 wtfs_cas::DEFAULT_VOLUME_SERIAL as i64,
                 "dev = 卷序列号: {line}"
             );
+            // 同行 `ino:`（git 2.53 的 --debug 标签；旧版为 `inode:`）：
+            // index 存的是 file_id 截 32 位（u32）。
+            let ino: i64 = line
+                .split("ino:")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            assert_eq!(ino, expect_ino, "inode = file_id 截 32 位: {line}");
+            found_ino = true;
+        }
+        if line.starts_with("  size:") {
+            let size: i64 = line
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(-1);
+            assert_eq!(size, readme.size as i64, "size = manifest 值: {line}");
         }
     }
     assert!(found_ctime, "ls-files --debug 应含 ctime 行: {debug}");
+    assert!(found_mtime, "ls-files --debug 应含 mtime 行: {debug}");
+    assert!(found_ino, "ls-files --debug 应含 inode 行: {debug}");
 }
 
 /// route B 对照（spike 记录）：完整 checkout → 复制 index → 删树 →

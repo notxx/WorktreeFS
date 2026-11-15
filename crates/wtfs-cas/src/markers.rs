@@ -62,9 +62,13 @@ impl MarkerLog {
         while off + 5 <= raw.len() {
             let len =
                 u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]) as usize;
-            let Some(payload) = raw.get(off + 4..off + 4 + len) else {
-                break; // 撕裂尾记录：忽略（与 M12 一致）
-            };
+            // 守卫（镜像 wtfs-core overlay_markers）：长度必须覆盖 op 字节
+            // （len < 1 = 零长度记录）且完整落在缓冲内，否则按撕裂/损坏尾
+            // 处理——截断尾部并停止重放，绝不越界（payload[0] 前置条件）。
+            if len < 1 || off + 4 + len > raw.len() {
+                break;
+            }
+            let payload = &raw[off + 4..off + 4 + len];
             let (op, rel_bytes) = (payload[0], &payload[1..]);
             let Ok(rel) = std::str::from_utf8(rel_bytes) else {
                 break;
@@ -246,5 +250,33 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(before, after, "集合无变化时零追加");
+    }
+
+    /// P2-1 回归：四字节零长度记录出现在边界（后随垃圾字节使循环成立）
+    /// 必须截断尾部、不 panic（镜像 wtfs-core 的 `len < 1` 守卫）。
+    #[test]
+    fn replay_tolerates_zero_length_record_at_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta").join("markers.log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut log = MarkerLog::open(dir.path().join("meta")).unwrap();
+        log.add("keep.txt").unwrap();
+        drop(log);
+
+        // 追加：u32 长度 = 0 的记录 + 1 字节垃圾（凑足循环进入条件）
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&[0xFF]);
+        // 再补一条 4 字节零长度记录收尾（循环入口即退出，同样不得 panic）
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &raw).unwrap();
+
+        let log = MarkerLog::open(dir.path().join("meta")).unwrap();
+        assert!(
+            log.whites().contains("keep.txt"),
+            "有效记录不受损坏尾部影响"
+        );
+        assert_eq!(log.whites().len(), 1);
     }
 }

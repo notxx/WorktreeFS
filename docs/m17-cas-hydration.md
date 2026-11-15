@@ -71,7 +71,10 @@ crates/wtfs-cas/
 **mtime/stat 方案**：`seed_stat_aligned` 在 read-tree 之后用 gix-index 把
 每条 entry 的 stat 字段改写为 manifest 值（dev=卷序列号、ino=file_id 截
 32 位、size=manifest、mtime=ctime=固定纪元 946684800s），并置 skip-worktree
-位。**挂载态切换（M18）**：FS 报告 manifest stat 后批量清除 skip-worktree
+位。**index 的 ino 字段是 u32**：62 位 file_id 写入时截断为 32 位，**M18
+的 FS stat 必须复现同一截断**（`CasStat.ino as u32` 回填），否则清
+skip-worktree 后 lstat ino 与 index 不一致，status 会全量报修改。
+**挂载态切换（M18）**：FS 报告 manifest stat 后批量清除 skip-worktree
 位（`clear_skip_worktree`，一条 `update-index --stdin`），status 干净性由
 "FS stat == index stat" 保证——与 B1 模板 index 机制同构。
 

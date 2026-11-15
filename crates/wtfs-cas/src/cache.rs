@@ -75,9 +75,12 @@ impl HydrationCache {
         &self.root
     }
 
-    /// oid → 缓存内最终路径（`<root>/<aa>/<oid>`）。
-    pub fn blob_path(&self, oid: &str) -> PathBuf {
-        self.root.join(&oid[..2]).join(oid)
+    /// oid → 缓存内最终路径（`<root>/<aa>/<oid>`）；非法 oid（非 40 位
+    /// hex sha1）报 [`Error::NotFound`]——分片取 `oid[..2]` 前必须先校验，
+    /// 短/坏 oid 不 panic。
+    pub fn blob_path(&self, oid: &str) -> Result<PathBuf> {
+        crate::gitx::validate_oid(oid)?;
+        Ok(self.root.join(&oid[..2]).join(oid))
     }
 
     pub fn stats(&self) -> CacheStatsSnapshot {
@@ -95,7 +98,7 @@ impl HydrationCache {
     /// `expected_size` 来自 manifest：命中文件大小不符 → 删除重灌（缓存
     /// 损坏自愈）；灌入后大小不符 → 报错并清理临时文件（对象库异常信号）。
     pub fn ensure(&self, cat: &CatFile, oid: &str, expected_size: u64) -> Result<PathBuf> {
-        let final_path = self.blob_path(oid);
+        let final_path = self.blob_path(oid)?;
         if let Ok(md) = std::fs::symlink_metadata(&final_path) {
             if md.is_file() && md.len() == expected_size {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -111,7 +114,7 @@ impl HydrationCache {
 
     /// 强制灌入（不管是否已缓存）；命中方不要调用（用 [`Self::ensure`]）。
     pub fn hydrate(&self, cat: &CatFile, oid: &str, expected_size: u64) -> Result<PathBuf> {
-        let final_path = self.blob_path(oid);
+        let final_path = self.blob_path(oid)?;
         self.misses.fetch_add(1, Ordering::Relaxed);
         self.hydrate_inner(cat, oid, expected_size, &final_path)?;
         Ok(final_path)
@@ -270,6 +273,7 @@ fn list_cache_files(root: &Path) -> Result<Vec<CacheFile>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cat_file::CatFile;
 
     fn oid(n: u8) -> String {
         format!("{n:02x}{}", "ab".repeat(19))
@@ -279,16 +283,42 @@ mod tests {
     fn blob_path_shards_by_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let c = HydrationCache::open(dir.path());
-        let p = c.blob_path(&oid(0xab));
+        let p = c.blob_path(&oid(0xab)).unwrap();
         assert!(p.starts_with(dir.path().join("cas-cache").join("ab")));
         assert_eq!(p.file_name().unwrap().to_str().unwrap(), oid(0xab));
+    }
+
+    /// 短 oid / 非 hex oid：blob_path 与 ensure 都报错，不 panic
+    /// （P2-2 回归：分片切片 `oid[..2]` 前必须先校验）。
+    #[test]
+    fn blob_path_rejects_invalid_oids_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = HydrationCache::open(dir.path());
+        let cat = CatFile::new(dir.path());
+
+        for bad in [
+            "x",
+            "ab",
+            "",
+            "0123456789abcdef0123456789abcdef0123456",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            assert!(c.blob_path(bad).is_err(), "blob_path({bad:?}) must err");
+            assert!(c.ensure(&cat, bad, 0).is_err(), "ensure({bad:?}) must err");
+            assert!(
+                c.hydrate(&cat, bad, 0).is_err(),
+                "hydrate({bad:?}) must err"
+            );
+        }
+        // 合法 oid 正常返回分片路径
+        assert!(c.blob_path(&oid(0xab)).is_ok());
     }
 
     #[test]
     fn stats_roundtrip_and_clear() {
         let dir = tempfile::tempdir().unwrap();
         let c = HydrationCache::open(dir.path());
-        let f = c.blob_path(&oid(1));
+        let f = c.blob_path(&oid(1)).unwrap();
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
         std::fs::write(&f, [0u8; 10]).unwrap();
         assert_eq!(c.cached_bytes(), 10);

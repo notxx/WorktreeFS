@@ -18,7 +18,9 @@
 //! manifest stat 后，[`seed_stat_aligned`] 已把 index 的 stat 字段改写为
 //! manifest 值（dev/ino/size/mode/mtime=固定纪元），批量清除 skip-worktree
 //! 位（[`clear_skip_worktree`]）即完成挂载态对齐——届时 status 的干净性由
-//! "FS stat == index stat" 保证，与 B1 模板 index 的机制同构。
+//! "FS stat == index stat" 保证，与 B1 模板 index 的机制同构。注意 index
+//! 的 ino 字段是 u32：62 位 [`crate::file_id`] 写入时截断为 32 位，M18 的
+//! FS stat 必须复现同一截断，否则清位后 status 会全量报修改。
 //!
 //! 注意：skip-worktree 是 git 尊重的语义位（sparse-checkout 用），但全树
 //! 置位属于超范围使用——`git add`/`git stash` 等对 skip-worktree 路径的
@@ -123,6 +125,10 @@ pub fn seed_stat_aligned(
                 let nsecs = (epoch_ns % 1_000_000_000).max(0) as u32;
                 entry.stat = Stat {
                     dev: volume_serial,
+                    // index 格式的 ino 是 u32：62 位 file_id 在此截断。
+                    // M18 的 FS stat 必须复现同一截断（CasStat.ino as u32
+                    // 回填），否则挂载态清 skip-worktree 后 lstat ino 与
+                    // index 不一致，status 全量报修改。
                     ino: crate::file_id(path) as u32,
                     uid: 0,
                     gid: 0,

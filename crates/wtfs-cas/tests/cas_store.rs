@@ -205,7 +205,7 @@ fn cache_ensures_sharded_files_with_stats_and_gc() {
 
     // 大小不符 = 损坏 → 删除重灌
     let (path, f) = m.files().iter().find(|(_, f)| f.size > 0).unwrap();
-    let p = cache.blob_path(&f.oid);
+    let p = cache.blob_path(&f.oid).unwrap();
     std::fs::write(&p, b"corrupted").unwrap();
     let hits_before = cache.stats().hits;
     let misses_before = cache.stats().misses;
@@ -224,7 +224,12 @@ fn cache_ensures_sharded_files_with_stats_and_gc() {
 
     // GC：预算 0 → 全部逐出；.tmp-* 残留清扫。注意上一段 size 不符的
     // ensure 已把该文件删掉（损坏自愈路径），所以正式文件少一个。
-    let tmp = cache.blob_path(&f.oid).parent().unwrap().join(".tmp-1-1");
+    let tmp = cache
+        .blob_path(&f.oid)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".tmp-1-1");
     std::fs::write(&tmp, b"torn").unwrap();
     let evicted_before = cache.stats().evicted_files;
     let report = cache.gc(0).unwrap();

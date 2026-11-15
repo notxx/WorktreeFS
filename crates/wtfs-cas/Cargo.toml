@@ -1,0 +1,17 @@
+[package]
+name = "wtfs-cas"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# 索引种子（route A）：read-tree 后按 manifest 改写 entry stat / skip-worktree 位。
+gix-index = { workspace = true }
+# cat-file --batch 常驻句柄互斥与标记日志追加串行化。
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# ino 派生与 wtfs-core 的 derive_ino 保持同一算法（blake3 小写路径）。
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

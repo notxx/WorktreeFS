@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/wtfs-cas",
     "crates/wtfs-core",
     "crates/wtfs-vfs",
     "crates/wtfs-daemon",

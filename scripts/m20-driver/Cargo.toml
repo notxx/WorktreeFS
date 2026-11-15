@@ -1,0 +1,19 @@
+# wtfs-m20-driver —— M20/B200100 bench driver（bench 脚手架，非产品代码）。
+#
+# 刻意放 scripts/ 且不入仓库 workspace（见 src/main.rs 模块注释）：M20 的
+# 实测需要进程内挂载 C（CAS）视图驱动 plain `git worktree add`，而 C 的
+# add/seed/注册只有库 API（M18 无 CLI/shim 接线）。path dep 用相对路径——
+# 无论从主 checkout 还是 worktree 构建，都指向本仓库的 crates/。
+[package]
+name = "wtfs-m20-driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wtfs-core = { path = "../../crates/wtfs-core" }
+wtfs-cas = { path = "../../crates/wtfs-cas" }
+wtfs-vfs = { path = "../../crates/wtfs-vfs" }
+
+# 脱离仓库 workspace（若不加，cargo 会因父目录存在 workspace 而报
+# "current package believes it's in a workspace when it's not"）。
+[workspace]

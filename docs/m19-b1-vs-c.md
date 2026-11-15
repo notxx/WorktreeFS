@@ -162,6 +162,20 @@ status/diff 慢 1.45×/1.96×——都是读的工作集换生命周期速度。
   * 能接受/消除首读延迟（预热、预取）且能改造自动化流程（shim 接线后
     C 的适用面显著扩大）。
 
+## C 不带 `--no-checkout` 的退化（M20 补充实测）
+
+M20 在 C 挂载视图上实测 plain `git worktree add`（不带 `--no-checkout`），
+完整数据与机制归因见 **docs/m20-c-plain.md**。要点：挂载根 mkdir 命中的是
+registry 级 `auto_register`——建出 **B1 overlay** 走 **full-copy 兜底**
+（C 的 store 无模板）：add 22.8 s（B1 模板路径的 5.7×），每 wt upper 全量
+物化 ≈49.3 MB；且无 daemon 时视图永远 Initializing → status 报整树删除
+（4,874 条 D）、后续 `git worktree` 操作会把先建 wt 的 admin 元数据 prune
+掉、`remove --force` 结局不确定（Permission denied / 意外成功并存）。
+即便强制经 CAS 视图全量物化（模拟 plain add 的 checkout 阶段）：checkout
+25.5 s/4,874 文件、hydration 缓存吃满整树 48.1 MB、首读 0 miss 但那是
+checkout 时已付的代价。**结论：shim/`--no-checkout` 显式流程是 C 的关键
+前置**——下表第 1 条改进的量化依据。
+
 ## C 的后续改进（按收益排序）
 
 1. **shim 自动注册**：把显式流程（add --no-checkout + seed + 注册 + 清位）

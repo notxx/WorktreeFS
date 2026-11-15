@@ -234,6 +234,9 @@ set WTFS_VFS_PROFILE=1
 set WTFS_BENCH_REPO=<大仓库 clone>
 set WTFS_BENCH_WTS=2
 cargo test --release -p wtfs-daemon --test m13_profile -- --ignored --nocapture
+
+:: 同窗口口径的 remove/unlink 归因（M14 起可用，见下节）
+cargo test --release -p wtfs-daemon --test m14_profile -- --ignored --nocapture
 ```
 
 ### 归因口径
@@ -322,3 +325,101 @@ cargo test --workspace -- --ignored
 （index watcher → ready → status 干净 → 编辑/还原 → remove → 卸载 → gc）；
 `worktree_lifecycle`（夹具仓库全生命周期：add → status 干净 → dedupe 上界 →
 diff → add/commit → remove → 卸载 → gc）。
+
+## remove/unlink 路径与性能地板（M14/B140100）
+
+### remove 窗口归因（profiler 实测）
+
+新增 `crates/wtfs-daemon/tests/m14_profile.rs`（ignored，与 m13_profile 同构，
+窗口改为 `git worktree remove`）：`git worktree remove` 的墙钟含开头一次
+干净检查 status 与逐文件递归删除，profiler 对窗口内回调/NT 系统调用计数。
+
+4,874 tracked files（git/git 夹具），remove 窗口 wall 6125 ms：
+
+| 指标 | 数值 |
+|---|---|
+| `cb.open` | 32,275 次 / 2.07 s——WinFSP 内核对每个路径分量发起 open（每 unlink ~6.3 次），每个 open handler 做一次完整 `overlay.stat` |
+| `cb.get_security_by_name` | 10,919 次 / 0.73 s——git 的 lstat（status 干净检查 + 递归删除前）×2/文件 + Create 的访问检查 |
+| `cb.get_file_info` / `cb.cleanup` | 各 5,100 次（= 文件+目录数） / 0.28 s + 0.33 s |
+| `cb.set_delete` / `cb.close` | 2.4 µs / 0.4 µs 均值——handler 本身近零成本 |
+| `nt.symlink_metadata` | **54,180 次 × 54.4 µs = 2.95 s（占窗口 48%）**——除 set_delete/close/read_directory 外每个回调各一次 upper 全路径探测 |
+| 三分归因 | Σ回调 3.78 s（NTFS 2.99 s + overlay 逻辑 0.78 s）｜IPC + git 自身 CPU ≈ 2.35 s |
+
+每次 unlink 的回调序列由 git 与 WinFSP 内核决定（lstat → Create →
+set_delete → cleanup → close + 按路径分量 open）：每 unlink ~18 个回调，
+其中除 `set_delete`/`close` 外的 ~11 个各自做一次 upper 全路径探测，**~11
+次探测 × 54 µs/次**构成主要成本；54 µs 是 NTFS 全路径解析的
+O(深度) 成本，热缓存下与 M13 status 窗口实测一致（~13 µs），删除过程的
+缓存扰动使其放大到 ~54 µs。
+
+优化后同一窗口（同夹具同机）：
+
+| 指标 | 优化前 | 优化后 |
+|---|---|---|
+| `nt.symlink_metadata` 次数 | 54,180 | **7,585**（≈文件+目录去重数，每路径仅首次真探测） |
+| NTFS 系统调用总耗时 | 2,994 ms | **583 ms** |
+| Σ回调墙钟 | 3,779 ms | **1,138 ms** |
+| `cb.open` 均值（3.2 万次） | 64.2 µs | **11.5 µs** |
+| `cb.cleanup` 均值 | 65.0 µs | **14.2 µs** |
+| `cb.get_security_by_name` 均值（1.1 万次） | 67.2 µs | 40.1 µs（每路径首次探测保留） |
+| `cb.get_file_info` 均值 | 55.6 µs | **3.3 µs**（整段走缓存） |
+| 回调次数（WinFSP 内核决定） | 91,610 | 91,610（不变） |
+| IPC + git 自身 CPU | ≈2,346 ms | ≈2,115 ms（**硬地板**） |
+
+### WinFSP 批量删除语义评估（结论：不支持，逐文件硬地板）
+
+WinFSP 官方 API 文档（winfsp.dev/apiref）定义的删除是三段式 per-file 流程：
+SetDispositionInformation（我们的 `set_delete`）→ Cleanup 携带
+`FspCleanupDelete` → Close；无任何批量删除/批量 cleanup 入口，删除回调
+序列与次数由内核与调用方（git）决定，user-mode 文件系统无法合并。因此
+remove 的回调次数地板不可减；可优化空间只剩每次回调的 handler 成本。
+
+### upper 负存在缓存（M14 优化）
+
+归因显示每回调一次的 upper 全路径探测是最大单项成本。干净 worktree 的
+删除窗口里 upper 几乎零变更（被删的是 lower 文件，只追加标记日志），
+同一路径被反复探测十次以上。`Overlay` 增加 `upper_neg` 负存在缓存：
+
+- 只缓存"upper 无此视图路径"的负结果；"存在"永不缓存——脏 worktree 的
+  stat/读取语义与无缓存时逐字节一致；
+- upper 任何物理变更（create/copy_up/staged 物化/写/删/改名，core 与 VFS
+  两侧全部变更点，含各错误出口前已物理建出的祖先目录——`create_dir_all`
+  之后立即失效一次）整体清空缓存——git 删除窗口零 upper 变更，整窗缓存
+  存活；
+- 并发安全：探测采用"先登记后探测再回收"的乐观序，并发清空只会让缓存
+  更空，不存在"已存在却缓存为不存在"的持久陈旧条目；登记仅对探测得到
+  "确实不存在"（ERROR_FILE/PATH_NOT_FOUND）的路径保留，sharing violation
+  等瞬态错误立即回收登记、下次重探（P2-3）。已知边界（P2-4）：单次探测
+  的 µs 级窗口内，其他线程读同一 rel 可能得到一次假负——受支持的用法
+  （每 worktree 单写者的 git 流）不可达，且条目随探测结果即时修正，无
+  持久陈旧；
+- 旁路直写 upper（绕过 FS 的外部编辑，daemon 私有存储目录，本就不在受
+  支持语义内）在下一次 FS 侧 upper 变更前不可见——此前行为是每次真探测
+  可即时看到；语义收窄已在源码与本文档注明。
+
+`Overlay::remove` 同步去重：Upper 臂补 `ctx.touch_upper()`，删除与标记
+共用一次解析（探测经缓存后零 NT 调用）；标记日志（M12 语义）不变。
+
+### 实测：优化前后（4,874 tracked files，10 轮中位）
+
+2026-11-15，release 构建，`m0_benchmark` harness，来源
+`wtfs-bench-large-m12/repo`（git/git @ `923ecfe`）；"优化前"为本 mission 起点
+独立复跑（M13 提交 @ a22d479 的代码）：
+
+| metric | native worktree | WorktreeFS（优化前） | WorktreeFS（优化后） |
+|---|---|---|---|
+| worktree add (median) | 2852 / 2859 ms | 5947 ms | **3269 ms** |
+| add + ready switch (median) | - | 6008 ms | **3320 ms** |
+| disk: worktree tree (mean) | 49.27 MB (4875 files) | 49.27 MB (4875 files) | 49.27 MB (4875 files) |
+| disk: private upper store (mean) | - | 0.1 KB | 0.1 KB（89 B，M9/M10/M12 性质不变） |
+| git status cold (median) | 215 / 181 ms | 137 ms | **99 ms** |
+| git status hot (median) | 60 / 53 ms | 137 ms | **100 ms** |
+| **worktree remove (median)** | 1334 / 1366 ms | 6427 ms | **3306 ms** |
+| one-off: template + mount | - | 4671 ms + 44 ms | 3726 ms + 42 ms |
+
+- remove 目标 <8s：基线已达成（6427 ms），优化后 **3306 ms**（−48%，与
+  native 的差距从 4.8× 收窄到 2.4×）；remove 轮内最慢单轮 3.5 s。
+- status 135 ms 护栏不回退且同步受益：冷/热 137 ms → 99/100 ms（负缓存
+  让 read_directory 之外的按名解析同样免探测）；本轮 native 冷态 181 ms。
+- add（checkout 写路径）同步受益：5947 → 3269 ms（检出期的按名解析走
+  同一 resolve 入口）。

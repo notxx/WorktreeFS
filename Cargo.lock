@@ -1725,6 +1725,7 @@ dependencies = [
  "blake3",
  "gix-index",
  "parking_lot 0.13.0",
+ "sha1",
  "tempfile",
  "thiserror",
  "tracing",
@@ -1805,6 +1806,7 @@ dependencies = [
  "windows 0.62.2",
  "winfsp",
  "winfsp-sys",
+ "wtfs-cas",
  "wtfs-core",
 ]
 

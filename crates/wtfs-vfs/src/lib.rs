@@ -21,7 +21,10 @@
 //!
 //! 模块：
 //!
-//! * [`registry`] —— worktree 注册表 + mark_ready 公共钩子 + 自动注册。
+//! * [`backend`] —— VFS 后端抽象（M18）：B1 [`wtfs_core::Overlay`] 与 C
+//!   [`wtfs_cas::CasView`] 共用回调层；[`backend::ViewBackend`] enum 分发。
+//! * [`registry`] —— worktree 注册表 + mark_ready 公共钩子 + 自动注册 +
+//!   CAS 视图注册（M18）。
 //! * [`context`]  —— WinFSP 回调实现（get_volume_info/security/open/create/
 //!   overwrite/read/write/read_directory/rename/cleanup/flush/set_*）。
 //! * [`mount`]    —— 目录挂载/卸载（[`mount::mount_directory`]）。
@@ -29,6 +32,7 @@
 //! * [`security`] —— 固定安全描述符。
 //! * [`win`]      —— FILETIME/NTSTATUS/路径转换与常量。
 
+pub mod backend;
 pub mod context;
 pub mod mount;
 pub mod notify;
@@ -39,7 +43,8 @@ pub mod win;
 #[cfg(test)]
 mod tests;
 
+pub use backend::{CasBackend, CasShared, ViewBackend, ViewResolution, ViewStaged, ViewWriteOutcome, ViewWriteState};
 pub use context::{FileContext, WtfsContext};
 pub use mount::{MountedVolume, mount_directory};
 pub use notify::{NotifyEvent, NotifyHub};
-pub use registry::{VfsConfig, VfsRegistry};
+pub use registry::{VfsConfig, VfsRegistry, register_cas_worktree};

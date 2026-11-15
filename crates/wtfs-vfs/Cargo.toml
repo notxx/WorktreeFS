@@ -22,6 +22,8 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 wtfs-core = { path = "../wtfs-core" }
+# M18/B180100：CAS 后端（C 方案）与 B1 Overlay 共用 WinFSP 回调层。
+wtfs-cas = { path = "../wtfs-cas" }
 
 [dev-dependencies]
 tempfile.workspace = true

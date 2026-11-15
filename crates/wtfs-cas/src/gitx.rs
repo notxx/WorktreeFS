@@ -105,3 +105,13 @@ pub(crate) fn absolute_git_dir(repo: &Path) -> Result<PathBuf> {
         Err(Error::Git(format!("git dir not absolute: {p:?}")))
     }
 }
+
+/// 解析当前 HEAD commit（完整 sha）；manifest 刷新（M18）用它检测 HEAD
+/// 前进。 unborn HEAD（空仓库）报 [`Error::Git`]。
+pub(crate) fn head_commit(repo: &Path) -> Result<String> {
+    let out = run_git(repo, &["rev-parse", "HEAD"])?;
+    require_ok(&out, "git rev-parse HEAD")?;
+    let s = out.stdout_lossy().trim().to_string();
+    validate_oid(&s)?;
+    Ok(s)
+}

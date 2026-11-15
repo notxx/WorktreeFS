@@ -13,15 +13,18 @@
 //! 只是把钩子暴露出来。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use wtfs_cas::{CasViewConfig, Manifest};
 use wtfs_core::{
     Db, FileHashMap, Overlay, OverlayConfig, SqliteOverlayStore, SqliteTemplateStore,
     TemplateId, TemplateSpec, TemplateStore, WorktreeId, template_spec_for_worktree,
     validate_relative_path,
 };
+
+use crate::backend::{CasBackend, CasShared, ViewBackend};
 
 /// 单个挂载的配置（daemon/CLI 构造，测试可手工填充）。
 #[derive(Debug, Clone)]
@@ -56,7 +59,8 @@ pub struct VfsRegistry {
     /// `worktree 名（小写键）→ 条目`。WinFSP FSD 的访问检查会传大写路径
     /// （如 `\WT-1\README.md`），挂载卷按 NTFS 惯例大小写不敏感，因此
     /// 路由键统一小写；原始名保留在条目里供通知/枚举使用。
-    overlays: DashMap<String, RegistryEntry>,
+    /// M18 起条目按 [`ViewBackend`] 分派（B1 Overlay / C CasView）。
+    backends: DashMap<String, RegistryEntry>,
     /// 模板 resolve（只查不建；模板创建/更新归 daemon/CLI）。
     template_store: SqliteTemplateStore,
     /// overlay 元数据（一个挂载一份；全部 worktree 共享同一 Db）。
@@ -65,7 +69,7 @@ pub struct VfsRegistry {
 
 struct RegistryEntry {
     name: String,
-    overlay: Arc<Overlay>,
+    backend: ViewBackend,
 }
 
 impl VfsRegistry {
@@ -76,7 +80,7 @@ impl VfsRegistry {
         let overlay_store = Arc::new(SqliteOverlayStore::new(db));
         Ok(Self {
             cfg,
-            overlays: DashMap::new(),
+            backends: DashMap::new(),
             template_store,
             overlay_store,
         })
@@ -95,48 +99,77 @@ impl VfsRegistry {
     pub fn register(&self, name: impl Into<String>, overlay: Arc<Overlay>) -> Arc<Overlay> {
         let name = name.into();
         let key = name.to_ascii_lowercase();
-        match self.overlays.get(&key) {
-            Some(existing) => existing.overlay.clone(),
+        match self.get(&name) {
+            // 同名 B1 overlay 已在（崩溃恢复/重开路径）：幂等返回既有实例。
+            Some(existing) => existing,
             None => {
                 let entry = RegistryEntry {
                     name: name.clone(),
-                    overlay: overlay.clone(),
+                    backend: ViewBackend::Overlay(overlay.clone()),
                 };
-                self.overlays.insert(key, entry);
+                self.backends.insert(key, entry);
                 overlay
             }
         }
     }
 
-    /// 大小写不敏感查找，返回（规范名, overlay）。
-    pub fn lookup(&self, name: &str) -> Option<(String, Arc<Overlay>)> {
-        self.overlays
-            .get(&name.to_ascii_lowercase())
-            .map(|e| (e.name.clone(), e.overlay.clone()))
+    /// 注册一个 CAS 视图后端（M18 显式流程；[`register_cas_worktree`] 的
+    /// 底座）。同名（大小写不敏感）重复注册幂等（返回既有实例）。
+    pub fn register_cas(&self, name: impl Into<String>, backend: CasBackend) -> CasBackend {
+        let name = name.into();
+        let key = name.to_ascii_lowercase();
+        match self.get_backend(&name) {
+            // 同名 CAS 视图已在（崩溃恢复/重挂）：幂等返回既有实例。
+            Some(ViewBackend::Cas(existing)) => existing,
+            Some(_) => backend,
+            None => {
+                let entry = RegistryEntry {
+                    name: name.clone(),
+                    backend: ViewBackend::Cas(backend.clone()),
+                };
+                self.backends.insert(key, entry);
+                backend
+            }
+        }
     }
 
+    /// 大小写不敏感查找，返回（规范名, 后端）。
+    pub fn lookup_backend(&self, name: &str) -> Option<(String, ViewBackend)> {
+        self.backends
+            .get(&name.to_ascii_lowercase())
+            .map(|e| (e.name.clone(), e.backend.clone()))
+    }
+
+    /// 大小写不敏感的后端查找（挂载路由用）。
+    pub fn get_backend(&self, name: &str) -> Option<ViewBackend> {
+        self.lookup_backend(name).map(|(_, backend)| backend)
+    }
+
+    /// B1 overlay 访问（daemon/watcher/测试的既有语义；CAS 视图 → `None`）。
     pub fn get(&self, name: &str) -> Option<Arc<Overlay>> {
-        self.lookup(name).map(|(_, overlay)| overlay)
+        self.get_backend(name)
+            .and_then(|backend| backend.as_overlay().cloned())
     }
 
     /// 已注册 worktree 名（挂载根枚举用；保留原始大小写）。
     pub fn names(&self) -> Vec<String> {
-        self.overlays.iter().map(|e| e.name.clone()).collect()
+        self.backends.iter().map(|e| e.name.clone()).collect()
     }
 
     /// 公共钩子（daemon index watcher 调用）：`initializing → ready`。
-    /// 切换后视图 = 模板 + upper（应用 whiteout/rename）。
+    /// 切换后视图 = 模板 + upper（应用 whiteout/rename）。CAS 视图无此
+    /// 状态机（注册即 ready）→ NotFound。
     pub fn mark_ready(&self, name: &str) -> wtfs_core::Result<()> {
-        match self.lookup(name) {
-            Some((_, overlay)) => overlay.mark_ready(),
+        match self.get(name) {
+            Some(overlay) => overlay.mark_ready(),
             None => Err(wtfs_core::Error::NotFound(format!("worktree {name:?}"))),
         }
     }
 
     /// 公共钩子：初始化失败标记（不允许 worker 在该 worktree 上启动）。
     pub fn mark_failed(&self, name: &str) -> wtfs_core::Result<()> {
-        match self.lookup(name) {
-            Some((_, overlay)) => overlay.mark_failed(),
+        match self.get(name) {
+            Some(overlay) => overlay.mark_failed(),
             None => Err(wtfs_core::Error::NotFound(format!("worktree {name:?}"))),
         }
     }
@@ -147,8 +180,8 @@ impl VfsRegistry {
     /// base ref；缺失则回退主仓库 HEAD；resolve 失败 → 无模板（全量 copy），
     /// worktree 仍然正确。
     pub fn auto_register(&self, name: &str) -> wtfs_core::Result<Arc<Overlay>> {
-        if let Some(existing) = self.lookup(name) {
-            return Ok(existing.1);
+        if let Some(existing) = self.get(name) {
+            return Ok(existing);
         }
         // worktree 名必须是单一路径组件（挂载根的一级目录名）。
         if name.contains('/') || name.contains('\\') {
@@ -195,8 +228,10 @@ impl VfsRegistry {
 
     /// 注销（merge/teardown 后 gc；daemon 用）。仅移除路由映射；upper 文件
     /// 与 DB 行由 `OverlayStore::unregister` + gc 流程负责（spec §6.6）。
+    /// CAS 视图：upper（真实 worktree 目录）与标记日志由调用方（git
+    /// worktree remove / gc）处置。
     pub fn unregister(&self, name: &str) -> bool {
-        self.overlays
+        self.backends
             .remove(&name.to_ascii_lowercase())
             .is_some()
     }
@@ -229,6 +264,57 @@ impl VfsRegistry {
             }
         }
     }
+}
+
+/// M18 显式流程的挂载侧入口：把一个已 `git worktree add --no-checkout` +
+/// 索引种子的 worktree 注册为 CAS 视图。流程约定（docs/m18-cas-mount.md）：
+///
+/// 1. 调用方经 `wtfs_cas::add_worktree_no_checkout` 建真实 worktree 目录
+///    （`.git` 指针所在；**必须在挂载点之外**，否则 mkdir 会被 B1 的
+///    auto_register 拦截）；
+/// 2. `wtfs_cas::Manifest::load` + `wtfs_cas::seed_stat_aligned` 完成索引
+///    种子（skip-worktree + stat 对齐）；
+/// 3. 挂载就绪（FS 已在服务）后调用本函数注册路由；
+/// 4. **注册成功后再** `wtfs_cas::clear_skip_worktree` 清位（挂载失败/
+///    未就绪不得清位——清位后未挂载的 status 必报全量删除）。
+///
+/// 视图布局：upper = 真实 worktree 目录（`.git` 经 upper 自然可见）；meta
+/// （标记日志）= `<store_root>/cas-meta/<name>`；cat-file/缓存 = 调用方
+/// 注入的 [`CasShared`]（per-挂载共享）。dev 用挂载卷序列号，mtime 用
+/// 固定纪元——与 `seed_stat_aligned` 写入 index 的值逐位一致。
+pub fn register_cas_worktree(
+    registry: &VfsRegistry,
+    name: &str,
+    real_worktree: &Path,
+    manifest: Arc<Manifest>,
+    shared: Arc<CasShared>,
+) -> wtfs_core::Result<CasBackend> {
+    if name.contains('/') || name.contains('\\') {
+        return Err(wtfs_core::Error::InvalidPath {
+            path: name.to_string(),
+            reason: "worktree name must be a single component".into(),
+        });
+    }
+    validate_relative_path(name)?;
+    if let Some(backend) = registry.get_backend(name) {
+        // 幂等重入（崩溃恢复/重挂）：返回既有 CAS 视图。
+        return match backend.as_cas() {
+            Some(c) => Ok(c.clone()),
+            None => Err(wtfs_core::Error::Overlay(format!(
+                "worktree {name:?} already registered as a B1 overlay"
+            ))),
+        };
+    }
+    let mut config = CasViewConfig::new(
+        real_worktree,
+        registry.config().store_root.join("cas-meta").join(name),
+    );
+    // dev 必须与 WinFSP 卷序列号一致（git lstat 的 st_dev 比对口径）。
+    config.volume_serial = registry.config().volume_serial;
+    config.fixed_stat_epoch_ns = wtfs_core::FIXED_STAT_EPOCH_UNIX_NS;
+    let backend = CasBackend::open(config, manifest, real_worktree, shared)
+        .map_err(crate::backend::map_cas_error)?;
+    Ok(registry.register_cas(name, backend))
 }
 
 /// `wt-<n>` → `WorktreeId(n)`；非Tower命名派生自 FNV-1a（同 repo 内唯一）。

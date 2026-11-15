@@ -200,19 +200,32 @@ impl Daemon {
         let mut names = self.registry.names();
         names.sort();
         for name in names {
-            let Some(overlay) = self.registry.get(&name) else {
-                continue;
+            // M18：同一注册表可同时挂 B1 overlay 与 C CAS 视图。B1 报 DB
+            // 状态机；CAS 视图注册即 ready（无状态机）。
+            let state = match self.registry.get_backend(&name) {
+                Some(backend) => match backend.as_overlay() {
+                    Some(overlay) => overlay
+                        .store()
+                        .state(overlay.worktree_id())
+                        .ok()
+                        .flatten()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    None => "ready (cas)".to_string(),
+                },
+                None => "unknown".to_string(),
             };
-            let state = overlay
-                .store()
-                .state(overlay.worktree_id())
-                .ok()
-                .flatten()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let worktree_id = match self.registry.get_backend(&name) {
+                Some(backend) => match backend.as_overlay() {
+                    Some(overlay) => overlay.worktree_id().0,
+                    // CAS 视图无 DB 行；id 与 FNV 派生路由无关联，报 0。
+                    None => 0,
+                },
+                None => 0,
+            };
             worktrees.push(WorktreeStatus {
                 name,
-                worktree_id: overlay.worktree_id().0,
+                worktree_id,
                 state,
             });
         }

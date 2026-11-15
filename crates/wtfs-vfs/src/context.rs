@@ -57,13 +57,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
-use wtfs_core::{
-    FileAttributes, Overlay, OverlayStore, Resolution, StagedContent, Stat, TemplateFile,
-    profiling::{Metric, Span},
-    validate_relative_path,
-};
+use wtfs_core::{FileAttributes, Stat, profiling::{Metric, Span}};
 use winfsp::FspError;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileSecurity, FileInfo, FileSystemContext, OpenFileInfo,
@@ -71,6 +67,7 @@ use winfsp::filesystem::{
 };
 use winfsp::U16CStr;
 
+use crate::backend::{ViewBackend, ViewResolution, ViewStaged};
 use crate::notify::NotifyHub;
 use crate::registry::{VfsRegistry, worktree_ino};
 use crate::security::{fixed_security_descriptor, fixed_security_descriptor_len};
@@ -100,7 +97,7 @@ enum Route {
     /// 已注册 worktree + repo 相对路径（`""` = worktree 根）。
     Worktree {
         name: String,
-        overlay: Arc<Overlay>,
+        backend: ViewBackend,
         rel: String,
     },
     /// 未注册首组件。
@@ -133,14 +130,14 @@ impl WtfsContext {
         let Some((name, rel)) = split_first_component(file_name) else {
             return Ok(Route::Root);
         };
-        match self.registry.lookup(&name) {
-            Some((canonical, overlay)) => {
+        match self.registry.lookup_backend(&name) {
+            Some((canonical, backend)) => {
                 if !rel.is_empty() {
-                    validate_relative_path(&rel).map_err(|_| err_invalid_name())?;
+                    wtfs_core::validate_relative_path(&rel).map_err(|_| err_invalid_name())?;
                 }
                 Ok(Route::Worktree {
                     name: canonical,
-                    overlay,
+                    backend,
                     rel,
                 })
             }
@@ -185,8 +182,8 @@ struct Spill {
 pub struct FileContext {
     /// worktree 名；`None` = 挂载根。
     route_name: Option<String>,
-    overlay: Option<Arc<Overlay>>,
-    /// overlay 内相对路径（挂载根/worktree 根为 `""`）。
+    backend: Option<ViewBackend>,
+    /// 视图内相对路径（挂载根/worktree 根为 `""`）。
     rel: String,
     is_dir: bool,
     dir_buffer: DirBuffer,
@@ -221,10 +218,10 @@ fn discard_staged(staged: StagedWrite) {
 }
 
 impl FileContext {
-    fn dir(route_name: Option<String>, overlay: Option<Arc<Overlay>>, rel: String) -> Self {
+    fn dir(route_name: Option<String>, backend: Option<ViewBackend>, rel: String) -> Self {
         Self {
             route_name,
-            overlay,
+            backend,
             rel,
             is_dir: true,
             dir_buffer: DirBuffer::new(),
@@ -235,10 +232,10 @@ impl FileContext {
         }
     }
 
-    fn file(route_name: Option<String>, overlay: Arc<Overlay>, rel: String) -> Self {
+    fn file(route_name: Option<String>, backend: ViewBackend, rel: String) -> Self {
         Self {
             route_name,
-            overlay: Some(overlay),
+            backend: Some(backend),
             rel,
             is_dir: false,
             dir_buffer: DirBuffer::new(),
@@ -252,18 +249,18 @@ impl FileContext {
     /// 在 `upper_abs(rel)` 建立全新空 upper 文件的写状态（新建/whiteout 重建/
     /// 覆写跳过 copy-up 共用；P1-1 祖先 whiteout 时同样按新文件落 upper）。
     fn open_fresh_upper(
-        overlay: &Overlay,
+        backend: &ViewBackend,
         rel: &str,
     ) -> Result<WriteState, FspError> {
-        let path = overlay.upper_abs(rel);
+        let path = backend.upper_abs(rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(FspError::from)?;
         }
         // P2-2：create_dir_all 之后任何出口（含 open_rw_create 失败）都已
         // 物理建过 upper 祖先目录——失效一次覆盖所有出口。
-        overlay.note_upper_mutation();
+        backend.note_upper_mutation();
         let file = open_rw_create(&path)?;
-        overlay.io_stats().record_upper_write();
+        backend.record_upper_write();
         Ok(WriteState::InPlace { file, size: 0 })
     }
 
@@ -281,8 +278,8 @@ impl FileContext {
         if self.truncate_open.load(Ordering::SeqCst) {
             return Ok(0);
         }
-        let overlay = self.overlay.as_ref().ok_or_else(err_access_denied)?;
-        Ok(overlay
+        let backend = self.backend.as_ref().ok_or_else(err_access_denied)?;
+        Ok(backend
             .stat(&self.rel)
             .map_err(fsp_err)?
             .map(|st| st.size)
@@ -291,11 +288,11 @@ impl FileContext {
 
     /// 首次写操作时建立写状态（spec §6.5 copy-up / §16.2 暂存策略）。
     fn ensure_write_state(&self) -> Result<std::sync::MutexGuard<'_, Option<WriteState>>, FspError> {
-        let overlay = self.overlay.as_ref().ok_or_else(err_access_denied)?;
+        let backend = self.backend.as_ref().ok_or_else(err_access_denied)?;
         let mut slot = self.write.lock().map_err(|_| err_invalid_parameter())?;
         if slot.is_none() {
             let rel = self.rel.as_str();
-            let initializing = overlay.is_initializing().map_err(fsp_err)?;
+            let initializing = backend.is_initializing().map_err(fsp_err)?;
             *slot = Some(if initializing {
                 // 暂存写从空内容开始：覆写打开语义天然成立（终裁整段替换）。
                 WriteState::Staged(StagedWrite {
@@ -310,8 +307,8 @@ impl FileContext {
                 // 新内容——upper 直接清空；lower 跳过 copy-up（内容将被整体
                 // 替换），终裁 write_from 的 dedupe 比对语义不变。
                 let truncate = self.truncate_open.load(Ordering::SeqCst);
-                match overlay.resolve(rel).map_err(fsp_err)? {
-                    Resolution::Upper { path } => {
+                match backend.resolve(rel).map_err(fsp_err)? {
+                    ViewResolution::Upper { path } => {
                         let mut size = std::fs::metadata(&path).map_err(FspError::from)?.len();
                         let mut file = open_rw(&path)?;
                         if truncate {
@@ -321,13 +318,14 @@ impl FileContext {
                         }
                         WriteState::InPlace { file, size }
                     }
-                    Resolution::Lower { .. } if truncate => {
-                        Self::open_fresh_upper(overlay, rel)?
+                    ViewResolution::Lower if truncate => {
+                        Self::open_fresh_upper(backend, rel)?
                     }
-                    Resolution::Lower { .. } => {
-                        // copy-up；被祖先 whiteout 挡住（P1-1）时按新文件落 upper。
-                        let copied = overlay.copy_up(rel).map_err(fsp_err)?;
-                        let path = copied.unwrap_or_else(|| overlay.upper_abs(rel));
+                    ViewResolution::Lower => {
+                        // copy-up（B1：模板复制 / C：manifest hydrate）；被
+                        // 祖先 whiteout 挡住（P1-1）时按新文件落 upper。
+                        let copied = backend.copy_up(rel).map_err(fsp_err)?;
+                        let path = copied.unwrap_or_else(|| backend.upper_abs(rel));
                         let size = std::fs::metadata(&path)
                             .map(|m| m.len())
                             .unwrap_or(0);
@@ -336,13 +334,13 @@ impl FileContext {
                         // remove 已记 whiteout，不再触碰缓存）时，本次
                         // open_rw_create 仍是 upper 物理创建——必须失效负缓存，
                         // 防并发竞态留下持久陈旧负条目。重复失效无害。
-                        overlay.note_upper_mutation();
+                        backend.note_upper_mutation();
                         WriteState::InPlace { file, size }
                     }
-                    Resolution::Whiteout | Resolution::NotFound => {
-                        Self::open_fresh_upper(overlay, rel)?
+                    ViewResolution::Whiteout | ViewResolution::NotFound => {
+                        Self::open_fresh_upper(backend, rel)?
                     }
-                    Resolution::Directory { .. } => return Err(err_is_directory()),
+                    ViewResolution::Directory => return Err(err_is_directory()),
                 }
             });
         }
@@ -370,90 +368,65 @@ impl FileContext {
         }
     }
 
-    /// 投影 stat（暂存句柄的 get_file_info）：内容与模板一致 → 固定 lower
-    /// stat（与 ready 后 core 报告一致，index 对齐）；否则报当下时间
-    /// （真实物化后的 upper mtime ≈ 此刻；只读投影不持久，不一致场景 git
-    /// 在 status 时回退全量哈希，正确性不受影响）。
-    fn projected_stat(&self, overlay: &Overlay, staged: &StagedWrite) -> Result<Stat, FspError> {
-        let rel = self.rel.as_str();
-        let vs = u64::from(overlay.config().volume_serial);
-        let ino = overlay.file_id(rel).map_err(fsp_err)?;
-        let template: Option<TemplateFile> = overlay.lower().and_then(|m| m.get(rel)).cloned();
-        let matches_template = overlay.config().dedupe_enabled
-            && staged.hasher_valid
-            && staged.size == template.as_ref().map_or(0, |t| t.size)
-            && template
-                .as_ref()
-                .zip(Self::staged_hash(staged).ok())
-                .is_some_and(|(t, h)| h == t.hash);
-        if matches_template {
-            let t = template.as_ref().expect("checked above");
-            let epoch = overlay.config().fixed_stat_epoch_ns;
-            return Ok(Stat {
-                dev: vs,
-                ino,
-                mode: t.mode,
-                size: t.size,
-                mtime_ns: epoch,
-                ctime_ns: epoch,
-            });
-        }
-        // 与模板不一致：报当下时间（与 core 的真实 mtime 语义对齐）。
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as i64);
-        Ok(Stat {
-            dev: vs,
-            ino,
-            mode: template.map_or(0o100644, |t| t.mode),
-            size: staged.size,
-            mtime_ns: now,
-            ctime_ns: now,
-        })
+    /// 投影 stat（暂存句柄的 get_file_info，M11）：内容与 lower 一致 → 固定
+    /// lower stat（index 对齐），否则报当下时间。逻辑在后端实现
+    /// （B1 对模板 blake3；C 无暂存流，不可达）。
+    fn projected_stat(&self, backend: &ViewBackend, staged: &StagedWrite) -> Result<Stat, FspError> {
+        let hash = if staged.hasher_valid {
+            Some(wtfs_core::FileHash(*staged.hasher.clone().finalize().as_bytes()))
+        } else {
+            // 乱序写后哈希失效：与 B1 的 `.ok()` 降级口径一致（投影按不匹配）。
+            None
+        };
+        backend.projected_staged_stat(&self.rel, staged.size, hash).map_err(fsp_err)
     }
 
-    /// cleanup/flush 终裁：暂存内容经 [`Overlay::finish_staged`] 判定
+    /// cleanup/flush 终裁：暂存内容经 [`ViewBackend::finish_staged`] 判定
     /// dedupe（M9/B090100 零拷贝：一致 → 丢弃暂存回落 lower，零 upper/零
     /// fsync；不同/新 → 溢写改名 / 内存直写 upper + 恰好一次 fsync）；
-    /// 就地写（ready 编辑流）保持 [`Overlay::write_from`] post-hoc 比对。
+    /// 就地写（ready 编辑流）保持 [`ViewBackend::write_from`] post-hoc 比对。
     /// 失败时保留 upper 已写内容（全量 copy 兜底）。
     fn finalize_write(&self) -> Result<(), FspError> {
-        let overlay = self.overlay.clone().ok_or_else(err_access_denied)?;
+        let backend = self.backend.clone().ok_or_else(err_access_denied)?;
         let rel = self.rel.clone();
         let mut slot = self.write.lock().map_err(|_| err_invalid_parameter())?;
         let Some(state) = slot.take() else {
             return Ok(());
         };
         match state {
-            WriteState::Staged(staged) => Self::finalize_staged(&overlay, &rel, staged),
+            WriteState::Staged(staged) => Self::finalize_staged(&backend, &rel, staged),
             WriteState::InPlace { file, size: _ } => {
                 // 关句柄再重开：Windows 上 rename 覆盖打开中的文件会失败。
                 drop(file);
-                let path = overlay.upper_abs(&rel);
+                let path = backend.upper_abs(&rel);
                 match File::open(&path) {
                     // upper 已被旁路删除：视为无内容可终裁。
                     Err(_) => Ok(()),
-                    Ok(mut f) => overlay.write_from(&rel, &mut f).map(|_| ()).map_err(fsp_err),
+                    Ok(mut f) => backend.write_from(&rel, &mut f).map(|_| ()).map_err(fsp_err),
                 }
             }
         }
     }
 
     /// 暂存终裁（M9/B090100）：暂存期算好的哈希/长度直接交
-    /// [`Overlay::finish_staged`]，不再把内容重写进临时副本。溢写句柄先关
+    /// [`ViewBackend::finish_staged`]，不再把内容重写进临时副本。溢写句柄先关
     /// （Windows rename 前置条件）；失败时 best-effort 清理溢写文件，
     /// upper 既有内容不受影响。
-    fn finalize_staged(overlay: &Overlay, rel: &str, staged: StagedWrite) -> Result<(), FspError> {
+    fn finalize_staged(
+        backend: &ViewBackend,
+        rel: &str,
+        staged: StagedWrite,
+    ) -> Result<(), FspError> {
         let hash = Self::staged_hash(&staged).map_err(FspError::from)?;
         let size = staged.size;
         let StagedWrite { mem, spill, .. } = staged;
         let spill_path = spill.as_ref().map(|s| s.path.clone());
         drop(spill);
         let content = match spill_path.as_deref() {
-            Some(path) => StagedContent::Spill(path),
-            None => StagedContent::Memory(mem.as_slice()),
+            Some(path) => ViewStaged::Spill(path),
+            None => ViewStaged::Memory(mem.as_slice()),
         };
-        let result = overlay
+        let result = backend
             .finish_staged(rel, hash, size, content)
             .map(|_| ())
             .map_err(fsp_err);
@@ -463,7 +436,7 @@ impl FileContext {
         result
     }
 
-    /// 读句柄当前内容（暂存 → 内存/溢写；就地/只读 → overlay 解析的源文件）。
+    /// 读句柄当前内容（暂存 → 内存/溢写；就地/只读 → 后端解析的源文件）。
     fn read_into(&self, buffer: &mut [u8], offset: u64) -> Result<u32, FspError> {
         if self.is_dir {
             return Err(err_access_denied());
@@ -488,8 +461,8 @@ impl FileContext {
                 return Ok(len as u32);
             }
         }
-        let overlay = self.overlay.as_ref().ok_or_else(err_access_denied)?;
-        let Some(source) = overlay.source_path(&self.rel).map_err(fsp_err)? else {
+        let backend = self.backend.as_ref().ok_or_else(err_access_denied)?;
+        let Some(source) = backend.source_path(&self.rel).map_err(fsp_err)? else {
             return Err(err_not_found());
         };
         let md = std::fs::metadata(&source).map_err(FspError::from)?;
@@ -504,16 +477,16 @@ impl FileContext {
         Ok(len as u32)
     }
 
-    /// 句柄 stat：暂存 → 投影；其余 → core 逻辑 stat。
+    /// 句柄 stat：暂存 → 投影；其余 → 后端逻辑 stat。
     fn handle_stat(&self) -> Result<Stat, FspError> {
-        let overlay = self.overlay.as_ref().ok_or_else(err_access_denied)?;
+        let backend = self.backend.as_ref().ok_or_else(err_access_denied)?;
         {
             let slot = self.write.lock().map_err(|_| err_invalid_parameter())?;
             if let Some(WriteState::Staged(staged)) = slot.as_ref() {
-                return self.projected_stat(overlay, staged);
+                return self.projected_stat(backend, staged);
             }
         }
-        overlay.stat(&self.rel).map_err(fsp_err)?.ok_or_else(err_not_found)
+        backend.stat(&self.rel).map_err(fsp_err)?.ok_or_else(err_not_found)
     }
 }
 
@@ -610,8 +583,8 @@ impl FileSystemContext for WtfsContext {
             let attributes = match self.route(file_name)? {
                 Route::Root => FileAttributes::DIRECTORY,
                 Route::Unknown { .. } => return Err(err_not_found()),
-                Route::Worktree { overlay, rel, .. } => {
-                    match overlay.stat(&rel).map_err(fsp_err)? {
+                Route::Worktree { backend, rel, .. } => {
+                    match backend.stat(&rel).map_err(fsp_err)? {
                         Some(st) => wtfs_core::attributes_for(&st),
                         None => return Err(err_not_found()),
                     }
@@ -709,7 +682,7 @@ impl FileSystemContext for WtfsContext {
     ) -> Result<(), FspError> {
         let span = Span::start();
         let out = (|| {
-            let st = if context.overlay.is_none() {
+            let st = if context.backend.is_none() {
                 mount_root_stat()
             } else {
                 context.handle_stat()?
@@ -889,14 +862,14 @@ impl WtfsContext {
                 Ok(FileContext::dir(None, None, String::new()))
             }
             Route::Unknown { .. } => Err(err_not_found()),
-            Route::Worktree { name, overlay, rel } => {
+            Route::Worktree { name, backend, rel } => {
                 if rel.is_empty() {
                     // worktree 根：initializing 期间也可开目录句柄（git 查空目录）。
                     if non_dir_requested {
                         return Err(err_not_a_directory());
                     }
-                    let st = overlay.stat("").map_err(fsp_err)?.unwrap_or_else(|| Stat {
-                        dev: u64::from(overlay.config().volume_serial),
+                    let st = backend.stat(&rel).map_err(fsp_err)?.unwrap_or_else(|| Stat {
+                        dev: u64::from(backend.volume_serial()),
                         ino: worktree_ino(&name),
                         mode: 0o040755,
                         size: 0,
@@ -904,9 +877,9 @@ impl WtfsContext {
                         ctime_ns: wtfs_core::FIXED_STAT_EPOCH_UNIX_NS,
                     });
                     fill_file_info(file_info.as_mut(), &st);
-                    return Ok(FileContext::dir(Some(name), Some(overlay), rel));
+                    return Ok(FileContext::dir(Some(name), Some(backend), rel));
                 }
-                let st = overlay.stat(&rel).map_err(fsp_err)?.ok_or_else(err_not_found)?;
+                let st = backend.stat(&rel).map_err(fsp_err)?.ok_or_else(err_not_found)?;
                 let is_dir = st.mode & 0o170000 == 0o040000;
                 if dir_requested && !is_dir {
                     return Err(err_not_a_directory());
@@ -916,9 +889,9 @@ impl WtfsContext {
                 }
                 fill_file_info(file_info.as_mut(), &st);
                 if is_dir {
-                    Ok(FileContext::dir(Some(name), Some(overlay), rel))
+                    Ok(FileContext::dir(Some(name), Some(backend), rel))
                 } else {
-                    let fctx = FileContext::file(Some(name), overlay, rel);
+                    let fctx = FileContext::file(Some(name), backend, rel);
                     // 覆写类 disposition（B060100）：WinFSP 用户态对覆写打开
                     // 只调 Open（Overwrite op 由内核 best-effort 补发、可能
                     // 不达），EOF 收缩语义由标记在首次写/cleanup 落地。
@@ -960,32 +933,36 @@ impl WtfsContext {
                     });
                 fill_file_info(file_info.as_mut(), &st);
                 self.notify.push(&mount_path(&name, ""), FILE_ACTION_ADDED);
-                return Ok(FileContext::dir(Some(name), Some(overlay), String::new()));
+                return Ok(FileContext::dir(
+                    Some(name),
+                    Some(ViewBackend::Overlay(overlay)),
+                    String::new(),
+                ));
             }
-            Route::Worktree { name, overlay, rel } => {
-                let initializing = overlay.is_initializing().map_err(fsp_err)?;
+            Route::Worktree { name, backend, rel } => {
+                let initializing = backend.is_initializing().map_err(fsp_err)?;
                 if rel.is_empty() {
                     return Err(err_access_denied());
                 }
                 if is_dir {
                     if !initializing
                         && matches!(
-                            overlay.resolve(&rel).map_err(fsp_err)?,
-                            Resolution::Upper { .. }
-                                | Resolution::Lower { .. }
-                                | Resolution::Directory { .. }
+                            backend.resolve(&rel).map_err(fsp_err)?,
+                            ViewResolution::Upper { .. }
+                                | ViewResolution::Lower
+                                | ViewResolution::Directory
                         )
                     {
                         return Err(err_collision());
                     }
-                    std::fs::create_dir_all(overlay.upper_abs(&rel)).map_err(FspError::from)?;
-                    overlay.note_upper_mutation();
-                    let st = overlay
+                    std::fs::create_dir_all(backend.upper_abs(&rel)).map_err(FspError::from)?;
+                    backend.note_upper_mutation();
+                    let st = backend
                         .stat(&rel)
                         .map_err(fsp_err)?
                         .unwrap_or_else(|| Stat {
-                            dev: u64::from(overlay.config().volume_serial),
-                            ino: overlay.file_id(&rel).map_err(fsp_err).unwrap_or(0),
+                            dev: u64::from(backend.volume_serial()),
+                            ino: backend.file_id(&rel).map_err(fsp_err).unwrap_or(0),
                             mode: 0o040755,
                             size: 0,
                             mtime_ns: wtfs_core::FIXED_STAT_EPOCH_UNIX_NS,
@@ -993,14 +970,14 @@ impl WtfsContext {
                         });
                     fill_file_info(file_info.as_mut(), &st);
                     self.notify_change(&name, &rel, FILE_ACTION_ADDED);
-                    return Ok(FileContext::dir(Some(name), Some(overlay), rel));
+                    return Ok(FileContext::dir(Some(name), Some(backend), rel));
                 }
                 if !initializing
                     && matches!(
-                        overlay.resolve(&rel).map_err(fsp_err)?,
-                        Resolution::Upper { .. }
-                            | Resolution::Lower { .. }
-                            | Resolution::Directory { .. }
+                        backend.resolve(&rel).map_err(fsp_err)?,
+                        ViewResolution::Upper { .. }
+                            | ViewResolution::Lower
+                            | ViewResolution::Directory
                     )
                 {
                     // whiteout 目标可重建（POSIX 语义）；真实存在才冲突。
@@ -1010,17 +987,17 @@ impl WtfsContext {
                 // 路径按名查询）——whiteout 当场撤销（模板空 blob 走零拷贝
                 // 终裁），NotFound 物化空 upper 占位；零字节 blob 没有写入、
                 // 也就没有 staged 终裁可依赖。
-                overlay.prepare_created_file(&rel).map_err(fsp_err)?;
+                backend.prepare_created_file(&rel).map_err(fsp_err)?;
                 let st = Stat {
-                    dev: u64::from(overlay.config().volume_serial),
-                    ino: overlay.file_id(&rel).map_err(fsp_err)?,
+                    dev: u64::from(backend.volume_serial()),
+                    ino: backend.file_id(&rel).map_err(fsp_err)?,
                     mode: 0o100644,
                     size: 0,
                     mtime_ns: wtfs_core::FIXED_STAT_EPOCH_UNIX_NS,
                     ctime_ns: wtfs_core::FIXED_STAT_EPOCH_UNIX_NS,
                 };
                 fill_file_info(file_info.as_mut(), &st);
-                let fctx = FileContext::file(Some(name.clone()), overlay.clone(), rel.clone());
+                let fctx = FileContext::file(Some(name.clone()), backend.clone(), rel.clone());
                 // B100100：标记为"新建文件句柄"——零写入关闭也要在 cleanup
                 // 物化空文件（NT 语义），否则 git checkout 的零字节 blob
                 // （O_CREAT|O_EXCL 写 0 字节）在视图里不存在。
@@ -1070,18 +1047,19 @@ impl WtfsContext {
         let delete = winfsp::constants::FspCleanupFlags::FspCleanupDelete.is_flagged(flags)
             || context.delete_pending.load(Ordering::SeqCst);
         // 挂载根：删除由 daemon/gc 负责。
-        let overlay = match context.overlay.clone() {
-            Some(overlay) => overlay,
+        let backend = match context.backend.clone() {
+            Some(backend) => backend,
             None => return,
         };
         let name = context.route_name.clone().unwrap_or_default();
         if context.rel.is_empty() {
             // worktree 根 delete-on-close（`git worktree remove` 的最后一步
-            // rmdir，B060100）：与 daemon watcher 的元数据消失路径完全一致——
-            // 删 DB 行（级联清子表）+ 摘路由；upper 目录随后变孤儿，由
-            // `wtfs gc` 回收（spec §6.6）。
+            // rmdir，B060100）：与 daemon watcher 的元数据消失路径一致——
+            // B1 删 DB 行（级联清子表；upper 目录随后变孤儿，由 `wtfs gc`
+            // 回收，spec §6.6）；C 无元数据行（upper 即真实 worktree 目录，
+            // 由 git worktree remove / gc 处置）。
             if delete {
-                if let Err(e) = overlay.store().unregister(overlay.worktree_id()) {
+                if let Err(e) = backend.root_delete_cleanup() {
                     tracing::warn!(worktree = %name, error = %e, "failed to unregister row");
                 }
                 self.registry.unregister(&name);
@@ -1107,13 +1085,13 @@ impl WtfsContext {
                     // 删除（否则幽灵空文件让后续 CREATE_NEW collision）；
                     // whiteout 已撤销的路径重新记上，lower 内容不得"复活"。
                     if context.created_new.load(Ordering::SeqCst) {
-                        if let Err(e) = overlay.remove(&rel) {
+                        if let Err(e) = backend.remove(&rel) {
                             tracing::warn!(rel = %rel, error = %e, "delete after staged discard failed");
                         }
                     }
                     return;
                 }
-                match FileContext::finalize_staged(&overlay, &rel, staged) {
+                match FileContext::finalize_staged(&backend, &rel, staged) {
                     Ok(()) => self.notify_change(&name, &rel, FILE_ACTION_MODIFIED),
                     Err(e) => tracing::warn!(
                         rel = %rel,
@@ -1125,17 +1103,17 @@ impl WtfsContext {
             Some(WriteState::InPlace { file, size: _ }) => {
                 drop(file);
                 if delete {
-                    match overlay.remove(&rel) {
+                    match backend.remove(&rel) {
                         Ok(_) => self.notify_change(&name, &rel, FILE_ACTION_REMOVED),
                         Err(e) => tracing::warn!(rel = %rel, error = %e, "delete failed"),
                     }
                     return;
                 }
                 // post-hoc dedupe：内容一致 → 回收 upper 回落 lower。
-                let path = overlay.upper_abs(&rel);
+                let path = backend.upper_abs(&rel);
                 let result = match File::open(&path) {
                     Err(_) => Ok(()), // upper 已被旁路删除
-                    Ok(mut f) => overlay.write_from(&rel, &mut f).map(|_| ()).map_err(fsp_err),
+                    Ok(mut f) => backend.write_from(&rel, &mut f).map(|_| ()).map_err(fsp_err),
                 };
                 match result {
                     Ok(()) => self.notify_change(&name, &rel, FILE_ACTION_MODIFIED),
@@ -1148,7 +1126,7 @@ impl WtfsContext {
             }
             None => {
                 if delete {
-                    match overlay.remove(&rel) {
+                    match backend.remove(&rel) {
                         Ok(_) => self.notify_change(&name, &rel, FILE_ACTION_REMOVED),
                         Err(e) => tracing::warn!(rel = %rel, error = %e, "delete failed"),
                     }
@@ -1163,12 +1141,12 @@ impl WtfsContext {
                     //   O_CREAT|O_EXCL 零字节 blob）NT 语义 = 文件已存在、
                     //   EOF = 0。create 当场已由 prepare_created_file 保证
                     //   路径可解析，此处补终裁（持久性 + 模板一致回收）。
-                    let result = overlay
+                    let result = backend
                         .finish_staged(
                             &rel,
                             wtfs_core::hash_bytes(&[]),
                             0,
-                            StagedContent::Memory(&[]),
+                            ViewStaged::Memory(&[]),
                         )
                         .map(|_| ())
                         .map_err(fsp_err);
@@ -1194,7 +1172,7 @@ impl WtfsContext {
             // 卷级 flush：M0 无全局脏状态（SQLite WAL 自管理）。
             return Ok(());
         };
-        if context.overlay.is_none() {
+        if context.backend.is_none() {
             fill_file_info(file_info, &mount_root_stat());
             return Ok(());
         }
@@ -1249,7 +1227,7 @@ impl WtfsContext {
         let reset = marker.is_none();
         let mut entries: Vec<(String, Stat)> = Vec::new();
         let self_stat;
-        if context.overlay.is_none() {
+        if context.backend.is_none() {
             // 挂载根：枚举已注册 worktree。
             self_stat = mount_root_stat();
             for name in self.registry.names() {
@@ -1266,13 +1244,13 @@ impl WtfsContext {
                 ));
             }
         } else {
-            let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
+            let backend = context.backend.as_ref().ok_or_else(err_access_denied)?;
             let rel = context.rel.as_str();
-            self_stat = overlay.stat(rel).map_err(fsp_err)?.ok_or_else(err_not_found)?;
+            self_stat = backend.stat(rel).map_err(fsp_err)?.ok_or_else(err_not_found)?;
             // M13/B130100：父目录解析一次 + 枚举元数据直接推导子项 stat
-            // （旧实现逐子项 overlay.stat 全量重解析，每子项 2 次 NTFS 探测，
-            // 是 status 的头号开销）。
-            for (name, st) in overlay.list_stat(rel).map_err(fsp_err)? {
+            // （旧实现逐子项全量重解析，每子项 2 次 NTFS 探测，是 status 的
+            // 头号开销）。
+            for (name, st) in backend.list_stat(rel).map_err(fsp_err)? {
                 entries.push((name, st));
             }
         }
@@ -1311,15 +1289,15 @@ impl WtfsContext {
         new_file_name: &U16CStr,
         replace_if_exists: bool,
     ) -> Result<(), FspError> {
-        if context.overlay.is_none() {
+        if context.backend.is_none() {
             return Err(err_access_denied());
         }
-        let overlay = context.overlay.clone().expect("checked above");
+        let backend = context.backend.clone().expect("checked above");
         let rel = context.rel.clone();
         let name = context.route_name.clone().ok_or_else(err_invalid_parameter)?;
         let Route::Worktree {
             name: new_name,
-            overlay: _target_overlay,
+            backend: _target_backend,
             rel: new_rel,
         } = self.route(new_file_name)?
         else {
@@ -1333,8 +1311,8 @@ impl WtfsContext {
         }
         if !replace_if_exists {
             let exists = !matches!(
-                overlay.resolve(&new_rel).map_err(fsp_err)?,
-                Resolution::NotFound | Resolution::Whiteout
+                backend.resolve(&new_rel).map_err(fsp_err)?,
+                ViewResolution::NotFound | ViewResolution::Whiteout
             );
             if exists {
                 return Err(err_collision());
@@ -1342,7 +1320,7 @@ impl WtfsContext {
         }
         // 源句柄可能有暂存内容：先终裁再重命名。
         context.finalize_write()?;
-        overlay.rename(&rel, &new_rel).map_err(fsp_err)?;
+        backend.rename(&rel, &new_rel).map_err(fsp_err)?;
         self.notify_change(&name, &rel, FILE_ACTION_RENAMED_OLD_NAME);
         self.notify_change(&name, &new_rel, FILE_ACTION_RENAMED_NEW_NAME);
         Ok(())
@@ -1360,7 +1338,7 @@ impl WtfsContext {
     ) -> Result<(), FspError> {
         let _ = (creation_time, last_access_time, last_change_time);
         let _ = file_attributes; // M0：READONLY 等属性位不落 overlay
-        let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
+        let backend = context.backend.as_ref().ok_or_else(err_access_denied)?;
         // 句柄级操作，不做 initializing 门控（git checkout 的 utime 走这里）。
         // upper 文件的真实 mtime 更新（git 回写 index mtime 走这里）：直接
         // 落到 upper 物理文件（M11：无 stat_cache；stat 推导自真实 mtime，
@@ -1369,7 +1347,7 @@ impl WtfsContext {
         // 重哈希自愈，正确性不受影响）。
         if last_write_time != 0 && !context.is_dir {
             let mtime_ns = unix_ns_from_filetime(last_write_time);
-            let upper = overlay.upper_abs(&context.rel);
+            let upper = backend.upper_abs(&context.rel);
             if upper.symlink_metadata().map(|m| !m.is_dir()).unwrap_or(false) {
                 let _ = std::fs::OpenOptions::new()
                     .write(true)
@@ -1390,16 +1368,16 @@ impl WtfsContext {
         context: &FileContext,
         delete_file: bool,
     ) -> Result<(), FspError> {
-        let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
+        let backend = context.backend.as_ref().ok_or_else(err_access_denied)?;
         if context.rel.is_empty() {
             // worktree 根目录删除（B060100，`git worktree remove` 的收尾
             // rmdir）：initializing（checkout 进行中）拒绝；视图仍有可见条目
-            // 拒绝（与普通目录一致）。挂载根已在上面（overlay=None）拒绝。
+            // 拒绝（与普通目录一致）。挂载根已在上面（backend=None）拒绝。
             if delete_file {
-                if overlay.is_initializing().map_err(fsp_err)? {
+                if backend.is_initializing().map_err(fsp_err)? {
                     return Err(err_access_denied());
                 }
-                let non_empty = !overlay.list("").map_err(fsp_err)?.is_empty();
+                let non_empty = !backend.list("").map_err(fsp_err)?.is_empty();
                 if non_empty {
                     return Err(err_dir_not_empty());
                 }
@@ -1410,7 +1388,7 @@ impl WtfsContext {
         // 非根路径：句柄级操作，不做 initializing 门控（暂存句柄可
         // delete-on-close）。
         if delete_file && context.is_dir {
-            let non_empty = !overlay.list(&context.rel).map_err(fsp_err)?.is_empty();
+            let non_empty = !backend.list(&context.rel).map_err(fsp_err)?.is_empty();
             if non_empty {
                 return Err(err_dir_not_empty());
             }
@@ -1483,7 +1461,7 @@ impl WtfsContext {
         offset: u64,
         file_info: &mut FileInfo,
     ) -> Result<u32, FspError> {
-        let overlay = context.overlay.as_ref().ok_or_else(err_access_denied)?;
+        let backend = context.backend.as_ref().ok_or_else(err_access_denied)?;
         {
             let mut slot = context.ensure_write_state()?;
             match slot.as_mut().expect("ensure_write_state initializes") {
@@ -1507,11 +1485,11 @@ impl WtfsContext {
                         && staged.mem.len() + buffer.len() > STAGE_SPILL_BYTES
                     {
                         // 溢写：把内存内容落到 upper 内隐藏临时文件。
-                        let dir = overlay.upper_abs(&context.rel);
+                        let dir = backend.upper_abs(&context.rel);
                         let parent = dir
                             .parent()
                             .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| overlay.upper_abs(""));
+                            .unwrap_or_else(|| backend.upper_abs(""));
                         let path = parent.join(format!(
                             ".wtfs-tmp-w-{}-{}",
                             std::process::id(),

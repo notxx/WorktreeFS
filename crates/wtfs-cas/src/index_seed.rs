@@ -162,6 +162,56 @@ pub fn clear_skip_worktree(worktree: &Path) -> Result<usize> {
     set_skip_worktree(worktree, false)
 }
 
+/// worktree git 配置（M18 挂载态 stat 对齐，B1 daemon `worktree_config` 的
+/// 同款三项）：`<gitdir>/config.worktree` 写 `core.checkStat=minimal`、
+/// `core.trustctime=false`、`core.untrackedCache=false`，并在 common config
+/// 开启 `extensions.worktreeConfig`。`checkStat=minimal` 让 git 只比
+/// mtime/size——Windows 的 mingw lstat 不报卷序列号 dev、index ino 是 32 位
+/// 截断，dev/ino 与 FS 报告值不可逐位比较（stat 对齐种子仍写入完整值供
+/// 记账/其他工具使用）。必须在清 skip-worktree 位之前调用。
+pub fn write_stat_config(worktree: &Path) -> Result<()> {
+    use std::io::Write;
+
+    let out = run_git(worktree, &["config", "extensions.worktreeConfig", "true"])?;
+    require_ok(&out, "git config extensions.worktreeConfig")?;
+    let gitdir = absolute_git_dir(worktree)?;
+    let cw = gitdir.join("config.worktree");
+    let existing = std::fs::read_to_string(&cw).unwrap_or_default();
+    let missing: Vec<(&str, &str)> = STAT_CONFIG_KEYS
+        .iter()
+        .copied()
+        .filter(|(key, _)| {
+            !existing
+                .lines()
+                .any(|line| line.split_once('=').is_some_and(|(k, _)| {
+                    k.trim().eq_ignore_ascii_case(key)
+                }))
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str("[core]\n");
+    for (key, value) in missing {
+        content.push_str(&format!("\t{key} = {value}\n"));
+    }
+    let mut f = std::fs::File::create(&cw)?;
+    f.write_all(content.as_bytes())?;
+    Ok(())
+}
+
+/// stat 对齐配置的三项（与 wtfs-daemon `worktree_config::REQUIRED_KEYS`
+/// 一致）。
+pub const STAT_CONFIG_KEYS: [(&str, &str); 3] = [
+    ("checkStat", "minimal"),
+    ("trustctime", "false"),
+    ("untrackedCache", "false"),
+];
+
 fn set_skip_worktree(worktree: &Path, set: bool) -> Result<usize> {
     let flag = if set {
         "--skip-worktree"

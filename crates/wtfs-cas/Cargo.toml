@@ -12,6 +12,9 @@ thiserror.workspace = true
 tracing.workspace = true
 # ino 派生与 wtfs-core 的 derive_ino 保持同一算法（blake3 小写路径）。
 blake3.workspace = true
+# 写路径 dedupe：暂存内容按 git blob sha1（`blob <len>\0` + 内容）回查
+# manifest oid——一致即回收 upper 回落 manifest（与 B1 的 ToLower 同语义）。
+sha1.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

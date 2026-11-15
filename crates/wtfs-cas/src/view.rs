@@ -17,15 +17,21 @@
 //!   灌入后读缓存文件——"读到即已物化"，未读路径零对象 I/O。目录报错；
 //!   whiteout/not-found → `None`；gitlink（160000）对象库无 blob → 读报
 //!   NotFound；symlink（120000）按 blob 内容（链接目标字节）读出。
-//! * **write**（MVP）：恒落 upper（temp+fsync+rename 原子），撤销路径的
-//!   whiteout；不做写路径内容 dedupe（B1 的 ToLower 路径是它的差异化
-//!   设计，C 的 M18 形态再议——届时可对写入流式 blake3 后回查 manifest）。
-//!   返回 [`WriteState::Upper`]（manifest 有路径）/ [`WriteState::New`]。
+//! * **write**（M18 与 B1 同语义）：暂存/就地内容经 git blob sha1
+//!   （`blob <len>\0` + 内容）回查 manifest oid——一致 → 回收 upper 回落
+//!   manifest（零 upper、零 fsync，[`WriteState::Lower`]）；不一致 →
+//!   temp+fsync+rename 原子落 upper（恰好一次 fsync，[`WriteState::Upper`/
+//!   `WriteState::New`]）。[`CasView::copy_up`] 支撑就地写：hydrate 后复制
+//!   到 upper 并把 mtime 归一到固定纪元（copy-up 本身不打脏 index）。
+//!   [`CasView::prepare_created_file`] 保证 create 回调后路径立即可解析
+//!   （B100100 同款）；[`CasView::rename`] 文件级 = copy/rename upper +
+//!   M12 标记，目录级 lower 有内容默认 EXDEV。
 //! * **remove**：upper 删真实文件/目录；manifest 有内容（自身或子树）则
 //!   记 whiteout（[`MarkerLog`]，M12 日志语义）。纯 manifest 删除零
 //!   upper 文件操作——"删除不 hydrate"。
-//! * rename 不在 MVP（目录级 B1 也默认 EXDEV；文件级由 M18 的 VFS 层按
-//!   copy+whiteout 组合即可，无需 core 支持）。
+//! * **refresh**（M18）：[`CasView::refresh_head`] 在 HEAD 前进（commit 后）
+//!   重载 manifest 并剪枝失效 whiteout（新 manifest 已无该路径的标记）；
+//!   stat 不含 oid，刷新不动摇 index 对齐。
 //!
 //! upper 负存在缓存（M14 优化）未移植：MVP 每次解析一次真实探测
 //! （`symlink_metadata`）；M14 的收益主要在 B1 的逐回调探测序列，C 的
@@ -74,20 +80,18 @@ impl CasViewConfig {
     }
 }
 
-/// 解析结果（内部）。
+/// 解析结果（对挂载层公开；[`CasView::resolve`]）。
 #[derive(Debug, Clone)]
-enum Resolution {
+pub enum CasResolution {
     NotFound,
     /// 被 whiteout 隐藏且 upper/lower 均无文件形态（upper 目录重建除外）。
     Whiteout,
-    /// upper 命中（文件）。
+    /// upper 命中（文件）；`path` 为 upper 物理路径。
     Upper {
         path: PathBuf,
     },
     /// manifest（lower）命中。
-    CasFile {
-        file: crate::manifest::ManifestFile,
-    },
+    CasFile,
     /// 目录：manifest/upper 两侧存在性（合并枚举用）。
     Directory {
         has_cas: bool,
@@ -103,10 +107,12 @@ pub struct CasDirEntry {
     pub kind: EntryKind,
 }
 
-/// [`CasView::write`] 的返回：MVP 恒落 upper，state 只表达 manifest 覆盖
-/// （Upper = 覆盖既有 manifest 路径，New = 全新路径）。
+/// [`CasView::write`] / [`CasView::write_from`] / [`CasView::finish_staged`]
+/// 的返回：`Lower` = 内容与 manifest 一致已回收（零 upper 回落），
+/// `Upper` = 覆盖既有 manifest 路径落 upper，`New` = 全新路径落 upper。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteState {
+    Lower,
     Upper,
     New,
 }
@@ -116,6 +122,17 @@ pub enum WriteState {
 pub struct WriteOutcome {
     pub state: WriteState,
     pub bytes: u64,
+}
+
+/// 暂存写终裁的内容来源（[`CasView::finish_staged`]；与 wtfs-core
+/// `StagedContent` 同构）。
+#[derive(Debug)]
+pub enum StagedSource<'a> {
+    /// 完整内容已在内存。
+    Memory(&'a [u8]),
+    /// 溢写文件（upper 目录内 `.wtfs-tmp-w-*`，与最终 upper 路径同卷）。
+    /// 调用方必须已关闭句柄（Windows 不允许 rename 打开中的文件）。
+    Spill(&'a std::path::Path),
 }
 
 /// 一个 worktree 的 CAS 视图。读方法 `&self`，写方法 `&mut self`
@@ -186,37 +203,38 @@ impl CasView {
 
     // ---- 解析 ----
 
-    fn resolve(&self, rel: &str) -> Result<Resolution> {
+    /// 解析视图路径（挂载层路由/写路径状态机用）。
+    pub fn resolve(&self, rel: &str) -> Result<CasResolution> {
         let upper_path = self.upper_abs(rel);
         let upper_md = std::fs::symlink_metadata(&upper_path).ok();
         let upper_is_file = upper_md.as_ref().is_some_and(|md| !md.is_dir());
         let upper_is_dir = upper_md.as_ref().is_some_and(|md| md.is_dir());
         if upper_is_file {
-            return Ok(Resolution::Upper { path: upper_path });
+            return Ok(CasResolution::Upper { path: upper_path });
         }
         if !rel.is_empty() && self.markers.blocks(rel) {
             // upper 文件已查无；upper 目录可能已重建（opaque 语义：只显示
             // upper 内容，manifest 子树继续隐藏）。
             return Ok(if upper_is_dir {
-                Resolution::Directory {
+                CasResolution::Directory {
                     has_cas: false,
                     has_upper: true,
                 }
             } else {
-                Resolution::Whiteout
+                CasResolution::Whiteout
             });
         }
-        if let Some(file) = self.manifest.file(rel) {
-            return Ok(Resolution::CasFile { file: file.clone() });
+        if self.manifest.file(rel).is_some() {
+            return Ok(CasResolution::CasFile);
         }
         let has_cas = rel.is_empty() || self.manifest.has_dir(rel);
         if has_cas || upper_is_dir {
-            return Ok(Resolution::Directory {
+            return Ok(CasResolution::Directory {
                 has_cas,
                 has_upper: upper_is_dir,
             });
         }
-        Ok(Resolution::NotFound)
+        Ok(CasResolution::NotFound)
     }
 
     // ---- stat ----
@@ -230,8 +248,8 @@ impl CasView {
         let vs = u64::from(self.config.volume_serial);
         let epoch = self.config.fixed_stat_epoch_ns;
         match self.resolve(rel)? {
-            Resolution::Whiteout | Resolution::NotFound => Ok(None),
-            Resolution::Upper { path } => {
+            CasResolution::Whiteout | CasResolution::NotFound => Ok(None),
+            CasResolution::Upper { path } => {
                 let md = std::fs::symlink_metadata(&path)?;
                 let mode = match self.manifest.file(rel) {
                     // upper 覆盖既有 manifest 路径：保留 manifest 可执行位。
@@ -250,15 +268,19 @@ impl CasView {
                     ctime_ns: mtime,
                 }))
             }
-            Resolution::CasFile { file } => Ok(Some(CasStat {
-                dev: vs,
-                ino: file_id(rel),
-                mode: file.mode,
-                size: file.size,
-                mtime_ns: epoch,
-                ctime_ns: epoch,
-            })),
-            Resolution::Directory { has_upper, .. } => {
+            CasResolution::CasFile => {
+                // 防御：resolve 已确认清单命中。
+                let f = self.manifest.file(rel).expect("resolve confirmed manifest hit");
+                Ok(Some(CasStat {
+                    dev: vs,
+                    ino: file_id(rel),
+                    mode: f.mode,
+                    size: f.size,
+                    mtime_ns: epoch,
+                    ctime_ns: epoch,
+                }))
+            }
+            CasResolution::Directory { has_upper, .. } => {
                 let mtime = if has_upper {
                     metadata_mtime_ns(&std::fs::symlink_metadata(self.upper_abs(rel))?)
                 } else {
@@ -433,12 +455,14 @@ impl CasView {
             return Ok(None);
         }
         match self.resolve(rel)? {
-            Resolution::Upper { path } => Ok(Some(path)),
-            Resolution::CasFile { file } => {
-                let path = self.cache.ensure(&self.cat, &file.oid, file.size)?;
+            CasResolution::Upper { path } => Ok(Some(path)),
+            CasResolution::CasFile => {
+                // 防御：resolve 已确认清单命中。
+                let f = self.manifest.file(rel).expect("resolve confirmed manifest hit");
+                let path = self.cache.ensure(&self.cat, &f.oid, f.size)?;
                 Ok(Some(path))
             }
-            Resolution::Directory { .. } => Err(Error::Cas(format!("{rel:?} is a directory"))),
+            CasResolution::Directory { .. } => Err(Error::Cas(format!("{rel:?} is a directory"))),
             _ => Ok(None),
         }
     }
@@ -453,38 +477,81 @@ impl CasView {
 
     // ---- 写 ----
 
-    /// 全量写入（MVP 恒落 upper：temp+fsync+rename 原子；撤销 whiteout）。
-    /// 与 B1 的 `write_from` 同一落盘纪律（恰好一次 fsync）。
-    pub fn write(&mut self, rel: &str, data: &[u8]) -> Result<WriteOutcome> {
+    /// copy-up：manifest 内容物化到 upper 以便就地修改；已在 upper 则返回
+    /// 其路径（B1 `copy_up` 同契约）。刚复制的副本与 manifest 内容一致，
+    /// mtime 归一到固定纪元（best-effort）——stat 在 copy-up 前后保持固定
+    /// 值，index 对齐不被 copy-up 打破；真实修改会自然刷新真实 mtime。
+    pub fn copy_up(&self, rel: &str) -> Result<Option<PathBuf>> {
         validate_relative_path(rel)?;
-        if is_temp_name(basename(rel)) {
-            return Err(Error::Cas(format!(
-                "path {rel:?} uses reserved temp prefix {TEMP_PREFIX:?}"
-            )));
+        match self.resolve(rel)? {
+            CasResolution::Upper { path } => Ok(Some(path)),
+            CasResolution::CasFile => {
+                let f = self.manifest.file(rel).expect("resolve confirmed manifest hit");
+                let cached = self.cache.ensure(&self.cat, &f.oid, f.size)?;
+                let final_path = self.upper_abs(rel);
+                if let Some(parent) = final_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&cached, &final_path)?;
+                normalize_manifest_identical_mtime(&final_path, self.config.fixed_stat_epoch_ns);
+                Ok(Some(final_path))
+            }
+            _ => Ok(None),
         }
+    }
+
+    /// 全量写入：内容与 manifest 一致 → 回收（零 upper、零 fsync，
+    /// [`WriteState::Lower`]）；否则 temp+fsync+rename 原子落 upper。
+    /// 撤销 whiteout。
+    pub fn write(&mut self, rel: &str, data: &[u8]) -> Result<WriteOutcome> {
+        self.finish_staged(rel, data.len() as u64, StagedSource::Memory(data))
+    }
+
+    /// 流式写入（B1 `write_from` 同语义）：内容先落 upper 目录内隐藏临时
+    /// 文件，随后按 git blob sha1 回查 manifest oid——一致 → 删临时文件与
+    /// 既有 upper，零 fsync 回落 manifest（copy-up 后改回原内容的回收语义
+    /// 与 B1 一致）；不一致 → fsync 后原子改名落 upper（恰好一次 fsync）。
+    pub fn write_from(
+        &mut self,
+        rel: &str,
+        reader: &mut impl std::io::Read,
+    ) -> Result<WriteOutcome> {
+        self.validate_write_rel(rel)?;
         let final_path = self.upper_abs(rel);
-        let parent = final_path
-            .parent()
-            .ok_or_else(|| Error::Cas(format!("bad upper path for {rel:?}")))?;
+        let parent = self.upper_parent(&final_path)?;
         std::fs::create_dir_all(parent)?;
-        let tmp = parent.join(format!(
-            "{TEMP_PREFIX}-{}-{}",
-            std::process::id(),
-            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let staged = (|| -> std::io::Result<()> {
+        let tmp = self.temp_path(parent);
+        let staged = (|| -> std::io::Result<u64> {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(data)?;
-            f.sync_all()?;
-            Ok(())
+            let n = std::io::copy(reader, &mut f)?;
+            Ok(n)
         })();
-        if let Err(e) = staged {
+        let size = match staged {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        };
+        let oid = match git_blob_oid_reader(size, &mut std::fs::File::open(&tmp)?) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        };
+        if self.manifest.file(rel).is_some_and(|f| f.oid == oid) {
+            // 与 manifest 一致：零 fsync 回收（临时文件未 sync 即删）。
             let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
+            if final_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&final_path)?;
+            }
+            self.markers.remove(rel)?;
+            return Ok(WriteOutcome { state: WriteState::Lower, bytes: size });
         }
-        if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        if let Err(e) = self.sync_and_publish(&tmp, &final_path) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
+            return Err(e);
         }
         self.markers.remove(rel)?;
         Ok(WriteOutcome {
@@ -493,8 +560,233 @@ impl CasView {
             } else {
                 WriteState::New
             },
-            bytes: data.len() as u64,
+            bytes: size,
         })
+    }
+
+    /// 暂存写终裁（M9/B090100 同款）：暂存期内容（内存/溢写）按 git blob
+    /// sha1 回查 manifest oid——一致 → 丢弃内容回落 manifest（零 upper、
+    /// 零 fsync）；否则物化 upper（溢写先 fsync 再同卷改名 / 内存经临时
+    /// 文件 fsync 后原子改名，恰好一次 fsync）。失败时溢写文件保留
+    /// （调用方 best-effort 清理），upper 既有内容不受影响。
+    pub fn finish_staged(
+        &mut self,
+        rel: &str,
+        size: u64,
+        source: StagedSource<'_>,
+    ) -> Result<WriteOutcome> {
+        self.validate_write_rel(rel)?;
+        let final_path = self.upper_abs(rel);
+        let oid = match &source {
+            StagedSource::Memory(bytes) => {
+                debug_assert_eq!(bytes.len() as u64, size, "memory staged size mismatch");
+                git_blob_oid_memory(bytes)
+            }
+            StagedSource::Spill(path) => git_blob_oid_reader(size, &mut std::fs::File::open(path)?)?,
+        };
+        if self.manifest.file(rel).is_some_and(|f| f.oid == oid) {
+            // 与 manifest 一致：回收（删溢写/既有 upper，零 fsync）。
+            if let StagedSource::Spill(path) = &source {
+                std::fs::remove_file(path)?;
+            }
+            if final_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(&final_path)?;
+            }
+            self.markers.remove(rel)?;
+            return Ok(WriteOutcome { state: WriteState::Lower, bytes: size });
+        }
+        let parent = self.upper_parent(&final_path)?;
+        std::fs::create_dir_all(parent)?;
+        match source {
+            StagedSource::Spill(path) => {
+                // Windows 的 FlushFileBuffers 要求写访问句柄，只读打开必报
+                // ACCESS_DENIED，以读+写重开；fsync 后同卷改名（数据先于
+                // 可见性，崩溃不留半截可见文件）。
+                let f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+                f.sync_all()?;
+                drop(f);
+                std::fs::rename(&path, &final_path)?;
+            }
+            StagedSource::Memory(data) => {
+                let tmp = self.temp_path(parent);
+                let staged = (|| -> std::io::Result<()> {
+                    let mut f = std::fs::File::create(&tmp)?;
+                    f.write_all(data)?;
+                    f.sync_all()?;
+                    Ok(())
+                })();
+                if let Err(e) = staged {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+                if let Err(e) = std::fs::rename(&tmp, &final_path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+            }
+        }
+        self.markers.remove(rel)?;
+        Ok(WriteOutcome {
+            state: if self.manifest.file(rel).is_some() {
+                WriteState::Upper
+            } else {
+                WriteState::New
+            },
+            bytes: size,
+        })
+    }
+
+    /// B100100：文件 create 回调返回后路径必须立即可解析——whiteout 撤销
+    /// （视图立即回落 manifest；与 B1 的"空 blob 零拷贝终裁/撤销"同效）；
+    /// manifest 无覆盖时物化空 upper 占位（plain create，无 fsync；持久性
+    /// 由后续写终裁或 cleanup 的零写终裁保证）。其余状态已可解析，no-op。
+    pub fn prepare_created_file(&mut self, rel: &str) -> Result<()> {
+        validate_relative_path(rel)?;
+        match self.resolve(rel)? {
+            CasResolution::Whiteout => {
+                self.markers.remove(rel)?;
+            }
+            CasResolution::NotFound => {
+                let path = self.upper_abs(rel);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::File::create(&path)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 重命名（M12 语义）：文件级 = upper 搬移/hydrate 复制 + whiteout 源 +
+    /// 撤销目标标记（POSIX 覆盖语义：目标是文件则先删）。目录级对齐
+    /// M12/B120100：manifest 有内容的目录默认 EXDEV（调用方按跨设备语义
+    /// 退化），仅 upper-only 目录纯物理改名、零标记。
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        validate_relative_path(from)?;
+        validate_relative_path(to)?;
+        if from == to {
+            return Ok(());
+        }
+        if from.starts_with(&format!("{to}/")) || to.starts_with(&format!("{from}/")) {
+            return Err(Error::Cas(format!(
+                "rename {from:?} -> {to:?}: cannot rename into own subtree"
+            )));
+        }
+        let source = self.resolve(from)?;
+        if matches!(source, CasResolution::NotFound | CasResolution::Whiteout) {
+            return Err(Error::NotFound(from.to_string()));
+        }
+        if let CasResolution::Directory { has_cas, has_upper } = source {
+            if has_cas || self.manifest.has_file_or_dir(from) {
+                return Err(Error::CrossDevice(format!(
+                    "directory rename {from:?} -> {to:?} spans overlay layers (EXDEV)"
+                )));
+            }
+            if has_upper {
+                let to_upper = self.upper_abs(to);
+                if let Some(parent) = to_upper.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(self.upper_abs(from), &to_upper)?;
+            }
+            self.markers.remove(to)?;
+            return Ok(());
+        }
+        if matches!(self.resolve(to)?, CasResolution::Directory { .. }) {
+            return Err(Error::Cas(format!(
+                "rename target {to:?} is an existing directory"
+            )));
+        }
+        let to_upper = self.upper_abs(to);
+        if let Some(parent) = to_upper.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if to_upper.symlink_metadata().is_ok() {
+            std::fs::remove_file(&to_upper)?;
+        }
+        match source {
+            CasResolution::Upper { path } => {
+                std::fs::rename(&path, &to_upper)?;
+            }
+            // lower（manifest）经改名落 upper：内容与 manifest 一致，mtime
+            // 归一到固定纪元，index 对齐不因改名破坏。
+            CasResolution::CasFile => {
+                let f = self.manifest.file(from).expect("resolve confirmed manifest hit");
+                let cached = self.cache.ensure(&self.cat, &f.oid, f.size)?;
+                std::fs::copy(&cached, &to_upper)?;
+                normalize_manifest_identical_mtime(&to_upper, self.config.fixed_stat_epoch_ns);
+            }
+            _ => unreachable!("checked above"),
+        }
+        if self.manifest.has_file_or_dir(from) {
+            self.markers.add(from)?;
+        }
+        self.markers.remove(to)?;
+        Ok(())
+    }
+
+    /// HEAD 前进（commit 等）后重载 manifest（M18 刷新）：返回 `true` =
+    /// manifest 已重载。失效 whiteout 剪枝：新 manifest 已无该路径的标记
+    /// 一并移除（已提交的删除不再需要隐藏）；新 manifest 仍有该路径的
+    /// 标记保留（未提交的删除继续生效）。stat 不含 oid，重载不动摇
+    /// index 对齐。分支切换的完整语义（跨分支路径复用等）不在 M18。
+    pub fn refresh_head(&mut self, repo: &std::path::Path) -> Result<bool> {
+        let head = crate::gitx::head_commit(repo)?;
+        if head == self.manifest.commit() {
+            return Ok(false);
+        }
+        let manifest = Arc::new(Manifest::load(repo, &head)?);
+        let stale: Vec<String> = self
+            .markers
+            .whites()
+            .iter()
+            .filter(|p| !manifest.has_file_or_dir(p))
+            .cloned()
+            .collect();
+        for p in stale {
+            self.markers.remove(&p)?;
+        }
+        self.manifest = manifest;
+        Ok(true)
+    }
+
+    // ---- 写路径内部 ----
+
+    fn validate_write_rel(&self, rel: &str) -> Result<()> {
+        validate_relative_path(rel)?;
+        if is_temp_name(basename(rel)) {
+            return Err(Error::Cas(format!(
+                "path {rel:?} uses reserved temp prefix {TEMP_PREFIX:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn upper_parent<'a>(&self, final_path: &'a std::path::Path) -> Result<&'a std::path::Path> {
+        final_path
+            .parent()
+            .ok_or_else(|| Error::Cas(format!("bad upper path {final_path:?}")))
+    }
+
+    fn temp_path(&self, parent: &std::path::Path) -> std::path::PathBuf {
+        parent.join(format!(
+            "{TEMP_PREFIX}-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// fsync 临时文件后原子改名到最终 upper 路径（恰好一次 fsync）。
+    fn sync_and_publish(&self, tmp: &std::path::Path, final_path: &std::path::Path) -> Result<()> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(tmp, final_path)?;
+        Ok(())
     }
 
     /// 删除：upper 删真实文件/目录；manifest 有内容（自身或子树）则记
@@ -503,14 +795,14 @@ impl CasView {
         validate_relative_path(rel)?;
         let upper_path = self.upper_abs(rel);
         match self.resolve(rel)? {
-            Resolution::Upper { .. } => {
+            CasResolution::Upper { .. } => {
                 std::fs::remove_file(&upper_path)?;
                 if self.manifest.has_file_or_dir(rel) {
                     self.markers.add(rel)?;
                 }
                 Ok(true)
             }
-            Resolution::Directory { has_cas, has_upper } => {
+            CasResolution::Directory { has_cas, has_upper } => {
                 if has_upper {
                     std::fs::remove_dir_all(&upper_path)?;
                 }
@@ -519,11 +811,11 @@ impl CasView {
                 }
                 Ok(true)
             }
-            Resolution::CasFile { .. } => {
+            CasResolution::CasFile => {
                 self.markers.add(rel)?;
                 Ok(true)
             }
-            Resolution::Whiteout | Resolution::NotFound => Ok(false),
+            CasResolution::Whiteout | CasResolution::NotFound => Ok(false),
         }
     }
 }
@@ -550,6 +842,56 @@ fn validate_rel_or_root(rel: &str) -> Result<()> {
         return Ok(());
     }
     validate_relative_path(rel)
+}
+
+/// 把与 manifest 内容一致的 upper 副本 mtime 归一到固定纪元（best-effort：
+/// 失败只影响 git 一次额外 rehash，正确性不受影响）。与 wtfs-core 的
+/// `normalize_template_identical_mtime` 同语义。
+fn normalize_manifest_identical_mtime(path: &std::path::Path, epoch_ns: i64) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| {
+            f.set_modified(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_nanos(epoch_ns.max(0) as u64),
+            )
+        });
+}
+
+/// git blob 的对象 id：sha1(`blob <len>\0` + 内容)——写路径 dedupe 与
+/// manifest oid 的对齐基准（M17 的 manifest oid 来自 `ls-tree`，同一算法）。
+fn git_blob_oid_memory(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(format!("blob {}\0", bytes.len()).into_bytes());
+    h.update(bytes);
+    hex_lower(&h.finalize())
+}
+
+/// 流式形态（长度已知：暂存文件/溢写文件）；一遍顺序读。
+fn git_blob_oid_reader(size: u64, read: &mut impl std::io::Read) -> std::io::Result<String> {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(format!("blob {size}\0").into_bytes());
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = read.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex_lower(&h.finalize()))
+}
+
+fn hex_lower(digest: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// 文件系统真实 mtime → Unix 纳秒（早于 Unix 纪元截为 0；与 wtfs-core 一致）。

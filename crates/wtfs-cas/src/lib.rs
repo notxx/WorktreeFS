@@ -43,12 +43,12 @@ pub mod view;
 pub use cache::{CacheStatsSnapshot, GcReport, HydrationCache};
 pub use cat_file::{CatFile, CatFileStats};
 pub use index_seed::{
-    SeedReport, add_worktree_no_checkout, clear_skip_worktree, seed_skip_worktree,
-    seed_stat_aligned,
+    SeedReport, STAT_CONFIG_KEYS, add_worktree_no_checkout, clear_skip_worktree, seed_skip_worktree,
+    seed_stat_aligned, write_stat_config,
 };
 pub use manifest::{EntryKind, Manifest, ManifestFile};
 pub use markers::MarkerLog;
-pub use view::{CasDirEntry, CasView, CasViewConfig, WriteOutcome, WriteState};
+pub use view::{CasDirEntry, CasResolution, CasView, CasViewConfig, StagedSource, WriteOutcome, WriteState};
 
 /// lower（manifest）文件统一报告的固定 stat 纪元：2000-01-01T00:00:00Z
 /// （Unix 纳秒）。与 wtfs-core [`FIXED_STAT_EPOCH`] 一致——同一枚举值是
@@ -92,6 +92,11 @@ pub enum Error {
     InvalidPath { path: String, reason: String },
     #[error("not found: {0}")]
     NotFound(String),
+    /// 跨层操作（M18：lower/manifest 有内容的目录 rename）：与 wtfs-core
+    /// `Error::CrossDevice` 同义——OverlayFS 未开 redirect_dir 的默认 EXDEV
+    /// 语义，挂载层映射为 NTSTATUS `STATUS_NOT_SAME_DEVICE`。
+    #[error("cross-device link: {0}")]
+    CrossDevice(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

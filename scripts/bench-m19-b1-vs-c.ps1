@@ -1,8 +1,13 @@
-﻿# bench-m19-b1-vs-c.ps1 - B1 (overlay + template) vs C (CAS + manifest) 对比基准。
+﻿# bench-m19-b1-vs-c.ps1 - native vs B1 (overlay + template) vs C (CAS + manifest) 三方对比基准。
 #
-# 同一夹具（git/git @923ecfe，4,874 文件）交替跑两条实现至少 3 轮，每轮
-# fresh 本地 clone，避免轮间互相污染：
+# 同一夹具（git/git @923ecfe，4,874 文件）每轮 fresh 本地 clone，轮内按
+# native → B1 → C 交替跑三条腿，避免轮间互相污染：
 #
+#   native（plain NTFS 对照基线，无 WTFS）：
+#     挂载外目录（<轮次目录>\native）逐 wt plain `git worktree add --detach`
+#     （原生 NTFS checkout）→ status 冷/热 → diff --stat → 编辑 README →
+#     `git add -A` + `git commit` → remove --force。无模板/mount 一次性
+#     成本，磁盘 = 每 wt 全量树。
 #   B1（commit 0922092，真实 release CLI 流程）：
 #     wtfs template create（一次性）→ wtfs mount → 逐 wt：plain
 #     `git worktree add`（挂载点内，auto_register）→ ready 轮询 →
@@ -15,9 +20,12 @@
 # 两条实现的驱动方式不同（B1 = 外部 CLI 二进制 + wtfsd 守护进程；C = 进程内
 # harness），FS 路径与 git 操作口径一致；对比时注意这一差异。
 #
-# 指标：add（B1 含 ready；C 含 seed/注册/清位）、status 冷/热、diff、commit、
-# remove、磁盘（B1 template+upper；C upper+标记+hydration 缓存）、首次读
-# 200 个 .c/.h、hydration 缓存大小；驱动进程峰值工作集（500ms 采样）。
+# 指标：add（native 原生 checkout；B1 含 ready；C 含 seed/注册/清位）、
+# status 冷/热、diff、commit（native = add -A + commit 两进程；B1/C =
+# commit -am 单进程）、remove、磁盘（native 每 wt 全量树；B1 template+upper；
+# C upper+标记+hydration 缓存）、首次读 200 个 .c/.h（native/B1 同为 PS
+# ReadAllBytes 驱动；C 为 harness 内 fs::read）、驱动进程峰值工作集（500ms
+# 采样；native 不采样）。跑完输出全程汇总 median/p95/min/max/样本标准差。
 #
 # 前置（两套 checkout 均需先行构建 release，-Build 可代劳）：
 #   B1 checkout：`git worktree add --detach %TEMP%\wtfs-b19-b1 0922092`
@@ -32,8 +40,8 @@
 #       [-FixtureRepo <path>] [-CRoot <path>] [-B1Root <path>] [-B1Commit <sha>]
 #       [-Worktrees 10] [-Rounds 3] [-FirstReadFiles 200] [-CargoTimeoutSec 1800]
 #       [-OutFile <path>] [-Build] [-KeepRounds]
-#   注意：-Worktrees 只作用于 B1 腿；C 腿是 harness（cas_mount_bench）固定
-#   10 wt。默认跑完清理 %TEMP%\wtfs-b19-r<N> 轮次目录，-KeepRounds 保留
+#   注意：-Worktrees 作用于 native 与 B1 腿；C 腿是 harness（cas_mount_bench）
+#   固定 10 wt。默认跑完清理 %TEMP%\wtfs-b19-r<N> 轮次目录，-KeepRounds 保留
 #   （内含 cas-stderr.log / cas-stdout.log 原始输出）。
 
 param(
@@ -92,6 +100,44 @@ function Median([double[]]$Values) {
     if ($n -eq 0) { return 0.0 }
     if ($n % 2 -eq 1) { return $sorted[[int](($n - 1) / 2)] }
     return ($sorted[$n / 2 - 1] + $sorted[$n / 2]) / 2.0
+}
+
+function Percentile([double[]]$Values, [double]$P) {
+    # 线性插值分位数（numpy 默认口径）：rank = P * (n-1)。
+    $sorted = $Values | Sort-Object
+    $n = $sorted.Count
+    if ($n -eq 0) { return 0.0 }
+    if ($n -eq 1) { return $sorted[0] }
+    $rank = $P * ($n - 1)
+    $lo = [int][math]::Floor($rank)
+    $hi = [int][math]::Ceiling($rank)
+    if ($lo -eq $hi) { return $sorted[$lo] }
+    return $sorted[$lo] + ($sorted[$hi] - $sorted[$lo]) * ($rank - $lo)
+}
+
+function StDev([double[]]$Values) {
+    # 样本标准差（n-1）。
+    $n = $Values.Count
+    if ($n -lt 2) { return 0.0 }
+    $mean = ($Values | Measure-Object -Average).Average
+    $ss = 0.0
+    foreach ($v in $Values) { $ss += [math]::Pow($v - $mean, 2) }
+    return [math]::Sqrt($ss / ($n - 1))
+}
+
+function New-Samples {
+    # 跨轮样本累计（全程汇总用）：native/B1 存 per-wt 原始值；C 存每轮
+    # harness 表值（10 wt 中位）。firstRead 为每轮 1 个合计值。
+    return @{
+        add = New-Object System.Collections.Generic.List[double]
+        seed = New-Object System.Collections.Generic.List[double]
+        cold = New-Object System.Collections.Generic.List[double]
+        hot = New-Object System.Collections.Generic.List[double]
+        diff = New-Object System.Collections.Generic.List[double]
+        commit = New-Object System.Collections.Generic.List[double]
+        remove = New-Object System.Collections.Generic.List[double]
+        firstRead = New-Object System.Collections.Generic.List[double]
+    }
 }
 
 function Dir-Bytes([string]$Dir) {
@@ -185,14 +231,18 @@ $results.Add("")
 $results.Add("- fixture: $FixtureRepo (fresh local clone per round)")
 $results.Add("- B1: commit $B1Commit @ $B1Root (release CLI: wtfs + wtfsd)")
 $results.Add("- C: ff4216f @ $CRoot (cargo test cas_mount_bench, in-process harness)")
-$results.Add("- rounds: $Rounds; worktrees: B1 = $Worktrees（-Worktrees 参数，只作用于 B1 腿）/ C = 10（harness 固定）; first-read files: $FirstReadFiles")
+$results.Add("- rounds: $Rounds; worktrees: native = $Worktrees / B1 = $Worktrees（-Worktrees 参数）/ C = 10（harness 固定）; first-read files: $FirstReadFiles")
 $results.Add("")
 
 $summary = New-Object System.Collections.Generic.List[string]
-$summary.Add("## 轮次汇总（每腿各自 wt 数的中位数，ms；B1 = $Worktrees wt / C = 10 wt harness 固定）")
+$summary.Add("## 轮次汇总（每腿各自 wt 数的中位数，ms；native = $Worktrees wt / B1 = $Worktrees wt / C = 10 wt harness 固定）")
 $summary.Add("")
 $summary.Add("| 轮 | 实现 | add | ready/seed | status 冷 | status 热 | diff | commit | remove | 首读合计 | 驱动峰值 WS MB |")
 $summary.Add("| -- | ---- | --- | ---------- | --------- | --------- | ---- | ------ | ------ | -------- | -------------- |")
+
+$gNat = New-Samples
+$gB1 = New-Samples
+$gC = New-Samples
 
 for ($r = 1; $r -le $Rounds; $r++) {
     Write-Host ""
@@ -210,6 +260,85 @@ for ($r = 1; $r -le $Rounds; $r++) {
     $head = (Assert-Git $repo @("rev-parse", "HEAD") "rev-parse").Trim()
     $fileCount = ((Assert-Git $repo @("ls-files") "ls-files") -split "`n" | Where-Object { $_ }).Count
     Write-Host "fixture: $repo ($fileCount files @ $($head.Substring(0,8)))"
+
+    # ================= native leg（plain NTFS，挂载外对照基线） =================
+    Write-Host "--- native leg (plain NTFS，挂载外，$Worktrees wt) ---"
+    $nativeBase = Join-Path $roundDir "native"
+    New-Item -ItemType Directory -Force $nativeBase | Out-Null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $add = @(); $addA = @(); $cold = @(); $hot = @(); $diff = @(); $commit = @(); $remove = @()
+    $natBytes = @(); $natFiles = @(); $firstReadMs = 0.0; $firstReadKB = 0.0
+    for ($i = 1; $i -le $Worktrees; $i++) {
+        $nview = Join-Path $nativeBase "wt-$i"
+        $t = Timed-Git $repo @("worktree", "add", "--detach", $nview, "HEAD") "native add wt-$i"
+        $add += $t.Ms
+
+        $t = Timed-Git $nview @("status", "--porcelain") "native status cold wt-$i"
+        if ($t.Text.Trim()) { throw "native wt-$i cold status not clean: $($t.Text)" }
+        $cold += $t.Ms
+        $t = Timed-Git $nview @("status", "--porcelain") "native status hot wt-$i"
+        if ($t.Text.Trim()) { throw "native wt-$i hot status not clean: $($t.Text)" }
+        $hot += $t.Ms
+
+        $t = Timed-Git $nview @("diff", "--stat") "native diff wt-$i"
+        if ($t.Text.Trim()) { throw "native wt-$i diff not empty: $($t.Text)" }
+        $diff += $t.Ms
+
+        [IO.File]::WriteAllText((Join-Path $nview "README.md"), "# bench $i`n", (New-Object Text.UTF8Encoding($false)))
+        $tAdd = Timed-Git $nview @("add", "-A") "native add -A wt-$i"
+        $t = Timed-Git $nview @("commit", "-m", "bench edit", "-q") "native commit wt-$i"
+        $addA += $tAdd.Ms
+        $commit += ($tAdd.Ms + $t.Ms)
+        $null = Assert-Git $nview @("status", "--porcelain") "native post-commit status wt-$i" # 未计时
+
+        $d = Dir-Bytes $nview
+        $natBytes += $d.Bytes; $natFiles += $d.Files
+
+        if ($i -eq 1) {
+            $sample = (Assert-Git $nview @("ls-files", "*.c", "*.h") "ls-files sample") -split "`n" |
+                Where-Object { $_ } | Select-Object -First $FirstReadFiles
+            $sw.Restart()
+            foreach ($path in $sample) {
+                $bytes = [IO.File]::ReadAllBytes((Join-Path $nview $path))
+                $firstReadKB += $bytes.Length / 1024.0
+            }
+            $sw.Stop()
+            $firstReadMs = $sw.Elapsed.TotalMilliseconds
+        }
+    }
+
+    $tRemoveFirst = 0.0
+    for ($i = 1; $i -le $Worktrees; $i++) {
+        $nview = Join-Path $nativeBase "wt-$i"
+        $t = Timed-Git $repo @("worktree", "remove", "--force", $nview) "native remove wt-$i"
+        if ($i -eq 1) { $tRemoveFirst = $t.Ms }
+        $remove += $t.Ms
+    }
+    & git -C $repo worktree prune *> $null
+
+    $results.Add("## Round $r — native（plain NTFS 挂载外，$Worktrees wt）")
+    $results.Add("")
+    $results.Add(("- add（plain worktree add，{0} wt 中位）: {1:N1} ms；各 wt: {2}" -f $Worktrees, (Median $add), (($add | ForEach-Object { [math]::Round($_, 1) }) -join ", ")))
+    $results.Add(("- status 冷/热（中位）: {0:N1} / {1:N1} ms" -f (Median $cold), (Median $hot)))
+    $results.Add(("- diff --stat（中位）: {0:N1} ms" -f (Median $diff)))
+    $results.Add(("- commit（add -A + commit 两进程，中位）: {0:N1} ms（add -A 单列中位: {1:N1} ms）" -f (Median $commit), (Median $addA)))
+    $results.Add(("- remove --force（中位）: {0:N1} ms（首个 {1:N1} ms）" -f (Median $remove), $tRemoveFirst))
+    $results.Add(("- 首读 {0} 个 .c/.h: {1:N1} ms 合计（{2:N3} ms/文件，{3:N0} KB）" -f $FirstReadFiles, $firstReadMs, ($firstReadMs / $FirstReadFiles), $firstReadKB))
+    $results.Add(("- 磁盘（{0} wt 合计）: {1} 文件 / {2:N1} MB（每 wt 中位 {3:N2} MB，全量树）" -f `
+        $Worktrees, (($natFiles | Measure-Object -Sum).Sum), (($natBytes | Measure-Object -Sum).Sum / 1MB), (Median ($natBytes | ForEach-Object { $_ / 1MB }))))
+    $results.Add("")
+
+    $summary.Add(("| $r | native | {0:N1} | — | {1:N1} | {2:N1} | {3:N1} | {4:N1} | {5:N1} | {6:N1} | — |" -f `
+        (Median $add), (Median $cold), (Median $hot), (Median $diff), (Median $commit), (Median $remove), $firstReadMs))
+
+    $gNat.add.AddRange([double[]]$add)
+    $gNat.cold.AddRange([double[]]$cold)
+    $gNat.hot.AddRange([double[]]$hot)
+    $gNat.diff.AddRange([double[]]$diff)
+    $gNat.commit.AddRange([double[]]$commit)
+    $gNat.remove.AddRange([double[]]$remove)
+    $gNat.firstRead.Add($firstReadMs)
 
     # ================= B1 leg =================
     Write-Host "--- B1 leg (CLI flow @ $B1Commit) ---"
@@ -311,6 +440,15 @@ for ($r = 1; $r -le $Rounds; $r++) {
     $summary.Add(("| $r | B1 | {0:N1} | {1:N1} | {2:N1} | {3:N1} | {4:N1} | {5:N1} | {6:N1} | {7:N1} | {8} |" -f `
         (Median $add), (Median $ready), (Median $cold), (Median $hot), (Median $diff), (Median $commit), (Median $remove), $firstReadMs, $b1Mem.PeakMB))
 
+    $gB1.add.AddRange([double[]]$add)
+    $gB1.seed.AddRange([double[]]$ready)
+    $gB1.cold.AddRange([double[]]$cold)
+    $gB1.hot.AddRange([double[]]$hot)
+    $gB1.diff.AddRange([double[]]$diff)
+    $gB1.commit.AddRange([double[]]$commit)
+    $gB1.remove.AddRange([double[]]$remove)
+    $gB1.firstRead.Add($firstReadMs)
+
     # ================= C leg =================
     Write-Host "--- C leg (harness cas_mount_bench @ ff4216f，固定 10 wt) ---"
     $env:WTFS_BENCH_REPO = $repo
@@ -377,12 +515,58 @@ for ($r = 1; $r -le $Rounds; $r++) {
     $results.Add(("- 驱动进程峰值 WS: {0} MB（{1}；进程内 harness，含 manifest/registry 内存，非纯 FS 层）" -f $casMem.PeakMB, $casMem.Who))
     $results.Add("")
 
+    $cAdd = Cas-Val $block "add（"; $cSeed = Cas-Val $block "种子（"; $cCold = Cas-Val $block "status 冷"
+    $cHot = Cas-Val $block "status 热"; $cDiff = Cas-Val $block "diff"; $cCommit = Cas-Val $block "commit"
+    $cRemove = Cas-Val $block "remove"; $cFirstRead = Cas-Val $block "首次读"
     $summary.Add(("| $r | C | {0:N1} | {1:N1} | {2:N1} | {3:N1} | {4:N1} | {5:N1} | {6:N1} | {7:N1} | {8} |" -f `
-        (Cas-Val $block "add（"), (Cas-Val $block "种子（"), (Cas-Val $block "status 冷"), (Cas-Val $block "status 热"), (Cas-Val $block "diff"),
-        (Cas-Val $block "commit"), (Cas-Val $block "remove"), (Cas-Val $block "首次读"), $casMem.PeakMB))
+        $cAdd, $cSeed, $cCold, $cHot, $cDiff, $cCommit, $cRemove, $cFirstRead, $casMem.PeakMB))
+
+    $gC.add.Add($cAdd)
+    $gC.seed.Add($cSeed)
+    $gC.cold.Add($cCold)
+    $gC.hot.Add($cHot)
+    $gC.diff.Add($cDiff)
+    $gC.commit.Add($cCommit)
+    $gC.remove.Add($cRemove)
+    $gC.firstRead.Add($cFirstRead)
 }
 
 $summary.Add("")
+
+# 全程汇总：median / p95 / min / max / 样本标准差，按腿分列。
+$stats = New-Object System.Collections.Generic.List[string]
+$stats.Add("## 全程汇总（median / p95 / min / max / 样本标准差，ms）")
+$stats.Add("")
+$stats.Add(("样本口径：native/B1 = per-wt 原始值（{0} 轮 × {1} wt = {2} 样本/指标）；C = 每轮 harness 表值（10 wt 中位 → {0} 样本/指标）；首读合计为每轮 1 值（{0} 样本）。" -f $Rounds, $Worktrees, ($Rounds * $Worktrees)))
+$stats.Add("")
+$stats.Add("| 腿 | 指标 | n | median | p95 | min | max | std |")
+$stats.Add("| -- | ---- | - | ------ | --- | --- | --- | --- |")
+
+function Add-StatRows([string]$LegName, $S, [bool]$HasSeed) {
+    $metrics = @(
+        @{ Key = "add"; Name = "add" },
+        @{ Key = "seed"; Name = "ready（B1）/ seed（C）" },
+        @{ Key = "cold"; Name = "status 冷" },
+        @{ Key = "hot"; Name = "status 热" },
+        @{ Key = "diff"; Name = "diff --stat" },
+        @{ Key = "commit"; Name = "commit" },
+        @{ Key = "remove"; Name = "remove --force" },
+        @{ Key = "firstRead"; Name = "首读合计" }
+    )
+    foreach ($m in $metrics) {
+        if ($m.Key -eq "seed" -and -not $HasSeed) { continue }
+        $vals = [double[]]$S[$m.Key].ToArray()
+        $script:stats.Add(("| {0} | {1} | {2} | {3:N1} | {4:N1} | {5:N1} | {6:N1} | {7:N2} |" -f `
+            $LegName, $m.Name, $vals.Count, (Median $vals), (Percentile $vals 0.95),
+            ($vals | Measure-Object -Minimum).Minimum, ($vals | Measure-Object -Maximum).Maximum, (StDev $vals)))
+    }
+}
+Add-StatRows "native" $gNat $false
+Add-StatRows "B1" $gB1 $true
+Add-StatRows "C" $gC $true
+$stats.Add("")
+
+$results.AddRange($stats.ToArray())
 $results.AddRange($summary.ToArray())
 $resultsText = $results -join "`r`n"
 Set-Content -LiteralPath $OutFile -Value $resultsText -Encoding UTF8

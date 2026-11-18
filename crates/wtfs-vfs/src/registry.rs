@@ -266,6 +266,18 @@ impl VfsRegistry {
     }
 }
 
+/// Windows 长路径前缀：CAS upper 直接落在真实 worktree 下，dashboard
+/// 这类深层 `specs/...` 路径会超过 MAX_PATH；`std::fs` 用 `\\?\` 才能
+/// 访问。已有前缀/UNC 路径保持不变。
+fn long_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(format!(r"\\?\{s}"))
+    }
+}
+
 /// M18 显式流程的挂载侧入口：把一个已 `git worktree add --no-checkout` +
 /// 索引种子的 worktree 注册为 CAS 视图。流程约定（docs/m18-cas-mount.md）：
 ///
@@ -306,7 +318,7 @@ pub fn register_cas_worktree(
         };
     }
     let mut config = CasViewConfig::new(
-        real_worktree,
+        long_path(real_worktree),
         registry.config().store_root.join("cas-meta").join(name),
     );
     // dev 必须与 WinFSP 卷序列号一致（git lstat 的 st_dev 比对口径）。

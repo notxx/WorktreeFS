@@ -36,6 +36,8 @@ fn git(repo: &Path, args: &[&str]) -> (bool, String) {
         .arg("user.name=wtfs-bench")
         .arg("-c")
         .arg("user.email=wtfs-bench@example.com")
+        .arg("-c")
+        .arg("core.longpaths=true")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -98,6 +100,8 @@ fn bench_cas_mount_pipeline() {
         out.split('\0').filter(|s| !s.is_empty()).count()
     };
     eprintln!("fixture: {} ({file_count} files @ {head})", repo.display());
+    let absorb = std::env::var("WTFS_CAS_ABSORB").is_ok();
+    eprintln!("mode: {}", if absorb { "absorb (plain reset --hard)" } else { "lazy (--no-checkout + seed)" });
 
     let base = tempfile::tempdir().expect("tempdir");
     let base = base.path().to_path_buf();
@@ -123,9 +127,10 @@ fn bench_cas_mount_pipeline() {
         manifest.total_size()
     );
 
-    // ---- add：--no-checkout + 种子 + 配置 + 注册 + 清位（每 worktree）----
+    // ---- add：--no-checkout +（lazy: seed+清位 / absorb: reset --hard）----
     let mut add_ms = Vec::new();
-    let mut seed_ms = Vec::new();
+    let mut setup_ms = Vec::new();
+    let mut checkout_ms = Vec::new();
     let mut names = Vec::new();
     for i in 1..=WORKTREES {
         let name = format!("wt-cas-{i}");
@@ -138,22 +143,43 @@ fn bench_cas_mount_pipeline() {
         assert!(ok, "worktree add {name}: {out}");
         let t_add = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
-        let report = seed_stat_aligned(
+        if absorb {
+            // 不 seed / 不清位：index 保持空，reset --hard 会真正写全部文件，
+            // 由 CasBackend 的 absorbing 窗口吸收到内存并按 manifest oid 终裁。
+            write_stat_config(&real_wt).expect("stat config");
+        } else {
+            let report = seed_stat_aligned(
+                &real_wt,
+                &head,
+                &manifest,
+                registry.config().volume_serial,
+                FIXED_STAT_EPOCH_UNIX_NS,
+            )
+            .expect("seed");
+            write_stat_config(&real_wt).expect("stat config");
+            let cleared = clear_skip_worktree(&real_wt).expect("clear skip-worktree");
+            assert_eq!(cleared, report.entries, "清位数 = index entry 数");
+        }
+        let t_setup = t1.elapsed().as_secs_f64() * 1000.0;
+        let backend = register_cas_worktree(
+            &registry,
+            &name,
             &real_wt,
-            &head,
-            &manifest,
-            registry.config().volume_serial,
-            FIXED_STAT_EPOCH_UNIX_NS,
+            manifest.clone(),
+            shared.clone(),
         )
-        .expect("seed");
-        write_stat_config(&real_wt).expect("stat config");
-        let t_seed = t1.elapsed().as_secs_f64() * 1000.0;
-        register_cas_worktree(&registry, &name, &real_wt, manifest.clone(), shared.clone())
-            .expect("register");
-        let cleared = clear_skip_worktree(&real_wt).expect("clear skip-worktree");
-        assert_eq!(cleared, report.entries, "清位数 = index entry 数");
+        .expect("register");
+        if absorb {
+            backend.set_absorbing(true);
+            let view_dir = mount_point.join(&name);
+            let t2 = Instant::now();
+            let (ok, out) = git(&view_dir, &["reset", "--hard"]);
+            assert!(ok, "reset --hard {name}: {out}");
+            checkout_ms.push(t2.elapsed().as_secs_f64() * 1000.0);
+            backend.set_absorbing(false);
+        }
         add_ms.push(t_add);
-        seed_ms.push(t_seed);
+        setup_ms.push(t_setup);
         names.push(name);
     }
 
@@ -172,33 +198,35 @@ fn bench_cas_mount_pipeline() {
         assert_eq!(out.trim(), "", "{name} hot status must be clean");
     }
     let misses_after_status = shared.cache.stats().misses;
-    // 断言口径（实测机制）：stat 对齐下 tracked 内容零 hydrate；git 的
-    // untracked 走查会读 per-directory `.gitignore` 做 exclude 分类
-    // （`-uno` 不读）——hydration 缓存按 oid 全局共享，14 个 .gitignore
-    // 只在首个 worktree 的首个 status 各读一次，其余 worktree 全命中。
-    // 断言：misses 全部落在 .gitignore，且第二个 worktree 起零新增。
-    let mut non_gitignore = Vec::new();
-    if misses_after_status != 0 {
-        for shard in std::fs::read_dir(shared.cache.root()).into_iter().flatten() {
-            let Some(shard) = shard.ok().map(|e| e.path()) else { continue };
-            for entry in std::fs::read_dir(&shard).into_iter().flatten().flatten() {
-                let oid = entry.file_name().to_string_lossy().into_owned();
-                match manifest.files().values().find(|f| f.oid == oid) {
-                    Some(f) if f.path.ends_with(".gitignore") => {}
-                    Some(f) => non_gitignore.push(f.path.clone()),
-                    None => non_gitignore.push(format!("{oid} (non-manifest)")),
+    if !absorb && std::env::var("WTFS_BENCH_SKIP_HYDRATE_ASSERT").is_err() {
+        // 断言口径（实测机制）：stat 对齐下 tracked 内容零 hydrate；git 的
+        // untracked 走查会读 per-directory `.gitignore` 做 exclude 分类
+        // （`-uno` 不读）——hydration 缓存按 oid 全局共享，14 个 .gitignore
+        // 只在首个 worktree 的首个 status 各读一次，其余 worktree 全命中。
+        // 断言：misses 全部落在 .gitignore，且第二个 worktree 起零新增。
+        let mut non_gitignore = Vec::new();
+        if misses_after_status != 0 {
+            for shard in std::fs::read_dir(shared.cache.root()).into_iter().flatten() {
+                let Some(shard) = shard.ok().map(|e| e.path()) else { continue };
+                for entry in std::fs::read_dir(&shard).into_iter().flatten().flatten() {
+                    let oid = entry.file_name().to_string_lossy().into_owned();
+                    match manifest.files().values().find(|f| f.oid == oid) {
+                        Some(f) if f.path.ends_with(".gitignore") => {}
+                        Some(f) => non_gitignore.push(f.path.clone()),
+                        None => non_gitignore.push(format!("{oid} (non-manifest)")),
+                    }
                 }
             }
         }
+        assert!(
+            non_gitignore.is_empty(),
+            "status 不得 hydrate 非 exclude 文件：{non_gitignore:?}"
+        );
+        assert_eq!(
+            misses_after_status, 14,
+            "fixture 全树 14 个 .gitignore 全局共享各读一次；tracked 内容零 hydrate"
+        );
     }
-    assert!(
-        non_gitignore.is_empty(),
-        "status 不得 hydrate 非 exclude 文件：{non_gitignore:?}"
-    );
-    assert_eq!(
-        misses_after_status, 14,
-        "fixture 全树 14 个 .gitignore 全局共享各读一次；tracked 内容零 hydrate"
-    );
 
     // ---- diff（干净树）----
     let mut diff_ms = Vec::new();
@@ -211,13 +239,26 @@ fn bench_cas_mount_pipeline() {
     }
 
     // ---- 首次读：逐文件冷读 200 个（每文件 = cat-file + 缓存落盘 + 读）----
-    let sample: Vec<String> = manifest
+    let mut sample: Vec<String> = manifest
         .files()
-        .keys()
-        .filter(|p| p.ends_with(".c") || p.ends_with(".h"))
+        .iter()
+        .filter(|(p, f)| {
+            f.mode & 0o170000 == 0o100000 && (p.ends_with(".c") || p.ends_with(".h"))
+        })
+        .map(|(p, _)| p.clone())
         .take(200)
-        .cloned()
         .collect();
+    if sample.is_empty() {
+        // dashboard 等非 git 源码夹具：取 manifest 前 200 个普通文件
+        // （跳过 gitlink/目录，std::fs::read 对目录会 access denied）。
+        sample = manifest
+            .files()
+            .iter()
+            .filter(|(_, f)| f.mode & 0o170000 == 0o100000)
+            .map(|(p, _)| p.clone())
+            .take(200)
+            .collect();
+    }
     let t0 = Instant::now();
     let mut first_read_bytes = 0u64;
     for path in &sample {
@@ -228,10 +269,20 @@ fn bench_cas_mount_pipeline() {
     let first_read_total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // ---- commit：每 worktree 改 1 文件 + commit -am ----
+    let edit_path = if manifest.files().contains_key("package.json") {
+        "package.json".to_string()
+    } else {
+        manifest
+            .files()
+            .keys()
+            .next()
+            .cloned()
+            .expect("manifest must be non-empty")
+    };
     let mut commit_ms = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let view_dir = mount_point.join(name);
-        std::fs::write(view_dir.join("README.md"), format!("# bench {i}\n")).unwrap();
+        std::fs::write(view_dir.join(&edit_path), format!("bench {i}\n")).unwrap();
         let t = Instant::now();
         assert_git(&view_dir, &["commit", "-am", "bench edit", "-q"]);
         commit_ms.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -264,18 +315,33 @@ fn bench_cas_mount_pipeline() {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
+    let checkout_row = if absorb {
+        format!(
+            "| checkout（reset --hard，absorbing，每 wt 中位） | {:.1} ms |\n",
+            median(checkout_ms)
+        )
+    } else {
+        String::new()
+    };
+    let hydrate_note = if absorb {
+        "status 期间 hydrate（absorb 模式不强制 14 次）".to_string()
+    } else {
+        "status 期间 hydrate（全部 .gitignore exclude，oid 缓存全局共享一次；tracked 内容 0）"
+            .to_string()
+    };
     let report = format!(
-        "\n## M18 CAS 挂载基准（release，{} 文件 / {} worktree）\n\n\
+        "\n## C checkout 基准（release，{} 文件 / {} worktree，{}）\n\n\
         | 指标 | 值 |\n| ---- | -- |\n\
         | add（worktree add --no-checkout，每 wt 中位） | {:.1} ms |\n\
-        | 种子（read-tree + stat 对齐 + 配置，每 wt 中位） | {:.1} ms |\n\
+        | setup（{}，每 wt 中位） | {:.1} ms |\n\
+        {}\
         | status 冷（挂载视图，每 wt 中位） | {:.1} ms |\n\
         | status 热（每 wt 中位） | {:.1} ms |\n\
         | diff --stat 干净树（每 wt 中位） | {:.1} ms |\n\
         | commit -am 单文件（每 wt 中位） | {:.1} ms |\n\
         | remove（worktree remove + 注销，每 wt 中位） | {:.1} ms |\n\
         | 首次读 {} 文件（冷，合计） | {:.1} ms（{:.3} ms/文件，{:.1} KB） |\n\
-        | status 期间 hydrate | {} 次（全部 .gitignore exclude，oid 缓存全局共享一次；tracked 内容 0） |\n\
+        | {} | {} 次 |\n\
         | hydration 缓存（首读后） | {} 文件 / {:.1} KB |\n\
         | upper 磁盘（10 wt 合计，含 .git 指针 + 提交残留） | {} 文件 / {:.1} KB |\n\
         | 标记日志磁盘 | {} 文件 / {:.1} KB |\n\
@@ -283,8 +349,11 @@ fn bench_cas_mount_pipeline() {
         \n",
         file_count,
         WORKTREES,
+        if absorb { "absorb" } else { "lazy" },
         median(add_ms),
-        median(seed_ms),
+        if absorb { "stat config，无 seed" } else { "read-tree + stat 对齐 + 配置" },
+        median(setup_ms),
+        checkout_row,
         median(status_cold_ms),
         median(status_hot_ms),
         median(diff_ms),
@@ -294,6 +363,7 @@ fn bench_cas_mount_pipeline() {
         first_read_total_ms,
         first_read_total_ms / sample.len() as f64,
         first_read_bytes as f64 / 1024.0,
+        hydrate_note,
         misses_after_status,
         cache_files,
         cache_bytes as f64 / 1024.0,

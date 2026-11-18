@@ -186,11 +186,14 @@ impl CasView {
     }
 
     /// upper 物理路径（`""` = upper 根）。
+    ///
+    /// 配置根可能带 `\\?\` 长路径前缀；verbatim 路径不接受 `/` 作为
+    /// 分隔符（Win32 报 ERROR_INVALID_PARAMETER），这里统一换成 `\`。
     pub fn upper_abs(&self, rel: &str) -> PathBuf {
         if rel.is_empty() {
             self.config.upper_root.clone()
         } else {
-            self.config.upper_root.join(rel)
+            self.config.upper_root.join(rel.replace('/', "\\"))
         }
     }
 

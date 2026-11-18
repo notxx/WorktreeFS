@@ -27,6 +27,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use wtfs_cas::{CasView, CasViewConfig, CacheStatsSnapshot, CatFile, HydrationCache, Manifest, StagedSource as CasStagedSource};
@@ -56,6 +57,11 @@ pub struct CasBackend {
     /// 同时是视图的 upper 根——`.git` 经 upper 自然可见，git 无需特判。
     worktree: PathBuf,
     shared: Arc<CasShared>,
+    /// checkout 吸收窗口：true 时 `is_initializing` 返回 true，VFS 走
+    /// 内存暂存 + `finish_staged` 的 manifest oid 比对（匹配零 upper/
+    /// 零 fsync），而不是 copy-up 就地写。由调用方在 `git worktree add`
+    /// 的 checkout 前后置位/清除。
+    absorbing: Arc<AtomicBool>,
 }
 
 impl CasBackend {
@@ -79,7 +85,18 @@ impl CasBackend {
             epoch_ns: config.fixed_stat_epoch_ns,
             worktree: worktree.into(),
             shared,
+            absorbing: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// 进入/退出 checkout 吸收窗口。窗口内写路径走内存暂存，close 时
+    /// 按 manifest oid 比对：一致丢弃（零 upper/零 fsync），不一致落 upper。
+    pub fn set_absorbing(&self, value: bool) {
+        self.absorbing.store(value, Ordering::Relaxed);
+    }
+
+    pub fn absorbing(&self) -> bool {
+        self.absorbing.load(Ordering::Relaxed)
     }
 
     pub fn volume_serial(&self) -> u32 {
@@ -298,11 +315,12 @@ impl ViewBackend {
         }
     }
 
-    /// checkout 暂存流门控；C 注册即 ready，恒 `false`。
+    /// checkout 暂存流门控；C 在 absorbing 窗口内为 true（内存吸收 +
+    /// manifest oid 比对），窗口外为 false（普通 copy-up/就地写）。
     pub fn is_initializing(&self) -> wtfs_core::Result<bool> {
         match self {
             ViewBackend::Overlay(o) => o.is_initializing(),
-            ViewBackend::Cas(_) => Ok(false),
+            ViewBackend::Cas(c) => Ok(c.absorbing()),
         }
     }
 
@@ -498,11 +516,34 @@ impl ViewBackend {
     ) -> wtfs_core::Result<Stat> {
         let o = match self {
             ViewBackend::Overlay(o) => o,
-            // C 无 initializing 暂存流（is_initializing 恒 false）。
-            ViewBackend::Cas(_) => {
-                return Err(wtfs_core::Error::Overlay(
-                    "cas view has no staged writes".into(),
-                ));
+            // C 的 checkout 吸收窗口：暂存内容尚未物化，但句柄 stat 必须
+            // 可解析。manifest 同尺寸 → 固定纪元（index 对齐）；否则报
+            // 当前时间。C 的暂存哈希是 blake3，无法直接比 manifest 的
+            // git blob sha1，这里按尺寸近似。
+            ViewBackend::Cas(c) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                let (mode, mtime) = {
+                    let view = c.view().lock();
+                    match view.manifest().file(rel) {
+                        Some(f) if size == f.size => {
+                            (f.mode, wtfs_core::FIXED_STAT_EPOCH_UNIX_NS)
+                        }
+                        Some(f) => (f.mode, now),
+                        None => (0o100644, now),
+                    }
+                };
+                let ino = c.view().lock().file_id(rel).map_err(map_cas_error)?;
+                return Ok(Stat {
+                    dev: u64::from(c.volume_serial()),
+                    ino,
+                    mode,
+                    size,
+                    mtime_ns: mtime,
+                    ctime_ns: mtime,
+                });
             }
         };
         let vs = u64::from(o.config().volume_serial);

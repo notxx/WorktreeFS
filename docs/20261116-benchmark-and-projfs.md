@@ -82,26 +82,40 @@ PCWSTR TriggeringProcessImageFileName;
 - 拿不到时 PID 为 0、image 为 NULL；
 - 可以据此做进程感知的陷阱/审计（例如区分 `git.exe` 和编辑器），而 WinFSP 只给用户 SID。
 
-### 当前机器状态（2026-11-16）
+### 当前机器状态（2026-11-16 → 2026-11-18）
 
-```powershell
-Get-CimInstance Win32_OptionalFeature -Filter "Name='Client-ProjFS'" |
-  Select-Object Name, InstallState
-```
-
-结果：
+2026-11-16 首次检查时：
 
 ```
 Name          InstallState
-Client-ProjFS            2
+Client-ProjFS            2    # Disabled
 ```
 
-`InstallState = 2` 表示 **Disabled**；同时：
-
-- `sc query ProjFS` → 服务未安装
+- `sc query ProjFS` → 服务未安装（注意：服务名不是 `ProjFS`，见下）
 - `Test-Path C:\Windows\System32\projectedfslib.dll` → False
 
-即：**这台机器没有开启 ProjFS**，ProjFS 原型暂时跑不起来。
+2026-11-18 复查时已经开启：
+
+```
+Name          InstallState
+Client-ProjFS            1    # Enabled
+```
+
+- `sc query type= driver` 中的 `PrjFlt` → `RUNNING`（显示名 "Windows Projected File System"）
+- `Test-Path C:\Windows\System32\projectedfslib.dll` → True
+- DLL 版本：`10.0.26100.9711`
+- OS：Windows 11 Enterprise `10.0.26300`
+- 无 pending reboot
+
+**注意**：ProjFS 的内核驱动服务名是 **`PrjFlt`**，不是 `ProjFS`；用 `sc query ProjFS` 会误报“服务未安装”。正确的检查是：
+
+```powershell
+sc.exe query type= driver | findstr /i PrjFlt
+# 或
+sc.exe query PrjFlt
+```
+
+即：**这台机器现在已启用并运行 ProjFS**，可以做 `PrjStartVirtualizing` 原型的下一步验证。
 
 ### 怎么检查
 
@@ -122,7 +136,7 @@ Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 dism /online /Get-FeatureInfo /FeatureName:Client-ProjFS
 ```
 
-辅助信号：`sc query ProjFS`、`Test-Path C:\Windows\System32\projectedfslib.dll`。
+辅助信号：`sc query PrjFlt`、`Test-Path C:\Windows\System32\projectedfslib.dll`。
 
 ### 怎么开启
 
@@ -134,7 +148,7 @@ Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -All
 dism /online /Enable-Feature /FeatureName:Client-ProjFS /All
 ```
 
-可能需要重启。开完再验证 `InstallState = 1`、`sc query ProjFS` 有服务、`projectedfslib.dll` 存在。
+可能需要重启。开完再验证 `InstallState = 1`、`sc query PrjFlt` 为 RUNNING、`projectedfslib.dll` 存在。
 
 ### 坑
 

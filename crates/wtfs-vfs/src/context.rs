@@ -258,7 +258,7 @@ impl FileContext {
         }
         // P2-2：create_dir_all 之后任何出口（含 open_rw_create 失败）都已
         // 物理建过 upper 祖先目录——失效一次覆盖所有出口。
-        backend.note_upper_mutation();
+        backend.note_upper_mutation(rel);
         let file = open_rw_create(&path)?;
         backend.record_upper_write();
         Ok(WriteState::InPlace { file, size: 0 })
@@ -334,7 +334,7 @@ impl FileContext {
                         // remove 已记 whiteout，不再触碰缓存）时，本次
                         // open_rw_create 仍是 upper 物理创建——必须失效负缓存，
                         // 防并发竞态留下持久陈旧负条目。重复失效无害。
-                        backend.note_upper_mutation();
+                        backend.note_upper_mutation(rel);
                         WriteState::InPlace { file, size }
                     }
                     ViewResolution::Whiteout | ViewResolution::NotFound => {
@@ -956,7 +956,7 @@ impl WtfsContext {
                         return Err(err_collision());
                     }
                     std::fs::create_dir_all(backend.upper_abs(&rel)).map_err(FspError::from)?;
-                    backend.note_upper_mutation();
+                    backend.note_upper_mutation(&rel);
                     let st = backend
                         .stat(&rel)
                         .map_err(fsp_err)?

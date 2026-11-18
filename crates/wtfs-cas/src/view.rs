@@ -37,11 +37,13 @@
 //! （`symlink_metadata`）；M14 的收益主要在 B1 的逐回调探测序列，C 的
 //! 基准口径（stat 4,874 文件）不受影响，M18 按需移植。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex;
 
 use crate::cache::HydrationCache;
 use crate::cat_file::CatFile;
@@ -99,6 +101,15 @@ pub enum CasResolution {
     },
 }
 
+/// 每文件三态缓存：Lower（manifest）/ Upper（真实 upper 文件）/ Deleted
+/// （whiteout）。目录仍走 manifest/upper 推导；status 热路径只关心文件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileState {
+    Lower,
+    Upper,
+    Deleted,
+}
+
 /// [`CasView::list`] 的条目；`rel` 是相对视图根的完整路径。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasDirEntry {
@@ -143,6 +154,63 @@ pub struct CasView {
     cat: Arc<CatFile>,
     cache: Arc<HydrationCache>,
     markers: MarkerLog,
+    /// upper 负存在缓存（M14 同款）：只缓存“不存在”，upper 任何变更整体
+    /// 失效。clean worktree 的 upper 几乎为空，`resolve` 每文件一次失败
+    /// NTFS 探测是 status 的主要差价。
+    upper_neg: Mutex<HashSet<String>>,
+    /// 每文件三态索引：启动时从 manifest + upper 扫描 + marker replay 构建；
+    /// 运行时由写/删/rename 增量更新。一次 `HashMap` 查询替代
+    /// upper 探测 + whiteout + manifest 三次推导。
+    state: Mutex<HashMap<String, FileState>>,
+}
+
+/// 启动时构建每文件三态索引：manifest 文件 → Lower；upper 递归扫描 →
+/// Upper；marker replay → Deleted（upper 已存在时 upper 优先）。
+fn build_file_state(
+    upper_root: &std::path::Path,
+    manifest: &Manifest,
+    whites: &HashSet<String>,
+) -> HashMap<String, FileState> {
+    let mut state = HashMap::with_capacity(manifest.files().len() + whites.len());
+    for path in manifest.files().keys() {
+        state.insert(path.clone(), FileState::Lower);
+    }
+    scan_upper_files(upper_root, "", &mut state);
+    for path in whites {
+        let upper_path = upper_root.join(path.replace('/', "\\"));
+        if upper_path.symlink_metadata().is_err() {
+            state.insert(path.clone(), FileState::Deleted);
+        }
+    }
+    state
+}
+
+fn scan_upper_files(
+    dir: &std::path::Path,
+    prefix: &str,
+    state: &mut HashMap<String, FileState>,
+) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if is_temp_name(name) {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            scan_upper_files(&entry.path(), &rel, state);
+        } else {
+            state.insert(rel, FileState::Upper);
+        }
+    }
 }
 
 impl CasView {
@@ -155,12 +223,15 @@ impl CasView {
         cache: Arc<HydrationCache>,
     ) -> Result<Self> {
         let markers = MarkerLog::open(&config.meta_root)?;
+        let state = build_file_state(&config.upper_root, &manifest, markers.whites());
         Ok(Self {
             config,
             manifest,
             cat,
             cache,
             markers,
+            upper_neg: Mutex::new(HashSet::new()),
+            state: Mutex::new(state),
         })
     }
 
@@ -208,36 +279,142 @@ impl CasView {
 
     /// 解析视图路径（挂载层路由/写路径状态机用）。
     pub fn resolve(&self, rel: &str) -> Result<CasResolution> {
+        Ok(self.resolve_with_md(rel)?.0)
+    }
+
+    /// 解析并回传 upper metadata（M13 同款）：`stat` 复用这次探测，避免
+    /// upper 文件 resolve + stat 两次 NTFS metadata。
+    fn resolve_with_md(
+        &self,
+        rel: &str,
+    ) -> Result<(CasResolution, Option<std::fs::Metadata>)> {
+        if !rel.is_empty() && is_temp_name(basename(rel)) {
+            return Ok((CasResolution::NotFound, None));
+        }
+        if !rel.is_empty() {
+            let cached = self.state.lock().get(rel).copied();
+            if let Some(state) = cached {
+                match state {
+                    FileState::Lower => {
+                        if self.markers.blocks(rel) {
+                            return Ok((CasResolution::Whiteout, None));
+                        }
+                        return Ok((CasResolution::CasFile, None));
+                    }
+                    FileState::Upper => {
+                        if self.markers.blocks(rel) {
+                            return Ok((CasResolution::Whiteout, None));
+                        }
+                        let path = self.upper_abs(rel);
+                        if let Some(md) = self.probe_upper(rel) {
+                            return Ok((CasResolution::Upper { path }, Some(md)));
+                        }
+                        // 状态说 Upper 但探测不到（竞态）：回落通用推导。
+                    }
+                    FileState::Deleted => return Ok((CasResolution::Whiteout, None)),
+                }
+            }
+        }
         let upper_path = self.upper_abs(rel);
-        let upper_md = std::fs::symlink_metadata(&upper_path).ok();
+        let upper_md = self.probe_upper(rel);
         let upper_is_file = upper_md.as_ref().is_some_and(|md| !md.is_dir());
         let upper_is_dir = upper_md.as_ref().is_some_and(|md| md.is_dir());
         if upper_is_file {
-            return Ok(CasResolution::Upper { path: upper_path });
+            return Ok((CasResolution::Upper { path: upper_path }, upper_md));
         }
         if !rel.is_empty() && self.markers.blocks(rel) {
             // upper 文件已查无；upper 目录可能已重建（opaque 语义：只显示
             // upper 内容，manifest 子树继续隐藏）。
-            return Ok(if upper_is_dir {
-                CasResolution::Directory {
-                    has_cas: false,
-                    has_upper: true,
-                }
-            } else {
-                CasResolution::Whiteout
-            });
+            return Ok((
+                if upper_is_dir {
+                    CasResolution::Directory {
+                        has_cas: false,
+                        has_upper: true,
+                    }
+                } else {
+                    CasResolution::Whiteout
+                },
+                upper_md,
+            ));
         }
         if self.manifest.file(rel).is_some() {
-            return Ok(CasResolution::CasFile);
+            return Ok((CasResolution::CasFile, upper_md));
         }
         let has_cas = rel.is_empty() || self.manifest.has_dir(rel);
         if has_cas || upper_is_dir {
-            return Ok(CasResolution::Directory {
-                has_cas,
-                has_upper: upper_is_dir,
-            });
+            return Ok((
+                CasResolution::Directory {
+                    has_cas,
+                    has_upper: upper_is_dir,
+                },
+                upper_md,
+            ));
         }
-        Ok(CasResolution::NotFound)
+        Ok((CasResolution::NotFound, upper_md))
+    }
+
+    /// upper 负存在探测：命中缓存直接返回 None；探测到存在时回收负条目。
+    /// 只缓存 NotFound，瞬态错误不缓存。
+    fn probe_upper(&self, rel: &str) -> Option<std::fs::Metadata> {
+        if rel.is_empty() {
+            return std::fs::symlink_metadata(self.config.upper_root.clone()).ok();
+        }
+        if self.upper_neg.lock().contains(rel) {
+            return None;
+        }
+        match std::fs::symlink_metadata(self.upper_abs(rel)) {
+            Ok(md) => {
+                self.upper_neg.lock().remove(rel);
+                Some(md)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 只缓存 manifest 文件的负结果；目录/未知路径不缓存，避免
+                // 外部重建目录（测试/旁路）后 stale。
+                if self.manifest.file(rel).is_some() {
+                    self.upper_neg.lock().insert(rel.to_string());
+                }
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// upper 任何变更后整体失效（M14 口径：只缓存负状态，清空只会让
+    /// 缓存更空，不会留下陈旧正/负条目）。
+    pub fn invalidate_upper(&self) {
+        self.upper_neg.lock().clear();
+    }
+
+    fn set_file_state(&self, rel: &str, state: FileState) {
+        self.state.lock().insert(rel.to_string(), state);
+    }
+
+    fn remove_file_state(&self, rel: &str) {
+        self.state.lock().remove(rel);
+    }
+
+    fn remove_subtree_state(&self, rel: &str) {
+        let mut state = self.state.lock();
+        state.remove(rel);
+        let prefix = format!("{rel}/");
+        state.retain(|path, _| !path.starts_with(&prefix));
+    }
+
+    /// upper 直接变更后的状态修正（VFS 侧 create/write/truncate 等无 CAS
+    /// 返回值时调用）：按真实 upper 形态更新三态索引。
+    pub fn note_upper_mutation(&self, rel: &str) {
+        if rel.is_empty() {
+            return;
+        }
+        match std::fs::symlink_metadata(self.upper_abs(rel)) {
+            Ok(md) if !md.is_dir() => self.set_file_state(rel, FileState::Upper),
+            Ok(_) => self.remove_file_state(rel),
+            Err(_) if self.manifest.file(rel).is_some() => {
+                self.set_file_state(rel, FileState::Lower)
+            }
+            Err(_) => self.remove_file_state(rel),
+        }
+        self.invalidate_upper();
     }
 
     // ---- stat ----
@@ -250,10 +427,14 @@ impl CasView {
         }
         let vs = u64::from(self.config.volume_serial);
         let epoch = self.config.fixed_stat_epoch_ns;
-        match self.resolve(rel)? {
+        let (resolution, upper_md) = self.resolve_with_md(rel)?;
+        match resolution {
             CasResolution::Whiteout | CasResolution::NotFound => Ok(None),
             CasResolution::Upper { path } => {
-                let md = std::fs::symlink_metadata(&path)?;
+                let md = match upper_md {
+                    Some(md) => md,
+                    None => std::fs::symlink_metadata(&path)?,
+                };
                 let mode = match self.manifest.file(rel) {
                     // upper 覆盖既有 manifest 路径：保留 manifest 可执行位。
                     Some(f) if f.mode & 0o111 != 0 => 0o100755,
@@ -285,7 +466,10 @@ impl CasView {
             }
             CasResolution::Directory { has_upper, .. } => {
                 let mtime = if has_upper {
-                    metadata_mtime_ns(&std::fs::symlink_metadata(self.upper_abs(rel))?)
+                    match upper_md {
+                        Some(md) => metadata_mtime_ns(&md),
+                        None => metadata_mtime_ns(&std::fs::symlink_metadata(self.upper_abs(rel))?),
+                    }
                 } else {
                     epoch
                 };
@@ -486,8 +670,12 @@ impl CasView {
     /// 值，index 对齐不被 copy-up 打破；真实修改会自然刷新真实 mtime。
     pub fn copy_up(&self, rel: &str) -> Result<Option<PathBuf>> {
         validate_relative_path(rel)?;
+        self.invalidate_upper();
         match self.resolve(rel)? {
-            CasResolution::Upper { path } => Ok(Some(path)),
+            CasResolution::Upper { path } => {
+                self.set_file_state(rel, FileState::Upper);
+                Ok(Some(path))
+            }
             CasResolution::CasFile => {
                 let f = self.manifest.file(rel).expect("resolve confirmed manifest hit");
                 let cached = self.cache.ensure(&self.cat, &f.oid, f.size)?;
@@ -497,6 +685,7 @@ impl CasView {
                 }
                 std::fs::copy(&cached, &final_path)?;
                 normalize_manifest_identical_mtime(&final_path, self.config.fixed_stat_epoch_ns);
+                self.set_file_state(rel, FileState::Upper);
                 Ok(Some(final_path))
             }
             _ => Ok(None),
@@ -520,6 +709,7 @@ impl CasView {
         reader: &mut impl std::io::Read,
     ) -> Result<WriteOutcome> {
         self.validate_write_rel(rel)?;
+        self.invalidate_upper();
         let final_path = self.upper_abs(rel);
         let parent = self.upper_parent(&final_path)?;
         std::fs::create_dir_all(parent)?;
@@ -550,6 +740,7 @@ impl CasView {
                 std::fs::remove_file(&final_path)?;
             }
             self.markers.remove(rel)?;
+            self.set_file_state(rel, FileState::Lower);
             return Ok(WriteOutcome { state: WriteState::Lower, bytes: size });
         }
         if let Err(e) = self.sync_and_publish(&tmp, &final_path) {
@@ -557,6 +748,7 @@ impl CasView {
             return Err(e);
         }
         self.markers.remove(rel)?;
+        self.set_file_state(rel, FileState::Upper);
         Ok(WriteOutcome {
             state: if self.manifest.file(rel).is_some() {
                 WriteState::Upper
@@ -579,6 +771,7 @@ impl CasView {
         source: StagedSource<'_>,
     ) -> Result<WriteOutcome> {
         self.validate_write_rel(rel)?;
+        self.invalidate_upper();
         let final_path = self.upper_abs(rel);
         let oid = match &source {
             StagedSource::Memory(bytes) => {
@@ -596,6 +789,7 @@ impl CasView {
                 std::fs::remove_file(&final_path)?;
             }
             self.markers.remove(rel)?;
+            self.set_file_state(rel, FileState::Lower);
             return Ok(WriteOutcome { state: WriteState::Lower, bytes: size });
         }
         let parent = self.upper_parent(&final_path)?;
@@ -629,6 +823,7 @@ impl CasView {
             }
         }
         self.markers.remove(rel)?;
+        self.set_file_state(rel, FileState::Upper);
         Ok(WriteOutcome {
             state: if self.manifest.file(rel).is_some() {
                 WriteState::Upper
@@ -648,6 +843,11 @@ impl CasView {
         match self.resolve(rel)? {
             CasResolution::Whiteout => {
                 self.markers.remove(rel)?;
+                if self.manifest.file(rel).is_some() {
+                    self.set_file_state(rel, FileState::Lower);
+                } else {
+                    self.remove_file_state(rel);
+                }
             }
             CasResolution::NotFound => {
                 let path = self.upper_abs(rel);
@@ -655,6 +855,7 @@ impl CasView {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::File::create(&path)?;
+                self.set_file_state(rel, FileState::Upper);
             }
             _ => {}
         }
@@ -668,6 +869,7 @@ impl CasView {
     pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         validate_relative_path(from)?;
         validate_relative_path(to)?;
+        self.invalidate_upper();
         if from == to {
             return Ok(());
         }
@@ -724,8 +926,12 @@ impl CasView {
         }
         if self.manifest.has_file_or_dir(from) {
             self.markers.add(from)?;
+            self.set_file_state(from, FileState::Deleted);
+        } else {
+            self.remove_file_state(from);
         }
         self.markers.remove(to)?;
+        self.set_file_state(to, FileState::Upper);
         Ok(())
     }
 
@@ -751,6 +957,13 @@ impl CasView {
             self.markers.remove(&p)?;
         }
         self.manifest = manifest;
+        let state = build_file_state(
+            &self.config.upper_root,
+            &self.manifest,
+            self.markers.whites(),
+        );
+        *self.state.lock() = state;
+        self.invalidate_upper();
         Ok(true)
     }
 
@@ -796,12 +1009,16 @@ impl CasView {
     /// whiteout。纯 manifest 删除零 upper 文件操作、零对象读取（不 hydrate）。
     pub fn remove(&mut self, rel: &str) -> Result<bool> {
         validate_relative_path(rel)?;
+        self.invalidate_upper();
         let upper_path = self.upper_abs(rel);
         match self.resolve(rel)? {
             CasResolution::Upper { .. } => {
                 std::fs::remove_file(&upper_path)?;
-                if self.manifest.has_file_or_dir(rel) {
+                if self.manifest.file(rel).is_some() {
                     self.markers.add(rel)?;
+                    self.set_file_state(rel, FileState::Deleted);
+                } else {
+                    self.remove_file_state(rel);
                 }
                 Ok(true)
             }
@@ -809,6 +1026,7 @@ impl CasView {
                 if has_upper {
                     std::fs::remove_dir_all(&upper_path)?;
                 }
+                self.remove_subtree_state(rel);
                 if has_cas || self.manifest.has_file_or_dir(rel) {
                     self.markers.add(rel)?;
                 }
@@ -816,6 +1034,7 @@ impl CasView {
             }
             CasResolution::CasFile => {
                 self.markers.add(rel)?;
+                self.set_file_state(rel, FileState::Deleted);
                 Ok(true)
             }
             CasResolution::Whiteout | CasResolution::NotFound => Ok(false),

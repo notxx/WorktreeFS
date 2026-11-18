@@ -99,6 +99,16 @@ impl CasBackend {
         self.absorbing.load(Ordering::Relaxed)
     }
 
+    /// upper 变更后失效负存在缓存（M14 口径）。
+    pub fn invalidate_upper(&self) {
+        self.view.lock().invalidate_upper();
+    }
+
+    /// upper 直接变更后修正三态索引（VFS create/truncate 等路径）。
+    pub fn note_upper_mutation(&self, rel: &str) {
+        self.view.lock().note_upper_mutation(rel);
+    }
+
     pub fn volume_serial(&self) -> u32 {
         self.volume_serial
     }
@@ -348,9 +358,10 @@ impl ViewBackend {
     }
 
     /// upper 物理变更通知（B1 失效负存在缓存；C 无缓存，no-op）。
-    pub fn note_upper_mutation(&self) {
-        if let ViewBackend::Overlay(o) = self {
-            o.note_upper_mutation();
+    pub fn note_upper_mutation(&self, rel: &str) {
+        match self {
+            ViewBackend::Overlay(o) => o.note_upper_mutation(),
+            ViewBackend::Cas(c) => c.note_upper_mutation(rel),
         }
     }
 

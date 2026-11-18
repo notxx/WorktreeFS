@@ -130,6 +130,7 @@ fn bench_cas_mount_pipeline() {
     // ---- add：--no-checkout +（lazy: seed+清位 / absorb: reset --hard）----
     let mut add_ms = Vec::new();
     let mut setup_ms = Vec::new();
+    let mut register_ms = Vec::new();
     let mut checkout_ms = Vec::new();
     let mut names = Vec::new();
     for i in 1..=WORKTREES {
@@ -161,6 +162,7 @@ fn bench_cas_mount_pipeline() {
             assert_eq!(cleared, report.entries, "清位数 = index entry 数");
         }
         let t_setup = t1.elapsed().as_secs_f64() * 1000.0;
+        let t_reg = Instant::now();
         let backend = register_cas_worktree(
             &registry,
             &name,
@@ -169,6 +171,7 @@ fn bench_cas_mount_pipeline() {
             shared.clone(),
         )
         .expect("register");
+        register_ms.push(t_reg.elapsed().as_secs_f64() * 1000.0);
         if absorb {
             backend.set_absorbing(true);
             let view_dir = mount_point.join(&name);
@@ -334,6 +337,7 @@ fn bench_cas_mount_pipeline() {
         | 指标 | 值 |\n| ---- | -- |\n\
         | add（worktree add --no-checkout，每 wt 中位） | {:.1} ms |\n\
         | setup（{}，每 wt 中位） | {:.1} ms |\n\
+        | register（manifest load + state build，每 wt 中位） | {:.1} ms |\n\
         {}\
         | status 冷（挂载视图，每 wt 中位） | {:.1} ms |\n\
         | status 热（每 wt 中位） | {:.1} ms |\n\
@@ -353,6 +357,7 @@ fn bench_cas_mount_pipeline() {
         median(add_ms),
         if absorb { "stat config，无 seed" } else { "read-tree + stat 对齐 + 配置" },
         median(setup_ms),
+        median(register_ms),
         checkout_row,
         median(status_cold_ms),
         median(status_hot_ms),

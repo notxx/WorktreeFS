@@ -104,3 +104,38 @@ cargo test --release -p wtfs-vfs --test cas_mount_bench -- --ignored --nocapture
 ```
 
 原始 10 轮日志：`%TEMP%\wtfs-dashboard-bench\results\`。
+
+## 7. 三态缓存复测（2026-11-18）
+
+在 `CasView` 里加了每文件三态索引：
+
+- `FileState = Lower | Upper | Deleted`；
+- 启动时从 manifest 文件 + upper 递归扫描 + markers.log replay 构建；
+- `resolve`/`stat` 一次 `HashMap` 查询，替代 upper 探测 + whiteout + manifest 三次推导；
+- 写/删/rename 增量更新；VFS 直写通过 `note_upper_mutation(rel)` 修正；
+- `upper_neg` 只对 manifest 文件缓存负结果，目录/未知路径不缓存，避免外部重建目录 stale。
+
+dashboard 791 文件 / 10 wt × 10 轮（中位）：
+
+| 指标 | C lazy 旧 | C lazy + state | C absorb 旧 | C absorb + state |
+|---|---:|---:|---:|---:|
+| add 全程 | 263 ms | 275 ms | 1,597 ms | **1,108 ms** |
+| setup | 210 ms | 214 ms | 50 ms | 46 ms |
+| register（manifest 已加载，state build） | — | **0.5 ms** | — | **0.4 ms** |
+| checkout | — | — | 1,501 ms | **1,019 ms** |
+| status 冷 | 137 ms | 138 ms | 137 ms | 139 ms |
+| status 热 | 134 ms | 144 ms | 116 ms | 115 ms |
+| diff | 230 ms | **137 ms** | 222 ms | **122 ms** |
+| commit | 407 ms | **300 ms** | 294 ms | **181 ms** |
+| remove | 45 ms | 44 ms | 55 ms | 53 ms |
+| 首次读 200 文件 | 982 ms | 1,003 ms | 859 ms | 834 ms |
+| upper（10 wt） | 1 KB | 1 KB | 17.2 MB | 17.2 MB |
+
+结论：
+
+- **启动 state build 0.4–0.5 ms**，不慢；SQLite checkpoint 目前没有必要（manifest 装载 592 ms 是另一回事，state 快照省不掉它）。
+- **status 没有变快**：10 轮中位仍 ~138/144 ms，和旧版持平。status 的剩余成本不在 `resolve`，而在 `list_stat`/目录枚举/WinFSP 每文件回调；状态 map 不是瓶颈。
+- **diff/commit/checkout 明显变快**：diff 230→137（lazy）、222→122（absorb）；commit 407→300、294→181；absorb checkout 1,501→1,019 ms。这些路径会大量走 `resolve`/`stat`，三态 map 省掉了三次推导。
+- 单轮 111 ms 是噪声，不要当结论。
+
+下一步如果要继续压 status，应该 profile `list_stat` / `read_directory` / `get_file_info` 的回调占比，而不是继续加状态缓存。

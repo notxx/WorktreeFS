@@ -1781,6 +1781,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2",
+ "wtfs-cas",
  "wtfs-core",
  "wtfs-vfs",
 ]

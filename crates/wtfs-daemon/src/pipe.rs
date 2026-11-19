@@ -35,6 +35,18 @@ const MAX_LINE_BYTES: usize = 1 << 20;
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum PipeRequest {
     Status,
+    /// 注册一个 CAS 视图（`wtfs worktree-add` 的挂载侧）。
+    RegisterCas {
+        name: String,
+        real_worktree: String,
+        head: String,
+        #[serde(default)]
+        absorbing: bool,
+    },
+    /// 结束 checkout 吸收窗口（`worktree-add` 在 reset --hard 后调用）。
+    FinishCas { name: String },
+    /// 注销 CAS 视图（`worktree-remove` 删除前调用）。
+    RemoveCas { name: String },
     Gc {
         #[serde(default)]
         dry_run: bool,
@@ -319,6 +331,9 @@ mod tests {
             PipeRequest::Gc { dry_run, .. } => {
                 ok_value(serde_json::json!({"gc": {"dry_run": dry_run}}))
             }
+            PipeRequest::RegisterCas { .. }
+            | PipeRequest::FinishCas { .. }
+            | PipeRequest::RemoveCas { .. } => ok_value(serde_json::json!({})),
         });
         PipeServer::spawn(name, handler).expect("spawn server").0
     }

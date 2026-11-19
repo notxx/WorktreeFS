@@ -15,14 +15,18 @@
 //! reopen 路径，index watcher 对已 ready 的 worktree 幂等跳过。
 //! `Daemon` 经 `Arc` 与管道 handler 共享，全部可变状态用锁内化。
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use wtfs_cas::{CatFile, HydrationCache, Manifest};
 use wtfs_core::OverlayStore;
-use wtfs_vfs::{MountedVolume, VfsConfig, VfsRegistry};
+use wtfs_vfs::{
+    CasShared, MountedVolume, VfsConfig, VfsRegistry, register_cas_worktree,
+};
 
 use crate::config::DaemonConfig;
 use crate::gc::{self, GcContext};
@@ -253,6 +257,25 @@ impl Daemon {
                     Err(e) => pipe::err_value(format!("serialize status: {e}")),
                 }
             }
+            PipeRequest::RegisterCas {
+                name,
+                real_worktree,
+                head,
+                absorbing,
+            } => self.handle_register_cas(name, Path::new(real_worktree), head, *absorbing),
+            PipeRequest::FinishCas { name } => {
+                match self.registry.get_backend(name).and_then(|b| b.as_cas().cloned()) {
+                    Some(cas) => {
+                        cas.set_absorbing(false);
+                        pipe::ok_value(serde_json::json!({}))
+                    }
+                    None => pipe::err_value(format!("cas view not registered: {name}")),
+                }
+            }
+            PipeRequest::RemoveCas { name } => {
+                self.registry.unregister(name);
+                pipe::ok_value(serde_json::json!({}))
+            }
             PipeRequest::Gc { dry_run, max_age_days } => self.handle_gc(*dry_run, *max_age_days),
             PipeRequest::Stop => {
                 self.stop.store(true, Ordering::Relaxed);
@@ -262,6 +285,37 @@ impl Daemon {
                 }
                 pipe::ok_value(serde_json::json!({}))
             }
+        }
+    }
+
+    fn handle_register_cas(
+        &self,
+        name: &str,
+        real_worktree: &Path,
+        head: &str,
+        absorbing: bool,
+    ) -> serde_json::Value {
+        let repo = &self.cfg.repo_root;
+        let manifest = match Manifest::load(repo, head) {
+            Ok(m) => m,
+            Err(e) => return pipe::err_value(format!("manifest load: {e}")),
+        };
+        let shared = Arc::new(CasShared {
+            cat: Arc::new(CatFile::new(repo)),
+            cache: Arc::new(HydrationCache::open(&self.cfg.store_root)),
+        });
+        match register_cas_worktree(
+            self.registry.as_ref(),
+            name,
+            real_worktree,
+            Arc::new(manifest),
+            shared,
+        ) {
+            Ok(cas) => {
+                cas.set_absorbing(absorbing);
+                pipe::ok_value(serde_json::json!({}))
+            }
+            Err(e) => pipe::err_value(format!("register cas: {e}")),
         }
     }
 

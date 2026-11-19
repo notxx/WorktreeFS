@@ -86,26 +86,56 @@ if (detect?.supported) {
   worktree backend: auto -> git (reason=tower-workspace-missing)
   ```
 
-## 4. 还没做的部分
-
-`wtfs detect` 只回答“这个项目能不能用 wtfs”。真正执行 worktree 创建/删除的
-CLI 命令还没接：
+## 4. 执行命令（已接）
 
 ```bash
-wtfs worktree-add  --repo <repo> --path <path> --branch <branch> --base <commit>
-wtfs worktree-remove --repo <repo> --path <path>
+wtfs worktree-add  --repo <repo> --name <wt-N> --base <commit> [--branch <b>] [--create-branch]
+wtfs worktree-remove --repo <repo> --name <wt-N>
 ```
 
-`worktree-add` 需要：
+`worktree-add` 的实际流程：
 
-1. `git worktree add --no-checkout`；
-2. 加载 manifest；
-3. seed 或注册 absorbing 视图 + `reset --hard`；
-4. 通过 daemon 管道注册 CAS 视图；
-5. 清 skip-worktree，校验 status；
-6. 失败回落真实 `git worktree add`。
+1. 确保 daemon/mount 在线（不在则 `wtfs mount`）；
+2. `git worktree add --no-checkout` 到 store 的 `cas-wt/<name>`（挂载点外）；
+3. 通过 daemon 管道 `RegisterCas` 注册 CAS 视图，`absorbing=true`；
+4. 在虚拟路径 `<repo>/.tower/worktrees/<name>` 上 `git reset --hard`；
+5. `FinishCas` 关闭吸收窗口，校验 `git status` 干净；
+6. 失败时 `RemoveCas` + `git worktree remove --force` 清理。
 
-这一步完成后，Kimi Code 的 backend 才能真正从 `detect` 走到执行。
+`worktree-remove`：`RemoveCas` → `git worktree remove --force` → `prune`。
+
+已实测（scratch repo，3 文件）：
+
+- `wtfs worktree-add` 成功，虚拟路径 `.tower/worktrees/wt-test4` 可见 `.git`；
+- `git rev-parse --show-toplevel` = 虚拟路径，`git status` 干净，分支 `test-branch4`；
+- real worktree 在 store 的 `cas-wt/wt-test4`，upper 很小。
+
+期间修了一个真实 bug：daemon watcher 可能先 `auto_register` 了同名 B1
+overlay；`register_cas` 原来遇到已有 B1 会“返回新 backend 但不替换路由”，
+导致虚拟视图仍是 B1（没有 `.git`）。现在显式 CAS 注册会覆盖 B1 路由。
+
+## 5. Kimi Code bundle 补丁（已装，未跑完整 Tower 会话）
+
+已在本机 Kimi Code 2.5.0 的 `dist/main.mjs` 打补丁：
+
+- `worktreeAdd` / `worktreeAddNewBranch` / `worktreeRemove` 在
+  `KIMI_WORKTREE_BACKEND=auto|wtfs` 且 `wtfs detect` 成功时调用
+  `wtfs worktree-add/remove`，失败回落 git；
+- 备份：`dist/main.mjs.wtfs-backup`。
+
+`kimi --version` 仍正常。完整 Tower 会话没有跑：Tower 模式只能由用户在 TUI
+里 `/tower on` 开启，`kimi -p` 的非交互模式不接受该 slash command。交互测试步骤：
+
+```powershell
+$env:KIMI_CODE_EXPERIMENTAL_TOWER = "1"
+$env:KIMI_WORKTREE_BACKEND = "auto"   # 或 wtfs
+$env:WTFS_BIN = "C:\path\to\wtfs.exe"
+kimi
+# 在 TUI 输入 /tower on，然后让主 agent 创建 worker
+```
+
+观察点：`wtfs status --json` 出现 worktree，虚拟路径有 `.git`，`git status`
+干净，upper 很小；失败时日志应有 `wtfs worktree-add failed, falling back to git`。
 
 ## 5. 实测
 

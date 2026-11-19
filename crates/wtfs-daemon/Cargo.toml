@@ -15,6 +15,7 @@ tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wtfs-core = { path = "../wtfs-core" }
+wtfs-cas = { path = "../wtfs-cas" }
 wtfs-vfs = { path = "../wtfs-vfs" }
 # 控制管道（\\.\pipe\wtfs）服务端所需：workspace 的 windows 条目 feature 不够，
 # 这里不用 workspace 继承，声明超集（同版本在构建图内自动统一）。

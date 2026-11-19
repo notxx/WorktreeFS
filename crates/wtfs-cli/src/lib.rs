@@ -69,6 +69,26 @@ enum Cmd {
     /// `--repo` 省略时从当前目录向上找 git 根；输出 JSON（`--json`）或
     /// 人读文本。Kimi Code 的 worktree backend 用它决定走 wtfs 还是 git。
     Detect,
+    /// 用 CAS 后端创建一个 worktree（供 Kimi Code backend 调用）。
+    WorktreeAdd {
+        /// worktree 名（挂载内一级目录名，如 wt-3）。
+        #[arg(long)]
+        name: String,
+        /// base commit / ref。
+        #[arg(long)]
+        base: String,
+        /// 分支名；配合 --create-branch 创建新分支，否则检出已有分支。
+        #[arg(long)]
+        branch: Option<String>,
+        /// 用 -b 创建新分支（缺省检出已有 branch）。
+        #[arg(long)]
+        create_branch: bool,
+    },
+    /// 注销并删除一个 CAS worktree。
+    WorktreeRemove {
+        #[arg(long)]
+        name: String,
+    },
     /// 停止 daemon 并卸载。
     Unmount,
     /// daemon 与 worktree 状态。
@@ -123,6 +143,31 @@ fn run_parsed(cli: Cli) -> anyhow::Result<()> {
             cmd_mount(&cfg, base.as_deref(), wait_secs, cli.json)
         }
         Cmd::Detect => cmd_detect(cli.repo.as_deref(), cli.store_root.as_deref(), cli.json),
+        Cmd::WorktreeAdd { name, base, branch, create_branch } => {
+            let repo = require_repo(cli.repo.as_ref())?;
+            let mut cfg = DaemonConfig::for_repo(&repo);
+            if let Some(store_root) = &cli.store_root {
+                cfg.store_root = store_root.clone();
+            }
+            cfg.pipe_name = pipe_name.clone();
+            cmd_worktree_add(
+                &cfg,
+                &name,
+                &base,
+                branch.as_deref(),
+                create_branch,
+                cli.json,
+            )
+        }
+        Cmd::WorktreeRemove { name } => {
+            let repo = require_repo(cli.repo.as_ref())?;
+            let mut cfg = DaemonConfig::for_repo(&repo);
+            if let Some(store_root) = &cli.store_root {
+                cfg.store_root = store_root.clone();
+            }
+            cfg.pipe_name = pipe_name.clone();
+            cmd_worktree_remove(&cfg, &name, cli.json)
+        }
         Cmd::Unmount => cmd_unmount(&pipe_name, cli.json),
         Cmd::Status => cmd_status(&pipe_name, cli.json),
         Cmd::Template { command } => {
@@ -146,6 +191,176 @@ fn require_repo(repo: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
         bail!("repo root not found: {}", repo.display());
     }
     Ok(repo)
+}
+
+/// `wtfs worktree-add`：CAS 后端的创建入口。
+///
+/// 真实 worktree 放在 store 的 `cas-wt/<name>`（挂载点外），虚拟路径是
+/// `<repo>/.tower/worktrees/<name>`；注册 CAS 视图后在该虚拟路径上跑
+/// `git reset --hard`，写路径经过吸收器/三态缓存。
+fn cmd_worktree_add(
+    cfg: &DaemonConfig,
+    name: &str,
+    base: &str,
+    branch: Option<&str>,
+    create_branch: bool,
+    as_json: bool,
+) -> anyhow::Result<()> {
+    if !pipe::call(
+        &cfg.pipe_name,
+        &PipeRequest::Status,
+        Duration::from_millis(500),
+    )
+    .is_ok()
+    {
+        cmd_mount(cfg, Some(base), MOUNT_WAIT_SECS_DEFAULT, false)?;
+    }
+
+    let real = cfg.store_root.join("cas-wt").join(name);
+    let virtual_path = cfg.mount_point.join(name);
+    if real.exists() {
+        bail!("real worktree already exists: {}", real.display());
+    }
+    if let Some(parent) = real.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = git_run(&cfg.repo_root, &["worktree", "prune"]);
+    if let Some(branch) = branch {
+        if create_branch {
+            git_run(
+                &cfg.repo_root,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-checkout",
+                    "-b",
+                    branch,
+                    &real.to_string_lossy(),
+                    base,
+                ],
+            )?;
+        } else {
+            git_run(
+                &cfg.repo_root,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-checkout",
+                    &real.to_string_lossy(),
+                    branch,
+                ],
+            )?;
+        }
+    } else {
+        git_run(
+            &cfg.repo_root,
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                "--detach",
+                &real.to_string_lossy(),
+                base,
+            ],
+        )?;
+    }
+    let head = git_output(&real, &["rev-parse", "HEAD"])?.trim().to_string();
+
+    let register = pipe::call(
+        &cfg.pipe_name,
+        &PipeRequest::RegisterCas {
+            name: name.to_string(),
+            real_worktree: real.to_string_lossy().into_owned(),
+            head,
+            absorbing: true,
+        },
+        Duration::from_secs(30),
+    )?;
+    if register.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        bail!("register cas failed: {register}");
+    }
+
+    if let Err(e) = git_run(&virtual_path, &["reset", "--hard"]) {
+        let _ = pipe::call(
+            &cfg.pipe_name,
+            &PipeRequest::RemoveCas { name: name.to_string() },
+            Duration::from_secs(5),
+        );
+        let _ = git_run(&cfg.repo_root, &["worktree", "remove", "--force", &real.to_string_lossy()]);
+        return Err(e);
+    }
+    let finish = pipe::call(
+        &cfg.pipe_name,
+        &PipeRequest::FinishCas { name: name.to_string() },
+        Duration::from_secs(5),
+    )?;
+    if finish.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        bail!("finish cas failed: {finish}");
+    }
+    let status = git_output(&virtual_path, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        bail!("worktree status not clean: {status}");
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "name": name,
+                "path": virtual_path.display().to_string(),
+                "real_worktree": real.display().to_string(),
+                "state": "ready",
+            }))?
+        );
+    } else {
+        println!("worktree {name} ready at {}", virtual_path.display());
+    }
+    Ok(())
+}
+
+/// `wtfs worktree-remove`：先注销 CAS 视图，再删真实 worktree。
+fn cmd_worktree_remove(
+    cfg: &DaemonConfig,
+    name: &str,
+    as_json: bool,
+) -> anyhow::Result<()> {
+    let real = cfg.store_root.join("cas-wt").join(name);
+    let _ = pipe::call(
+        &cfg.pipe_name,
+        &PipeRequest::RemoveCas { name: name.to_string() },
+        Duration::from_secs(5),
+    );
+    let _ = git_run(
+        &cfg.repo_root,
+        &["worktree", "remove", "--force", &real.to_string_lossy()],
+    );
+    let _ = git_run(&cfg.repo_root, &["worktree", "prune"]);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "name": name,
+        }))?);
+    } else {
+        println!("worktree {name} removed");
+    }
+    Ok(())
+}
+
+fn git_run(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("git {args:?} failed"))?;
+    if !out.status.success() {
+        bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// `wtfs detect`：只读探测，不 mount、不创建目录。

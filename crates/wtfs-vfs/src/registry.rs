@@ -121,8 +121,9 @@ impl VfsRegistry {
         match self.get_backend(&name) {
             // 同名 CAS 视图已在（崩溃恢复/重挂）：幂等返回既有实例。
             Some(ViewBackend::Cas(existing)) => existing,
-            Some(_) => backend,
-            None => {
+            // watcher 可能在 admin 目录出现时先 auto_register 了 B1；显式
+            // CAS 注册必须覆盖它，否则虚拟视图仍是 B1（没有 .git/upper）。
+            Some(ViewBackend::Overlay(_)) | None => {
                 let entry = RegistryEntry {
                     name: name.clone(),
                     backend: ViewBackend::Cas(backend.clone()),

@@ -64,6 +64,11 @@ enum Cmd {
         #[arg(long, default_value_t = MOUNT_WAIT_SECS_DEFAULT)]
         wait_secs: u64,
     },
+    /// 探测当前项目是否可交给 wtfs 后端（不挂载、不改文件）。
+    ///
+    /// `--repo` 省略时从当前目录向上找 git 根；输出 JSON（`--json`）或
+    /// 人读文本。Kimi Code 的 worktree backend 用它决定走 wtfs 还是 git。
+    Detect,
     /// 停止 daemon 并卸载。
     Unmount,
     /// daemon 与 worktree 状态。
@@ -117,6 +122,7 @@ fn run_parsed(cli: Cli) -> anyhow::Result<()> {
             cfg.pipe_name = pipe_name.clone();
             cmd_mount(&cfg, base.as_deref(), wait_secs, cli.json)
         }
+        Cmd::Detect => cmd_detect(cli.repo.as_deref(), cli.store_root.as_deref(), cli.json),
         Cmd::Unmount => cmd_unmount(&pipe_name, cli.json),
         Cmd::Status => cmd_status(&pipe_name, cli.json),
         Cmd::Template { command } => {
@@ -140,6 +146,128 @@ fn require_repo(repo: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
         bail!("repo root not found: {}", repo.display());
     }
     Ok(repo)
+}
+
+/// `wtfs detect`：只读探测，不 mount、不创建目录。
+///
+/// 仓库路径来源：`--repo`，缺省用当前目录；如果当前目录在 linked worktree
+/// 内，用 `git rev-parse --git-common-dir` 找到主仓库根，再检查主仓库的
+/// `.tower/`（Tower workspace）。输出给 Kimi Code 的 worktree backend 用。
+fn cmd_detect(
+    repo: Option<&Path>,
+    store_root: Option<&Path>,
+    as_json: bool,
+) -> anyhow::Result<()> {
+    let cwd = match repo {
+        Some(p) => config::to_absolute(p.to_path_buf()),
+        None => std::env::current_dir().context("current dir unavailable")?,
+    };
+
+    let mut supported = false;
+    let mut reason: Option<&str> = None;
+    let mut repo_root: Option<PathBuf> = None;
+    let mut common_git_dir: Option<PathBuf> = None;
+    let mut tower_dir: Option<PathBuf> = None;
+    let mut store: Option<PathBuf> = store_root.map(Path::to_path_buf);
+    let mut mount_point: Option<PathBuf> = None;
+
+    if !cfg!(windows) {
+        reason = Some("not-windows");
+    } else if !cwd.is_dir() {
+        reason = Some("repo-path-not-found");
+    } else {
+        let top = git_output(&cwd, &["rev-parse", "--show-toplevel"]).ok();
+        let common = git_output(
+            &cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .ok()
+        .or_else(|| git_output(&cwd, &["rev-parse", "--git-common-dir"]).ok());
+
+        match (top, common) {
+            (Some(top), Some(common)) => {
+                let top = config::to_absolute(PathBuf::from(top.trim()));
+                let common = PathBuf::from(common.trim());
+                let common = if common.is_absolute() {
+                    common
+                } else {
+                    config::to_absolute(top.join(common))
+                };
+                let main_root = if common
+                    .file_name()
+                    .is_some_and(|name| name == ".git")
+                {
+                    common
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| top.clone())
+                } else {
+                    top.clone()
+                };
+                let tower = main_root.join(".tower");
+                repo_root = Some(main_root.clone());
+                common_git_dir = Some(common);
+                tower_dir = Some(tower.clone());
+                mount_point = Some(tower.join("worktrees"));
+                if store.is_none() {
+                    store = Some(DaemonConfig::for_repo(&main_root).store_root);
+                }
+                // `.tower` 可能是基准/临时目录残留；真正的 Tower workspace
+                // 至少有 comms（state.json）或 worktrees 挂载点。
+                if tower.join("comms").is_dir() || tower.join("worktrees").is_dir() {
+                    supported = true;
+                } else {
+                    reason = Some("tower-workspace-missing");
+                }
+            }
+            _ => reason = Some("not-a-git-repo"),
+        }
+    }
+
+    let out = serde_json::json!({
+        "supported": supported,
+        "reason": reason,
+        "repo_root": repo_root.as_ref().map(|p| p.display().to_string()),
+        "git_common_dir": common_git_dir.as_ref().map(|p| p.display().to_string()),
+        "tower_dir": tower_dir.as_ref().map(|p| p.display().to_string()),
+        "store_root": store.as_ref().map(|p| p.display().to_string()),
+        "mount_point": mount_point.as_ref().map(|p| p.display().to_string()),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if supported {
+        println!(
+            "supported: wtfs\nrepo: {}\nstore: {}\nmount: {}",
+            out["repo_root"].as_str().unwrap_or("-"),
+            out["store_root"].as_str().unwrap_or("-"),
+            out["mount_point"].as_str().unwrap_or("-"),
+        );
+    } else {
+        println!(
+            "supported: git\nreason: {}",
+            reason.unwrap_or("unknown")
+        );
+    }
+    Ok(())
+}
+
+/// 在 `dir` 下跑只读 git 命令，成功返回 stdout。
+fn git_output(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("git {args:?} failed"))?;
+    if !out.status.success() {
+        bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 // ---- mount / unmount / status ----
